@@ -46,14 +46,20 @@ def load_config():
 
 def load_api_key():
     # Streamlit secrets > environment variable > config file
-    if hasattr(st, 'secrets') and 'CRUSTDATA_API_KEY' in st.secrets:
-        return st.secrets['CRUSTDATA_API_KEY']
+    try:
+        if hasattr(st, 'secrets') and 'CRUSTDATA_API_KEY' in st.secrets:
+            return st.secrets['CRUSTDATA_API_KEY']
+    except Exception:
+        pass
     return os.environ.get('CRUSTDATA_API_KEY') or load_config().get('api_key')
 
 def load_openai_key():
     # Streamlit secrets > environment variable > config file
-    if hasattr(st, 'secrets') and 'OPENAI_API_KEY' in st.secrets:
-        return st.secrets['OPENAI_API_KEY']
+    try:
+        if hasattr(st, 'secrets') and 'OPENAI_API_KEY' in st.secrets:
+            return st.secrets['OPENAI_API_KEY']
+    except Exception:
+        pass
     return os.environ.get('OPENAI_API_KEY') or load_config().get('openai_api_key')
 
 
