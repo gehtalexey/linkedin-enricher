@@ -12,4 +12,5 @@ __pycache__/
 *_enriched.csv
 *_enriched.json
 screening_*.csv
+!screening_results.csv
 screening_*.json
