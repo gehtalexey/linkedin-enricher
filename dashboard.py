@@ -67,10 +67,10 @@ def load_openai_key():
 # To add more tabs: File > Share > Publish to web > select specific tab > copy the URL
 GOOGLE_SHEETS = {
     "target_companies": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?output=csv",
-    "target_universities": "",  # Add URL after publishing tab
-    "tech_alerts": "",  # Add URL after publishing tab
+    "target_universities": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?gid=1852720049&single=true&output=csv",
+    "tech_alerts": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?gid=563180056&single=true&output=csv",
     "blacklist_companies": "",  # Add URL after publishing tab
-    "not_relevant_companies": "",  # Add URL after publishing tab
+    "not_relevant_companies": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?gid=1008417602&single=true&output=csv",
 }
 
 
@@ -85,9 +85,10 @@ def load_sheet_data(sheet_key: str) -> set:
         if response.status_code == 200:
             df = pd.read_csv(io.StringIO(response.text), encoding='utf-8')
             items = set()
-            # Get all values from all columns
+            # Get all values from all columns (handle non-string values)
             for col in df.columns:
-                items.update(df[col].dropna().str.strip().str.lower().tolist())
+                for val in df[col].dropna():
+                    items.add(str(val).strip().lower())
             # Remove empty strings
             items.discard('')
             return items
