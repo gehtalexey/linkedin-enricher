@@ -21,7 +21,7 @@ def load_urls(file_path: str) -> list[str]:
             # Handle both list of URLs and list of objects with 'url' key
             if isinstance(data, list):
                 if len(data) > 0 and isinstance(data[0], dict):
-                    return [item.get('url') or item.get('linkedin_url') or item.get('profile_url') for item in data]
+                    return [item.get('url') or item.get('linkedin_url') or item.get('profile_url') or item.get('public_url') for item in data]
                 return data
             return []
 
@@ -33,7 +33,8 @@ def load_urls(file_path: str) -> list[str]:
                 # Try common column names
                 url = (row.get('url') or row.get('linkedin_url') or
                        row.get('profile_url') or row.get('URL') or
-                       row.get('LinkedIn URL') or row.get('linkedinUrl'))
+                       row.get('LinkedIn URL') or row.get('linkedinUrl') or
+                       row.get('public_url'))
                 if url:
                     urls.append(url)
         return urls

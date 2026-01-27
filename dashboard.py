@@ -70,7 +70,8 @@ def extract_urls(uploaded_file) -> list[str]:
             for item in data:
                 if isinstance(item, dict):
                     url = (item.get('url') or item.get('linkedin_url') or
-                           item.get('profile_url') or item.get('linkedinUrl'))
+                           item.get('profile_url') or item.get('linkedinUrl') or
+                           item.get('public_url'))
                     if url:
                         urls.append(url)
                 elif isinstance(item, str):
@@ -79,7 +80,7 @@ def extract_urls(uploaded_file) -> list[str]:
     elif uploaded_file.name.endswith('.csv'):
         df = pd.read_csv(uploaded_file)
         # Try common column names
-        for col in ['url', 'linkedin_url', 'profile_url', 'URL', 'LinkedIn URL', 'linkedinUrl', 'LinkedIn', 'linkedin']:
+        for col in ['url', 'linkedin_url', 'profile_url', 'URL', 'LinkedIn URL', 'linkedinUrl', 'LinkedIn', 'linkedin', 'public_url']:
             if col in df.columns:
                 urls = df[col].dropna().tolist()
                 break
