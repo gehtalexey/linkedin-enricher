@@ -10,11 +10,23 @@ import time
 import os
 import io
 import requests
-import winsound
+import platform
 from pathlib import Path
 from datetime import datetime
-from plyer import notification
 from openai import OpenAI
+
+# Windows-specific imports (optional)
+try:
+    import winsound
+    WINDOWS = True
+except ImportError:
+    WINDOWS = False
+
+try:
+    from plyer import notification
+    HAS_PLYER = True
+except ImportError:
+    HAS_PLYER = False
 
 
 # Page config
@@ -33,11 +45,15 @@ def load_config():
     return {}
 
 def load_api_key():
-    # Environment variable takes priority, then config file
+    # Streamlit secrets > environment variable > config file
+    if hasattr(st, 'secrets') and 'CRUSTDATA_API_KEY' in st.secrets:
+        return st.secrets['CRUSTDATA_API_KEY']
     return os.environ.get('CRUSTDATA_API_KEY') or load_config().get('api_key')
 
 def load_openai_key():
-    # Environment variable takes priority, then config file
+    # Streamlit secrets > environment variable > config file
+    if hasattr(st, 'secrets') and 'OPENAI_API_KEY' in st.secrets:
+        return st.secrets['OPENAI_API_KEY']
     return os.environ.get('OPENAI_API_KEY') or load_config().get('openai_api_key')
 
 
@@ -66,18 +82,23 @@ def load_target_companies() -> set:
 
 
 def send_notification(title, message):
-    """Send desktop notification with sound."""
+    """Send desktop notification with sound (Windows only)."""
+    # Skip notifications on non-Windows (cloud deployment)
+    if not WINDOWS:
+        return
+
     try:
         # Play success sound (more noticeable)
         winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS)
 
         # Show Windows notification
-        notification.notify(
-            title=title,
-            message=message,
-            app_name="LinkedIn Enricher",
-            timeout=10
-        )
+        if HAS_PLYER:
+            notification.notify(
+                title=title,
+                message=message,
+                app_name="LinkedIn Enricher",
+                timeout=10
+            )
     except Exception as e:
         # Fallback: try just the beep
         try:
