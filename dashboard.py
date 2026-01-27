@@ -64,12 +64,13 @@ def load_openai_key():
 
 
 # Google Sheet URLs for filtering criteria
+# To add more tabs: File > Share > Publish to web > select specific tab > copy the URL
 GOOGLE_SHEETS = {
-    "target_companies": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?gid=0&single=true&output=csv",
-    "target_universities": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?gid=1&single=true&output=csv",
-    "tech_alerts": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?gid=2&single=true&output=csv",
-    "blacklist_companies": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?gid=3&single=true&output=csv",
-    "not_relevant_companies": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?gid=4&single=true&output=csv",
+    "target_companies": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?output=csv",
+    "target_universities": "",  # Add URL after publishing tab
+    "tech_alerts": "",  # Add URL after publishing tab
+    "blacklist_companies": "",  # Add URL after publishing tab
+    "not_relevant_companies": "",  # Add URL after publishing tab
 }
 
 
