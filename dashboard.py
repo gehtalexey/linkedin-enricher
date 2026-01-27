@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 import json
 import time
+import re
 import requests
 import winsound
 from pathlib import Path
@@ -141,6 +142,227 @@ def flatten_for_csv(data: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(flat_records)
 
 
+# ========== PRE-FILTERING FUNCTIONS ==========
+
+def filter_csv_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter CSV to keep only screening-relevant columns."""
+
+    def calc_years_to_today(date_str):
+        if pd.isna(date_str) or not str(date_str).strip():
+            return None
+        try:
+            dt = datetime.strptime(str(date_str).strip(), '%d %b %Y')
+            years = (datetime.now() - dt).days / 365.25
+            return round(years, 1)
+        except:
+            return None
+
+    def calc_years_between(start_str, end_str):
+        if pd.isna(start_str) or not str(start_str).strip():
+            return None
+        try:
+            start = datetime.strptime(str(start_str).strip(), '%d %b %Y')
+            if pd.isna(end_str) or not str(end_str).strip():
+                end = datetime.now()
+            else:
+                end = datetime.strptime(str(end_str).strip(), '%d %b %Y')
+            years = (end - start).days / 365.25
+            return round(years, 1)
+        except:
+            return None
+
+    result = pd.DataFrame()
+
+    # Basic info
+    result['first_name'] = df.get('first_name', pd.Series([''] * len(df)))
+    result['last_name'] = df.get('last_name', pd.Series([''] * len(df)))
+    result['headline'] = df.get('headline', pd.Series([''] * len(df)))
+    result['location'] = df.get('location', pd.Series([''] * len(df)))
+    result['summary'] = df.get('summary', pd.Series([''] * len(df)))
+
+    # Current position
+    result['current_title'] = df.get('job_1_job_title', pd.Series([''] * len(df)))
+    result['current_company'] = df.get('job_1_job_company_name', pd.Series([''] * len(df)))
+    result['current_start_date'] = df.get('job_1_job_start_date', pd.Series([''] * len(df)))
+    result['current_years_in_role'] = df.get('job_1_job_start_date', pd.Series()).apply(calc_years_to_today)
+    result['current_description'] = df.get('job_1_job_description', pd.Series([''] * len(df)))
+
+    # Past positions
+    def combine_past_positions(row):
+        positions = []
+        for i in range(2, 20):
+            title_col = f'job_{i}_job_title'
+            company_col = f'job_{i}_job_company_name'
+            start_col = f'job_{i}_job_start_date'
+            end_col = f'job_{i}_job_end_date'
+            desc_col = f'job_{i}_job_description'
+
+            if title_col in df.columns and pd.notna(row.get(title_col)):
+                title = row.get(title_col, '')
+                company = row.get(company_col, '')
+                start = row.get(start_col, '')
+                end = row.get(end_col, '')
+                desc = row.get(desc_col, '')
+                years = calc_years_between(start, end)
+                years_str = f" [{years} yrs]" if years else ""
+                desc_str = f": {desc}" if pd.notna(desc) and desc else ""
+                positions.append(f"{title} at {company} ({start} - {end}){years_str}{desc_str}")
+        return ' || '.join(positions)
+
+    result['past_positions'] = df.apply(combine_past_positions, axis=1)
+
+    # Education
+    def combine_education(row):
+        educations = []
+        for i in range(1, 10):
+            school_col = f'edu_{i}_school_name'
+            degree_col = f'edu_{i}_degree'
+            field_col = f'edu_{i}_field_of_study'
+
+            if school_col in df.columns and pd.notna(row.get(school_col)):
+                school = row.get(school_col, '')
+                degree = row.get(degree_col, '')
+                field = row.get(field_col, '')
+                parts = [school]
+                if pd.notna(degree) and degree:
+                    parts.append(degree)
+                if pd.notna(field) and field:
+                    parts.append(f"in {field}")
+                educations.append(', '.join(parts))
+        return ' | '.join(educations)
+
+    result['education'] = df.apply(combine_education, axis=1)
+
+    # Skills
+    skill_cols = [col for col in df.columns if re.match(r'^skill_\d+_name$', col)]
+    def combine_skills(row):
+        skills = []
+        for col in skill_cols:
+            if pd.notna(row.get(col)):
+                skills.append(str(row[col]))
+        return ', '.join(skills)
+
+    result['skills'] = df.apply(combine_skills, axis=1)
+
+    # LinkedIn URL
+    result['public_url'] = df.get('public_url', df.get('linkedin_url', pd.Series([''] * len(df))))
+
+    return result
+
+
+def apply_pre_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, dict]:
+    """Apply pre-filters to candidates. Returns filtered df and stats."""
+    stats = {}
+    original_count = len(df)
+
+    # Helper functions
+    def matches_list(company, company_list):
+        if pd.isna(company) or not str(company).strip():
+            return False
+        company_lower = str(company).lower().strip()
+        for c in company_list:
+            if c in company_lower or company_lower in c:
+                return True
+        return False
+
+    def matches_list_in_text(text, company_list):
+        if pd.isna(text) or not str(text).strip():
+            return False
+        text_lower = str(text).lower()
+        for c in company_list:
+            if c in text_lower:
+                return True
+        return False
+
+    # 1. Past candidates filter
+    if filters.get('past_candidates_df') is not None:
+        past_df = filters['past_candidates_df']
+        if 'Name' in past_df.columns:
+            past_names = set(str(name).lower().strip() for name in past_df['Name'].dropna())
+            df['_full_name'] = (df['first_name'].fillna('').str.lower().str.strip() + ' ' +
+                               df['last_name'].fillna('').str.lower().str.strip())
+            df['_is_past'] = df['_full_name'].isin(past_names)
+            stats['past_candidates'] = df['_is_past'].sum()
+            df = df[~df['_is_past']].drop(columns=['_is_past', '_full_name'])
+
+    # 2. Blacklist filter
+    if filters.get('blacklist'):
+        blacklist = [c.lower().strip() for c in filters['blacklist']]
+        df['_blacklisted'] = df['current_company'].apply(lambda x: matches_list(x, blacklist))
+        stats['blacklist'] = df['_blacklisted'].sum()
+        df = df[~df['_blacklisted']].drop(columns=['_blacklisted'])
+
+    # 3. Not relevant companies (current)
+    if filters.get('not_relevant'):
+        not_relevant = [c.lower().strip() for c in filters['not_relevant']]
+        df['_not_relevant'] = df['current_company'].apply(lambda x: matches_list(x, not_relevant))
+        stats['not_relevant_current'] = df['_not_relevant'].sum()
+        df = df[~df['_not_relevant']].drop(columns=['_not_relevant'])
+
+    # 4. Not relevant companies (past)
+    if filters.get('not_relevant_past') and filters.get('not_relevant'):
+        not_relevant = [c.lower().strip() for c in filters['not_relevant']]
+        df['_past_not_relevant'] = df['past_positions'].apply(lambda x: matches_list_in_text(x, not_relevant))
+        stats['not_relevant_past'] = df['_past_not_relevant'].sum()
+        df = df[~df['_past_not_relevant']].drop(columns=['_past_not_relevant'])
+
+    # 5. Job hoppers filter
+    if filters.get('filter_job_hoppers'):
+        def count_short_stints(past_positions):
+            if pd.isna(past_positions) or not str(past_positions).strip():
+                return 0
+            years_pattern = r'\[(\d+\.?\d*)\s*yrs?\]'
+            matches = re.findall(years_pattern, str(past_positions))
+            return sum(1 for y in matches if float(y) < 1.0)
+
+        df['_short_stints'] = df['past_positions'].apply(count_short_stints)
+        df['_is_job_hopper'] = df['_short_stints'] >= 2
+        stats['job_hoppers'] = df['_is_job_hopper'].sum()
+        df = df[~df['_is_job_hopper']].drop(columns=['_short_stints', '_is_job_hopper'])
+
+    # 6. Consulting companies filter
+    if filters.get('filter_consulting'):
+        consulting = ['tikal', 'matrix', 'ness', 'sela', 'malam', 'bynet', 'sqlink', 'john bryce',
+                      'experis', 'manpower', 'infosys', 'tata', 'wipro', 'cognizant', 'accenture', 'capgemini']
+        df['_is_consulting'] = df['current_company'].apply(lambda x: matches_list(x, consulting))
+        stats['consulting'] = df['_is_consulting'].sum()
+        df = df[~df['_is_consulting']].drop(columns=['_is_consulting'])
+
+    # 7. Long tenure filter
+    if filters.get('filter_long_tenure'):
+        df['_long_tenure'] = df['current_years_in_role'].apply(lambda x: x >= 8 if pd.notna(x) else False)
+        stats['long_tenure'] = df['_long_tenure'].sum()
+        df = df[~df['_long_tenure']].drop(columns=['_long_tenure'])
+
+    # 8. Management titles filter
+    if filters.get('filter_management'):
+        exclude_titles = ['director', 'head of', 'vp ', 'vice president', 'cto', 'ceo', 'coo',
+                          'chief ', 'group manager', 'engineering manager', 'r&d manager', 'founder']
+        keep_titles = ['team lead', 'tech lead', 'staff', 'principal', 'senior', 'architect']
+
+        def is_management_title(title):
+            if pd.isna(title) or not str(title).strip():
+                return False
+            title_lower = str(title).lower()
+            for keep in keep_titles:
+                if keep in title_lower:
+                    return False
+            for excl in exclude_titles:
+                if excl in title_lower:
+                    return True
+            return False
+
+        df['_is_management'] = df['current_title'].apply(is_management_title)
+        stats['management_titles'] = df['_is_management'].sum()
+        df = df[~df['_is_management']].drop(columns=['_is_management'])
+
+    stats['original'] = original_count
+    stats['final'] = len(df)
+    stats['total_removed'] = original_count - len(df)
+
+    return df, stats
+
+
 def screen_profile(profile: dict, job_description: str, client: OpenAI) -> dict:
     """Screen a profile against a job description using OpenAI."""
 
@@ -227,8 +449,102 @@ if pre_enriched_file:
 
 st.divider()
 
-# ========== SECTION 2: Enrich new profiles (optional) ==========
-with st.expander("Or: Enrich New Profiles (requires Crust Data API key)", expanded=False):
+# ========== SECTION 2: Pre-Filter Candidates ==========
+st.subheader("2. Pre-Filter Candidates")
+st.markdown("Apply filters to remove irrelevant candidates before AI screening")
+
+if 'results' in st.session_state and st.session_state['results']:
+    # Check if data needs column filtering
+    df = st.session_state['results_df']
+    needs_filtering = 'job_1_job_title' in df.columns and 'current_title' not in df.columns
+
+    if needs_filtering:
+        if st.button("Convert to Screening Format"):
+            with st.spinner("Converting columns..."):
+                filtered_df = filter_csv_columns(df)
+                st.session_state['results_df'] = filtered_df
+                st.session_state['results'] = filtered_df.to_dict('records')
+                st.success(f"Converted to {len(filtered_df.columns)} screening columns")
+                st.rerun()
+
+    # Pre-filter options
+    with st.expander("Filter Options", expanded=True):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**Upload Filter Files:**")
+            past_candidates_file = st.file_uploader("Past Candidates CSV", type=['csv'], key="past_candidates")
+            blacklist_file = st.file_uploader("Blacklist Companies CSV", type=['csv'], key="blacklist")
+            not_relevant_file = st.file_uploader("Not Relevant Companies CSV", type=['csv'], key="not_relevant")
+
+        with col2:
+            st.markdown("**Additional Filters:**")
+            filter_not_relevant_past = st.checkbox("Also filter past positions for not relevant", value=True)
+            filter_job_hoppers = st.checkbox("Filter job hoppers (2+ roles < 1 year)", value=True)
+            filter_consulting = st.checkbox("Filter consulting/project companies", value=True)
+            filter_long_tenure = st.checkbox("Filter 8+ years at one company", value=True)
+            filter_management = st.checkbox("Filter Director/VP/Head titles", value=True)
+
+        if st.button("Apply Filters", type="primary"):
+            filters = {
+                'filter_job_hoppers': filter_job_hoppers,
+                'filter_consulting': filter_consulting,
+                'filter_long_tenure': filter_long_tenure,
+                'filter_management': filter_management,
+                'not_relevant_past': filter_not_relevant_past,
+            }
+
+            # Load filter files
+            if past_candidates_file:
+                filters['past_candidates_df'] = pd.read_csv(past_candidates_file)
+
+            if blacklist_file:
+                bl_df = pd.read_csv(blacklist_file)
+                filters['blacklist'] = bl_df.iloc[:, 0].dropna().tolist()
+
+            if not_relevant_file:
+                nr_df = pd.read_csv(not_relevant_file)
+                filters['not_relevant'] = nr_df.iloc[:, 0].dropna().tolist()
+
+            # Apply filters
+            with st.spinner("Applying filters..."):
+                df = st.session_state['results_df']
+                filtered_df, stats = apply_pre_filters(df, filters)
+
+                st.session_state['results_df'] = filtered_df
+                st.session_state['results'] = filtered_df.to_dict('records')
+                st.session_state['filter_stats'] = stats
+
+            st.success(f"Filtering complete! {stats['final']} candidates remaining")
+            st.rerun()
+
+    # Show filter stats if available
+    if 'filter_stats' in st.session_state:
+        stats = st.session_state['filter_stats']
+        st.markdown("**Filter Results:**")
+        stats_cols = st.columns(4)
+        with stats_cols[0]:
+            st.metric("Original", stats.get('original', 0))
+        with stats_cols[1]:
+            st.metric("Removed", stats.get('total_removed', 0))
+        with stats_cols[2]:
+            st.metric("Remaining", stats.get('final', 0))
+        with stats_cols[3]:
+            pct = round((stats.get('final', 0) / stats.get('original', 1)) * 100) if stats.get('original', 0) > 0 else 0
+            st.metric("Keep Rate", f"{pct}%")
+
+        with st.expander("Detailed Breakdown"):
+            for key, value in stats.items():
+                if key not in ['original', 'final', 'total_removed'] and value > 0:
+                    st.text(f"{key.replace('_', ' ').title()}: {value} removed")
+
+else:
+    st.info("Upload data above first to enable filtering.")
+
+st.divider()
+
+# ========== SECTION 3: Enrich new profiles (optional) ==========
+with st.expander("Enrich New Profiles (requires Crust Data API key)", expanded=False):
     if not has_crust_key:
         st.warning("Crust Data API key not configured. Add 'api_key' to config.json")
     else:
@@ -291,9 +607,9 @@ with st.expander("Or: Enrich New Profiles (requires Crust Data API key)", expand
 
 st.divider()
 
-# ========== SECTION 3: View loaded data ==========
+# ========== SECTION 4: View loaded data ==========
 if 'results' in st.session_state and st.session_state['results']:
-    st.subheader("2. Loaded Data")
+    st.subheader("3. Loaded Data")
     results = st.session_state['results']
     df = st.session_state['results_df']
     st.success(f"**{len(results)}** profiles loaded")
@@ -301,8 +617,8 @@ if 'results' in st.session_state and st.session_state['results']:
 
 st.divider()
 
-# ========== SECTION 4: AI Screening ==========
-st.subheader("3. AI Screening")
+# ========== SECTION 5: AI Screening ==========
+st.subheader("4. AI Screening")
 
 openai_key = load_openai_key()
 if not openai_key:
@@ -363,10 +679,10 @@ else:
                 send_notification("Screening Complete", f"Screened {len(screening_results)} candidates")
                 st.session_state['screening_results'] = screening_results
 
-# ========== SECTION 5: Screening Results ==========
+# ========== SECTION 6: Screening Results ==========
 if 'screening_results' in st.session_state and st.session_state['screening_results']:
     st.divider()
-    st.subheader("4. Screening Results")
+    st.subheader("5. Screening Results")
 
     screening_results = st.session_state['screening_results']
     screening_results_sorted = sorted(screening_results, key=lambda x: x.get('score', 0), reverse=True)
