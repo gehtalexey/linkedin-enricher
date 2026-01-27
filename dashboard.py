@@ -433,19 +433,25 @@ if pre_enriched_file:
             if isinstance(pre_enriched_data, list):
                 st.session_state['results'] = pre_enriched_data
                 st.session_state['results_df'] = flatten_for_csv(pre_enriched_data)
+                st.success(f"Loaded **{len(pre_enriched_data)}** profiles from JSON!")
             else:
                 st.error("JSON must be a list of profiles")
-                pre_enriched_data = []
         else:
-            df_uploaded = pd.read_csv(pre_enriched_file)
-            pre_enriched_data = df_uploaded.to_dict('records')
-            st.session_state['results'] = pre_enriched_data
+            # Reset file position for re-reads
+            pre_enriched_file.seek(0)
+            df_uploaded = pd.read_csv(pre_enriched_file, encoding='utf-8')
+            st.session_state['results'] = df_uploaded.to_dict('records')
             st.session_state['results_df'] = df_uploaded
-
-        if pre_enriched_data:
-            st.success(f"Loaded **{len(pre_enriched_data)}** profiles! Scroll down to AI Screening.")
+            st.success(f"Loaded **{len(df_uploaded)}** profiles from CSV!")
+            st.info(f"Columns: {', '.join(df_uploaded.columns[:5])}... ({len(df_uploaded.columns)} total)")
     except Exception as e:
         st.error(f"Error loading file: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+# Show current data status
+if 'results' in st.session_state and st.session_state['results']:
+    st.success(f"**{len(st.session_state['results'])}** profiles currently loaded")
 
 st.divider()
 
