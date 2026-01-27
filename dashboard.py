@@ -63,28 +63,103 @@ def load_openai_key():
     return os.environ.get('OPENAI_API_KEY') or load_config().get('openai_api_key')
 
 
-# Google Sheet URL for target companies (companies with layoffs to recruit from)
-TARGET_COMPANIES_SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?output=csv"
+# Google Sheet URLs for filtering criteria
+GOOGLE_SHEETS = {
+    "target_companies": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?gid=0&single=true&output=csv",
+    "target_universities": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?gid=1&single=true&output=csv",
+    "tech_alerts": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?gid=2&single=true&output=csv",
+    "blacklist_companies": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwZW1szbtKb7yYRU5hVE6FdMchLkRNd_jRff2eyYSSpD4R1V0USYsK_6uEBQLzlOdvUFMucJSh2bsv/pub?gid=3&single=true&output=csv",
+}
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
+def load_sheet_data(sheet_key: str) -> set:
+    """Load data from a Google Sheet tab."""
+    url = GOOGLE_SHEETS.get(sheet_key)
+    if not url:
+        return set()
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            df = pd.read_csv(io.StringIO(response.text), encoding='utf-8')
+            items = set()
+            # Get all values from all columns
+            for col in df.columns:
+                items.update(df[col].dropna().str.strip().str.lower().tolist())
+            # Remove empty strings
+            items.discard('')
+            return items
+    except Exception as e:
+        st.warning(f"Could not load {sheet_key} from Google Sheet: {e}")
+    return set()
+
+
 def load_target_companies() -> set:
     """Load target companies from Google Sheet."""
+    return load_sheet_data("target_companies")
+
+
+def load_target_universities() -> set:
+    """Load target universities from Google Sheet."""
+    return load_sheet_data("target_universities")
+
+
+def load_tech_alerts() -> set:
+    """Load tech alert companies from Google Sheet."""
+    return load_sheet_data("tech_alerts")
+
+
+def load_blacklist_companies() -> set:
+    """Load blacklisted companies from Google Sheet."""
+    return load_sheet_data("blacklist_companies")
+
+
+def extract_past_candidates(uploaded_file) -> set:
+    """Extract LinkedIn URLs from a past candidates file."""
+    urls = set()
+    if uploaded_file is None:
+        return urls
+
     try:
-        response = requests.get(TARGET_COMPANIES_SHEET_URL, timeout=10)
-        if response.status_code == 200:
-            import io
-            df = pd.read_csv(io.StringIO(response.text), encoding='utf-8')
-            companies = set()
-            # Get all company names from both columns
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+            # Find URL column
             for col in df.columns:
-                companies.update(df[col].dropna().str.strip().str.lower().tolist())
-            # Remove empty strings
-            companies.discard('')
-            return companies
+                if 'url' in col.lower() or 'linkedin' in col.lower():
+                    for val in df[col].dropna():
+                        url = normalize_url(str(val))
+                        if 'linkedin.com' in url:
+                            urls.add(url)
+                    break
+        elif uploaded_file.name.endswith('.json'):
+            data = json.load(uploaded_file)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        url = item.get('url') or item.get('linkedin_url') or item.get('linkedinUrl') or ''
+                        if url and 'linkedin.com' in str(url):
+                            urls.add(normalize_url(url))
+                    elif isinstance(item, str) and 'linkedin.com' in item:
+                        urls.add(normalize_url(item))
     except Exception as e:
-        st.warning(f"Could not load target companies from Google Sheet: {e}")
-    return set()
+        st.warning(f"Could not parse past candidates file: {e}")
+
+    return urls
+
+
+def match_company(profile_company: str, target_set: set) -> bool:
+    """Check if profile company matches any company in target set (fuzzy match)."""
+    if not profile_company:
+        return False
+    company_lower = profile_company.strip().lower()
+    # Exact match
+    if company_lower in target_set:
+        return True
+    # Partial match (company name contains or is contained by target)
+    for target in target_set:
+        if target in company_lower or company_lower in target:
+            return True
+    return False
 
 
 def send_notification(title, message):
@@ -392,54 +467,209 @@ if uploaded_file:
             # Filter section
             st.subheader("3. Filter Profiles")
 
-            # Load target companies from Google Sheet
+            # Load filter lists from Google Sheets
             target_companies = load_target_companies()
+            target_universities = load_target_universities()
+            tech_alerts = load_tech_alerts()
+            blacklist_companies = load_blacklist_companies()
+
+            # Show loaded filters summary
+            filter_summary = []
             if target_companies:
-                st.success(f"Loaded **{len(target_companies)}** target companies from Google Sheet")
+                filter_summary.append(f"{len(target_companies)} target companies")
+            if target_universities:
+                filter_summary.append(f"{len(target_universities)} target universities")
+            if tech_alerts:
+                filter_summary.append(f"{len(tech_alerts)} tech alerts")
+            if blacklist_companies:
+                filter_summary.append(f"{len(blacklist_companies)} blacklisted companies")
+            if filter_summary:
+                st.success(f"Loaded from Google Sheet: {', '.join(filter_summary)}")
 
-            # Target companies filter (quick filter)
-            use_target_filter = st.checkbox(
-                "Only show profiles from Target Companies (Google Sheet)",
-                value=False,
-                help="Filter profiles to only show those from companies in your Google Sheet"
-            )
+            # === EXCLUDE FILTERS ===
+            with st.expander("🚫 Exclude Filters", expanded=True):
+                st.markdown("**Remove profiles matching these criteria:**")
 
-            # Get unique values for filters
-            all_companies = sorted(set(p['company'] for p in uploaded_profiles if p.get('company')))
-            all_titles = sorted(set(p['title'] for p in uploaded_profiles if p.get('title')))
-            all_universities = sorted(set(p['university'] for p in uploaded_profiles if p.get('university')))
+                exclude_col1, exclude_col2 = st.columns(2)
 
-            filter_col1, filter_col2, filter_col3 = st.columns(3)
+                with exclude_col1:
+                    # Blacklist companies (from Google Sheet)
+                    use_blacklist = st.checkbox(
+                        "Exclude Blacklisted Companies (Google Sheet)",
+                        value=True if blacklist_companies else False,
+                        help="Remove profiles from companies in your blacklist"
+                    )
 
-            with filter_col1:
-                selected_companies = st.multiselect("Filter by Company", all_companies, default=[])
-            with filter_col2:
-                selected_titles = st.multiselect("Filter by Title (contains)", all_titles, default=[])
-            with filter_col3:
-                selected_universities = st.multiselect("Filter by University", all_universities, default=[])
+                    # Past candidates upload
+                    st.markdown("**Past Candidates (exclude already contacted):**")
+                    past_candidates_file = st.file_uploader(
+                        "Upload past candidates file",
+                        type=['csv', 'json'],
+                        key="past_candidates",
+                        help="Upload a file with LinkedIn URLs of past candidates to exclude"
+                    )
+                    past_candidate_urls = set()
+                    if past_candidates_file:
+                        past_candidate_urls = extract_past_candidates(past_candidates_file)
+                        st.caption(f"Loaded {len(past_candidate_urls)} past candidate URLs")
 
-            # Apply filters
+                with exclude_col2:
+                    # Manual company exclusion
+                    all_companies = sorted(set(p['company'] for p in uploaded_profiles if p.get('company')))
+                    exclude_companies = st.multiselect(
+                        "Exclude specific companies",
+                        all_companies,
+                        default=[],
+                        help="Select companies to exclude from results"
+                    )
+
+                    # Title exclusion keywords
+                    exclude_title_keywords = st.text_input(
+                        "Exclude title keywords (comma-separated)",
+                        placeholder="intern, student, junior",
+                        help="Exclude profiles with these words in their title"
+                    )
+
+            # === INCLUDE FILTERS ===
+            with st.expander("✅ Include Filters (narrow down to matching profiles)", expanded=True):
+                st.markdown("**Only include profiles matching these criteria:**")
+
+                include_col1, include_col2 = st.columns(2)
+
+                with include_col1:
+                    # Target companies filter
+                    use_target_companies = st.checkbox(
+                        "Target Companies (Google Sheet)",
+                        value=False,
+                        help="Only show profiles from your target companies list"
+                    )
+
+                    # Tech alerts filter
+                    use_tech_alerts = st.checkbox(
+                        "Tech Alerts (Google Sheet)",
+                        value=False,
+                        help="Only show profiles from companies with tech alerts"
+                    )
+
+                    # Target universities filter
+                    use_target_universities = st.checkbox(
+                        "Target Universities (Google Sheet)",
+                        value=False,
+                        help="Only show profiles from your target universities"
+                    )
+
+                with include_col2:
+                    # Manual company selection
+                    include_companies = st.multiselect(
+                        "Include specific companies",
+                        all_companies,
+                        default=[],
+                        help="Only include these specific companies"
+                    )
+
+                    # Title inclusion keywords
+                    include_title_keywords = st.text_input(
+                        "Include title keywords (comma-separated)",
+                        placeholder="engineer, developer, architect",
+                        help="Only include profiles with these words in their title"
+                    )
+
+                    # University filter
+                    all_universities = sorted(set(p['university'] for p in uploaded_profiles if p.get('university')))
+                    include_universities = st.multiselect(
+                        "Include specific universities",
+                        all_universities,
+                        default=[],
+                        help="Only include profiles from these universities"
+                    )
+
+            # === APPLY FILTERS ===
             filtered_profiles = uploaded_profiles.copy()
+            filter_stats = {"start": len(filtered_profiles)}
 
-            # Target companies filter (from Google Sheet)
-            if use_target_filter and target_companies:
+            # --- EXCLUSIONS FIRST ---
+            # Exclude blacklisted companies
+            if use_blacklist and blacklist_companies:
                 filtered_profiles = [
                     p for p in filtered_profiles
-                    if p.get('company', '').strip().lower() in target_companies
+                    if not match_company(p.get('company', ''), blacklist_companies)
                 ]
+                filter_stats["after_blacklist"] = len(filtered_profiles)
 
-            if selected_companies:
-                filtered_profiles = [p for p in filtered_profiles if p.get('company') in selected_companies]
-            if selected_titles:
-                filtered_profiles = [p for p in filtered_profiles if any(t.lower() in p.get('title', '').lower() for t in selected_titles)]
-            if selected_universities:
-                filtered_profiles = [p for p in filtered_profiles if p.get('university') in selected_universities]
+            # Exclude past candidates
+            if past_candidate_urls:
+                filtered_profiles = [
+                    p for p in filtered_profiles
+                    if normalize_url(p.get('url', '')) not in past_candidate_urls
+                ]
+                filter_stats["after_past_candidates"] = len(filtered_profiles)
 
-            # Show match info
-            if use_target_filter and target_companies:
-                st.info(f"**{len(filtered_profiles)}** profiles from target companies (out of {len(uploaded_profiles)} total)")
-            else:
-                st.info(f"**{len(filtered_profiles)}** profiles match your filters (out of {len(uploaded_profiles)} total)")
+            # Exclude specific companies
+            if exclude_companies:
+                filtered_profiles = [
+                    p for p in filtered_profiles
+                    if p.get('company') not in exclude_companies
+                ]
+                filter_stats["after_exclude_companies"] = len(filtered_profiles)
+
+            # Exclude title keywords
+            if exclude_title_keywords:
+                keywords = [k.strip().lower() for k in exclude_title_keywords.split(',') if k.strip()]
+                if keywords:
+                    filtered_profiles = [
+                        p for p in filtered_profiles
+                        if not any(kw in p.get('title', '').lower() for kw in keywords)
+                    ]
+                    filter_stats["after_exclude_titles"] = len(filtered_profiles)
+
+            # --- INCLUSIONS ---
+            # Combine all include company filters (OR logic between filter types)
+            include_company_filters_active = use_target_companies or use_tech_alerts or include_companies
+            if include_company_filters_active:
+                combined_target_companies = set()
+                if use_target_companies and target_companies:
+                    combined_target_companies.update(target_companies)
+                if use_tech_alerts and tech_alerts:
+                    combined_target_companies.update(tech_alerts)
+                if include_companies:
+                    combined_target_companies.update(c.lower() for c in include_companies)
+
+                if combined_target_companies:
+                    filtered_profiles = [
+                        p for p in filtered_profiles
+                        if match_company(p.get('company', ''), combined_target_companies)
+                    ]
+                    filter_stats["after_include_companies"] = len(filtered_profiles)
+
+            # Include target universities
+            if use_target_universities and target_universities:
+                filtered_profiles = [
+                    p for p in filtered_profiles
+                    if p.get('university', '').strip().lower() in target_universities
+                ]
+                filter_stats["after_target_universities"] = len(filtered_profiles)
+
+            # Include specific universities
+            if include_universities:
+                filtered_profiles = [
+                    p for p in filtered_profiles
+                    if p.get('university') in include_universities
+                ]
+                filter_stats["after_include_universities"] = len(filtered_profiles)
+
+            # Include title keywords
+            if include_title_keywords:
+                keywords = [k.strip().lower() for k in include_title_keywords.split(',') if k.strip()]
+                if keywords:
+                    filtered_profiles = [
+                        p for p in filtered_profiles
+                        if any(kw in p.get('title', '').lower() for kw in keywords)
+                    ]
+                    filter_stats["after_include_titles"] = len(filtered_profiles)
+
+            # Show filter results
+            st.divider()
+            st.markdown(f"### Filter Results: **{len(filtered_profiles)}** profiles (from {len(uploaded_profiles)} total)")
 
             if st.button("📋 Use These Profiles for Screening", type="primary"):
                 # Re-read the file with full_data=True to get all fields
