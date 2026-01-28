@@ -448,6 +448,8 @@ def apply_pre_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, di
     filtered_out = {}  # Store removed candidates by filter type
     original_count = len(df)
 
+    df = df.copy()  # Avoid SettingWithCopyWarning
+
     # Helper functions
     def normalize_company(name):
         """Normalize company name for comparison."""
@@ -496,6 +498,8 @@ def apply_pre_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, di
                 return True
         return False
 
+    # ========== EXCLUSION FILTERS ==========
+
     # 1. Past candidates filter
     if filters.get('past_candidates_df') is not None:
         past_df = filters['past_candidates_df']
@@ -532,7 +536,7 @@ def apply_pre_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, di
         filtered_out['Not Relevant (Past)'] = df[df['_past_not_relevant']].drop(columns=['_past_not_relevant']).copy()
         df = df[~df['_past_not_relevant']].drop(columns=['_past_not_relevant'])
 
-    # 5. Job hoppers filter
+    # 5. Job hoppers filter - exempt priority candidates
     if filters.get('filter_job_hoppers'):
         def count_short_stints(past_positions):
             if pd.isna(past_positions) or not str(past_positions).strip():
@@ -585,24 +589,6 @@ def apply_pre_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, di
         stats['management_titles'] = df['_is_management'].sum()
         filtered_out['Management Titles'] = df[df['_is_management']].drop(columns=['_is_management']).copy()
         df = df[~df['_is_management']].drop(columns=['_is_management'])
-
-    # 9. Mark target company candidates (add priority column - does not filter)
-    if filters.get('mark_target') and filters.get('target_companies'):
-        target_list = [c.lower().strip() for c in filters['target_companies']]
-        df['from_target_company'] = df['current_company'].apply(lambda x: matches_list(x, target_list))
-        stats['target_company_candidates'] = df['from_target_company'].sum()
-
-    # 11. Mark tech alerts / layoffs candidates (add priority column)
-    if filters.get('mark_tech_alerts') and filters.get('tech_alerts'):
-        alerts_list = [c.lower().strip() for c in filters['tech_alerts']]
-        df['from_layoff_company'] = df['current_company'].apply(lambda x: matches_list(x, alerts_list))
-        stats['layoff_company_candidates'] = df['from_layoff_company'].sum()
-
-    # 10. Mark university candidates (add priority column - does not filter)
-    if filters.get('mark_universities') and filters.get('universities'):
-        uni_list = [u.lower().strip() for u in filters['universities']]
-        df['from_target_university'] = df['education'].apply(lambda x: matches_list_in_text(x, uni_list) if pd.notna(x) else False)
-        stats['target_university_candidates'] = df['from_target_university'].sum()
 
     stats['original'] = original_count
     stats['final'] = len(df)
@@ -658,107 +644,65 @@ Return ONLY the JSON, no other text."""
 
 # Main UI
 st.title("LinkedIn Profile Enricher")
-st.markdown("Upload pre-enriched data for AI screening, or enrich new profiles")
 
 # Check API keys
 api_key = load_api_key()
 has_crust_key = api_key and api_key != "YOUR_CRUSTDATA_API_KEY_HERE"
 
-# ========== SECTION 1: Upload pre-enriched data ==========
-st.subheader("1. Upload Pre-Enriched Data (for AI Screening)")
-st.markdown("Already have enriched LinkedIn data? Upload it here.")
+# Show data status in header
+if 'results' in st.session_state and st.session_state['results']:
+    st.info(f"📊 **{len(st.session_state['results'])}** profiles loaded")
 
-pre_enriched_file = st.file_uploader(
-    "Upload pre-enriched CSV or JSON",
-    type=['csv', 'json'],
-    key="pre_enriched_upload"
-)
+# Create tabs
+tab_upload, tab_filter, tab_results, tab_screening = st.tabs(["📤 Upload", "🔍 Filter", "📋 Results", "🤖 AI Screening"])
 
-if pre_enriched_file:
-    try:
-        if pre_enriched_file.name.endswith('.json'):
-            pre_enriched_data = json.load(pre_enriched_file)
-            if isinstance(pre_enriched_data, list):
-                st.session_state['results'] = pre_enriched_data
-                st.session_state['results_df'] = flatten_for_csv(pre_enriched_data)
-                st.success(f"Loaded **{len(pre_enriched_data)}** profiles from JSON!")
+# ========== TAB 1: Upload ==========
+with tab_upload:
+    pre_enriched_file = st.file_uploader(
+        "Upload pre-enriched CSV or JSON",
+        type=['csv', 'json'],
+        key="pre_enriched_upload"
+    )
+
+    if pre_enriched_file:
+        try:
+            if pre_enriched_file.name.endswith('.json'):
+                pre_enriched_data = json.load(pre_enriched_file)
+                if isinstance(pre_enriched_data, list):
+                    st.session_state['results'] = pre_enriched_data
+                    st.session_state['results_df'] = flatten_for_csv(pre_enriched_data)
+                    st.success(f"Loaded **{len(pre_enriched_data)}** profiles!")
             else:
-                st.error("JSON must be a list of profiles")
-        else:
-            # Reset file position for re-reads
-            pre_enriched_file.seek(0)
-            df_uploaded = pd.read_csv(pre_enriched_file, encoding='utf-8')
-            st.session_state['results'] = df_uploaded.to_dict('records')
-            st.session_state['results_df'] = df_uploaded
-            st.success(f"Loaded **{len(df_uploaded)}** profiles from CSV!")
-            st.info(f"Columns: {', '.join(df_uploaded.columns[:5])}... ({len(df_uploaded.columns)} total)")
-    except Exception as e:
-        st.error(f"Error loading file: {e}")
-        import traceback
-        st.code(traceback.format_exc())
+                pre_enriched_file.seek(0)
+                df_uploaded = pd.read_csv(pre_enriched_file, encoding='utf-8')
+                st.session_state['results'] = df_uploaded.to_dict('records')
+                st.session_state['results_df'] = df_uploaded
+                st.success(f"Loaded **{len(df_uploaded)}** profiles!")
+        except Exception as e:
+            st.error(f"Error: {e}")
 
-# Show current data status and preview
-if 'results' in st.session_state and st.session_state['results']:
-    st.success(f"**{len(st.session_state['results'])}** profiles currently loaded")
-
-    # Compact data preview with pagination
-    with st.expander("Preview loaded data (click to expand)", expanded=False):
+    if 'results' in st.session_state and st.session_state['results']:
         df = st.session_state['results_df']
-        page_size = 10
-        total_pages = (len(df) + page_size - 1) // page_size
-
-        # Initialize page in session state
-        if 'preview_page' not in st.session_state:
-            st.session_state['preview_page'] = 0
-
-        # Navigation
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col1:
-            if st.button("← Previous", disabled=st.session_state['preview_page'] == 0, key="prev_page"):
-                st.session_state['preview_page'] -= 1
-                st.rerun()
-        with col2:
-            st.markdown(f"<center>Page {st.session_state['preview_page'] + 1} of {total_pages}</center>", unsafe_allow_html=True)
-        with col3:
-            if st.button("Next →", disabled=st.session_state['preview_page'] >= total_pages - 1, key="next_page"):
-                st.session_state['preview_page'] += 1
-                st.rerun()
-
-        # Display current page
-        start_idx = st.session_state['preview_page'] * page_size
-        end_idx = min(start_idx + page_size, len(df))
-
-        display_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'location']
+        display_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'education', 'location']
         available_cols = [c for c in display_cols if c in df.columns]
-        if available_cols:
-            st.dataframe(df[available_cols].iloc[start_idx:end_idx], use_container_width=True, hide_index=True)
-        else:
-            st.dataframe(df.iloc[start_idx:end_idx], use_container_width=True, hide_index=True)
+        st.dataframe(df[available_cols].head(50) if available_cols else df.head(50), use_container_width=True, hide_index=True)
+        st.caption(f"Showing first 50 of {len(df)} profiles")
 
-        st.caption(f"Showing {start_idx + 1}-{end_idx} of {len(df)} profiles")
+# ========== TAB 2: Filter ==========
+with tab_filter:
+    if 'results' not in st.session_state or not st.session_state['results']:
+        st.info("Upload data in the Upload tab first.")
+    else:
+        df = st.session_state['results_df']
+        needs_filtering = 'job_1_job_title' in df.columns and 'current_title' not in df.columns
 
-st.divider()
-
-# ========== SECTION 2: Pre-Filter Candidates ==========
-st.subheader("2. Pre-Filter Candidates")
-st.markdown("Apply filters to remove irrelevant candidates before AI screening")
-
-if 'results' in st.session_state and st.session_state['results']:
-    # Check if data needs column filtering
-    df = st.session_state['results_df']
-    needs_filtering = 'job_1_job_title' in df.columns and 'current_title' not in df.columns
-
-    if needs_filtering:
-        if st.button("Convert to Screening Format"):
-            with st.spinner("Converting columns..."):
+        if needs_filtering:
+            if st.button("Convert to Screening Format"):
                 filtered_df = filter_csv_columns(df)
                 st.session_state['results_df'] = filtered_df
                 st.session_state['results'] = filtered_df.to_dict('records')
-                st.success(f"Converted to {len(filtered_df.columns)} screening columns")
                 st.rerun()
 
-    # Pre-filter options
-    with st.expander("Filter Options", expanded=True):
         # Check for Google Sheets config
         filter_sheets = get_filter_sheets_config().copy()
         gspread_client = get_gspread_client()
@@ -847,22 +791,6 @@ if 'results' in st.session_state and st.session_state['results']:
             filter_long_tenure = st.checkbox("Filter 8+ years at one company", value=True)
             filter_management = st.checkbox("Filter Director/VP/Head titles", value=True)
 
-            st.markdown("**Priority Markers (highlight, not filter):**")
-            # Target companies
-            use_target = has_sheets and filter_sheets.get('target_companies')
-            mark_target = st.checkbox("Highlight Target Company candidates", value=True, disabled=not use_target,
-                                      help="Adds column to identify candidates from target companies")
-
-            # Universities
-            use_universities = has_sheets and filter_sheets.get('universities')
-            mark_universities = st.checkbox("Highlight Target University candidates", value=True, disabled=not use_universities,
-                                           help="Adds column to identify candidates from target universities")
-
-            # Tech alerts / layoffs
-            use_tech_alerts = has_sheets and filter_sheets.get('tech_alerts')
-            mark_tech_alerts = st.checkbox("Highlight Layoff Company candidates", value=True, disabled=not use_tech_alerts,
-                                          help="Adds column to identify candidates from companies with recent layoffs")
-
         if st.button("Apply Filters", type="primary"):
             filters = {
                 'filter_job_hoppers': filter_job_hoppers,
@@ -870,9 +798,6 @@ if 'results' in st.session_state and st.session_state['results']:
                 'filter_long_tenure': filter_long_tenure,
                 'filter_management': filter_management,
                 'not_relevant_past': filter_not_relevant_past,
-                'mark_target': mark_target,
-                'mark_universities': mark_universities,
-                'mark_tech_alerts': mark_tech_alerts,
             }
 
             # Load filter data from Google Sheets or files
@@ -908,42 +833,12 @@ if 'results' in st.session_state and st.session_state['results']:
                     nr_df = pd.read_csv(not_relevant_file)
                     filters['not_relevant'] = nr_df.iloc[:, 0].dropna().tolist()
 
-                # Target companies
-                if mark_target and filter_sheets.get('target_companies'):
-                    tc_df = load_sheet_as_df(sheet_url, filter_sheets['target_companies'])
-                    if tc_df is not None and len(tc_df.columns) > 0:
-                        # Combine all company name columns
-                        target_companies = []
-                        for col in tc_df.columns:
-                            if 'company' in col.lower() or 'name' in col.lower():
-                                target_companies.extend(tc_df[col].dropna().tolist())
-                        filters['target_companies'] = [str(c) for c in target_companies if c]
-                        st.info(f"Loaded {len(filters['target_companies'])} target companies from Google Sheet")
-
-                # Universities
-                if mark_universities and filter_sheets.get('universities'):
-                    uni_df = load_sheet_as_df(sheet_url, filter_sheets['universities'])
-                    if uni_df is not None and len(uni_df.columns) > 0:
-                        filters['universities'] = uni_df.iloc[:, 0].dropna().tolist()
-                        st.info(f"Loaded {len(filters['universities'])} universities from Google Sheet")
-
-                # Tech alerts / layoffs
-                if mark_tech_alerts and filter_sheets.get('tech_alerts'):
-                    ta_df = load_sheet_as_df(sheet_url, filter_sheets['tech_alerts'])
-                    if ta_df is not None and len(ta_df.columns) > 0:
-                        # Combine all company name columns
-                        tech_alerts = []
-                        for col in ta_df.columns:
-                            if 'company' in col.lower() or 'name' in col.lower():
-                                tech_alerts.extend(ta_df[col].dropna().tolist())
-                        filters['tech_alerts'] = [str(c) for c in tech_alerts if c]
-                        st.info(f"Loaded {len(filters['tech_alerts'])} tech alert companies from Google Sheet")
-
             # Apply filters
             with st.spinner("Applying filters..."):
                 df = st.session_state['results_df']
                 filtered_df, stats, filtered_out = apply_pre_filters(df, filters)
 
+                st.session_state['passed_candidates_df'] = filtered_df  # Store filtered results separately
                 st.session_state['results_df'] = filtered_df
                 st.session_state['results'] = filtered_df.to_dict('records')
                 st.session_state['filter_stats'] = stats
@@ -968,9 +863,180 @@ if 'results' in st.session_state and st.session_state['results']:
             st.metric("Keep Rate", f"{pct}%")
 
         with st.expander("Detailed Breakdown"):
+            st.markdown("**Filtered Out:**")
+            exclude_keys = ['original', 'final', 'total_removed']
             for key, value in stats.items():
-                if key not in ['original', 'final', 'total_removed'] and value > 0:
-                    st.text(f"{key.replace('_', ' ').title()}: {value} removed")
+                if key not in exclude_keys and value > 0:
+                    st.text(f"  ✗ {key.replace('_', ' ').title()}: {value} removed")
+
+    # View passed candidates section (only show after filtering)
+    if 'filter_stats' in st.session_state and 'passed_candidates_df' in st.session_state:
+        st.divider()
+        st.markdown("### View Passed Candidates")
+        st.caption("Browse candidates that passed all filters, with priority categorization")
+
+        passed_df = st.session_state['passed_candidates_df']
+
+        # Priority categorization section
+        filter_sheets = get_filter_sheets_config()
+        gspread_client = get_gspread_client()
+        has_sheets = bool(filter_sheets.get('url')) and gspread_client is not None
+
+        if has_sheets and st.button("Load Priority Categories", key="apply_categories"):
+            sheet_url = filter_sheets.get('url', '')
+
+            # Helper function for matching
+            def normalize_company(name):
+                if pd.isna(name) or not str(name).strip():
+                    return ''
+                name = str(name).lower().strip()
+                for suffix in [' ltd', ' inc', ' corp', ' llc', ' limited', ' israel', ' il', ' technologies', ' tech', ' software', ' solutions', ' group']:
+                    if name.endswith(suffix):
+                        name = name[:-len(suffix)].strip()
+                return name
+
+            def matches_list(company, company_list):
+                if pd.isna(company) or not str(company).strip():
+                    return False
+                company_norm = normalize_company(company)
+                if not company_norm:
+                    return False
+                for c in company_list:
+                    c_norm = normalize_company(c)
+                    if not c_norm:
+                        continue
+                    if company_norm == c_norm:
+                        return True
+                    if len(c_norm) >= 4 and len(company_norm) >= 4:
+                        if company_norm.startswith(c_norm) or c_norm.startswith(company_norm):
+                            return True
+                return False
+
+            def matches_list_in_text(text, items_list):
+                if pd.isna(text) or not str(text).strip():
+                    return False
+                text_lower = str(text).lower()
+                for item in items_list:
+                    item_norm = str(item).lower().strip()
+                    if not item_norm or len(item_norm) < 3:
+                        continue
+                    if item_norm in text_lower:
+                        return True
+                return False
+
+            with st.spinner("Loading priority lists..."):
+                # Target companies
+                if filter_sheets.get('target_companies'):
+                    tc_df = load_sheet_as_df(sheet_url, filter_sheets['target_companies'])
+                    if tc_df is not None and len(tc_df.columns) > 0:
+                        target_companies = []
+                        for col in tc_df.columns:
+                            if 'company' in col.lower() or 'name' in col.lower():
+                                target_companies.extend(tc_df[col].dropna().tolist())
+                        target_list = [str(c).lower().strip() for c in target_companies if c]
+                        passed_df['is_target_company'] = passed_df['current_company'].apply(lambda x: matches_list(x, target_list))
+                        st.info(f"Target Companies: {len(target_list)} loaded, {passed_df['is_target_company'].sum()} matches")
+
+                # Layoff alerts
+                if filter_sheets.get('tech_alerts'):
+                    ta_df = load_sheet_as_df(sheet_url, filter_sheets['tech_alerts'])
+                    if ta_df is not None and len(ta_df.columns) > 0:
+                        tech_alerts = []
+                        for col in ta_df.columns:
+                            if 'company' in col.lower() or 'name' in col.lower():
+                                tech_alerts.extend(ta_df[col].dropna().tolist())
+                        alerts_list = [str(c).lower().strip() for c in tech_alerts if c]
+                        passed_df['is_layoff_company'] = passed_df['current_company'].apply(lambda x: matches_list(x, alerts_list))
+                        st.info(f"Layoff Alerts: {len(alerts_list)} loaded, {passed_df['is_layoff_company'].sum()} matches")
+
+                # Universities
+                if filter_sheets.get('universities'):
+                    uni_df = load_sheet_as_df(sheet_url, filter_sheets['universities'])
+                    if uni_df is not None and len(uni_df.columns) > 0:
+                        uni_list = uni_df.iloc[:, 0].dropna().tolist()
+                        passed_df['is_top_university'] = passed_df['education'].apply(lambda x: matches_list_in_text(x, uni_list))
+                        st.info(f"Top Universities: {len(uni_list)} loaded, {passed_df['is_top_university'].sum()} matches")
+
+            # Save categorized data
+            st.session_state['passed_candidates_df'] = passed_df
+            st.session_state['categories_applied'] = True
+            st.rerun()
+
+        # Re-read from session state to get latest data with categories
+        passed_df = st.session_state['passed_candidates_df']
+
+        # Filter checkboxes at the top
+        st.markdown("**Filter by category:**")
+        filter_cols = st.columns(4)
+
+        with filter_cols[0]:
+            show_all = st.checkbox("All", value=True, key="filter_all")
+
+        has_target = 'is_target_company' in passed_df.columns
+        has_layoff = 'is_layoff_company' in passed_df.columns
+        has_uni = 'is_top_university' in passed_df.columns
+
+        with filter_cols[1]:
+            if has_target:
+                count = int(passed_df['is_target_company'].fillna(False).sum())
+                show_target = st.checkbox(f"Target Companies ({count})", value=False, key="filter_target")
+            else:
+                show_target = False
+
+        with filter_cols[2]:
+            if has_layoff:
+                count = int(passed_df['is_layoff_company'].fillna(False).sum())
+                show_layoff = st.checkbox(f"Layoff Alerts ({count})", value=False, key="filter_layoff")
+            else:
+                show_layoff = False
+
+        with filter_cols[3]:
+            if has_uni:
+                count = int(passed_df['is_top_university'].fillna(False).sum())
+                show_uni = st.checkbox(f"Top Universities ({count})", value=False, key="filter_uni")
+            else:
+                show_uni = False
+
+        # Filter based on checkboxes
+        if show_all or (not show_target and not show_layoff and not show_uni):
+            view_df = passed_df.copy()
+        else:
+            # Combine selected filters with OR
+            mask = pd.Series([False] * len(passed_df), index=passed_df.index)
+            if show_target and has_target:
+                mask = mask | passed_df['is_target_company'].fillna(False)
+            if show_layoff and has_layoff:
+                mask = mask | passed_df['is_layoff_company'].fillna(False)
+            if show_uni and has_uni:
+                mask = mask | passed_df['is_top_university'].fillna(False)
+            view_df = passed_df[mask].copy()
+
+        st.success(f"**{len(view_df)}** candidates")
+
+        # Display columns (without category columns)
+        display_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'education', 'location', 'public_url']
+        available_cols = [c for c in display_cols if c in view_df.columns]
+
+        if available_cols:
+            st.dataframe(
+                view_df[available_cols],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "public_url": st.column_config.LinkColumn("LinkedIn"),
+                }
+            )
+
+        # Download passed candidates
+        col1, col2 = st.columns(2)
+        with col1:
+            csv_data = view_df.to_csv(index=False)
+            st.download_button(
+                label="Download View (CSV)",
+                data=csv_data,
+                file_name="passed_candidates.csv",
+                mime="text/csv"
+            )
 
     # Review filtered candidates section
     if 'filtered_out' in st.session_state and st.session_state['filtered_out']:
@@ -1032,12 +1098,162 @@ if 'results' in st.session_state and st.session_state['results']:
         else:
             st.info("No candidates were filtered out")
 
-else:
-    st.info("Upload data above first to enable filtering.")
+# ========== TAB 3: Results ==========
+with tab_results:
+    if 'filter_stats' not in st.session_state:
+        st.info("Apply filters in the Filter tab first to see results.")
+    elif 'passed_candidates_df' in st.session_state:
+        passed_df = st.session_state['passed_candidates_df']
+        stats = st.session_state['filter_stats']
 
-st.divider()
+        # Summary metrics
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Original", stats.get('original', 0))
+        col2.metric("Removed", stats.get('total_removed', 0))
+        col3.metric("Passed", stats.get('final', 0))
+        col4.metric("Keep Rate", f"{round((stats.get('final', 0) / max(stats.get('original', 1), 1)) * 100)}%")
 
-# ========== SECTION 3: Enrich new profiles (optional) ==========
+        st.divider()
+
+        # Priority categories
+        filter_sheets = get_filter_sheets_config()
+        gspread_client = get_gspread_client()
+        has_sheets = bool(filter_sheets.get('url')) and gspread_client is not None
+
+        if has_sheets and st.button("Load Priority Categories", key="load_categories_results"):
+            sheet_url = filter_sheets.get('url', '')
+
+            def normalize_company(name):
+                if pd.isna(name) or not str(name).strip():
+                    return ''
+                name = str(name).lower().strip()
+                for suffix in [' ltd', ' inc', ' corp', ' llc', ' limited', ' israel', ' il', ' technologies', ' tech', ' software', ' solutions', ' group']:
+                    if name.endswith(suffix):
+                        name = name[:-len(suffix)].strip()
+                return name
+
+            def matches_list(company, company_list):
+                if pd.isna(company) or not str(company).strip():
+                    return False
+                company_norm = normalize_company(company)
+                if not company_norm:
+                    return False
+                for c in company_list:
+                    c_norm = normalize_company(c)
+                    if c_norm and (company_norm == c_norm or (len(c_norm) >= 4 and len(company_norm) >= 4 and (company_norm.startswith(c_norm) or c_norm.startswith(company_norm)))):
+                        return True
+                return False
+
+            def matches_list_in_text(text, items_list):
+                if pd.isna(text) or not str(text).strip():
+                    return False
+                text_lower = str(text).lower()
+                return any(str(item).lower().strip() in text_lower for item in items_list if len(str(item).strip()) >= 3)
+
+            with st.spinner("Loading priority lists..."):
+                if filter_sheets.get('target_companies'):
+                    tc_df = load_sheet_as_df(sheet_url, filter_sheets['target_companies'])
+                    if tc_df is not None:
+                        target_companies = []
+                        for col in tc_df.columns:
+                            if 'company' in col.lower() or 'name' in col.lower():
+                                target_companies.extend(tc_df[col].dropna().tolist())
+                        target_list = [str(c).lower().strip() for c in target_companies if c]
+                        passed_df['is_target_company'] = passed_df['current_company'].apply(lambda x: matches_list(x, target_list))
+                        st.info(f"Target Companies: {passed_df['is_target_company'].sum()} matches")
+
+                if filter_sheets.get('tech_alerts'):
+                    ta_df = load_sheet_as_df(sheet_url, filter_sheets['tech_alerts'])
+                    if ta_df is not None:
+                        tech_alerts = []
+                        for col in ta_df.columns:
+                            if 'company' in col.lower() or 'name' in col.lower():
+                                tech_alerts.extend(ta_df[col].dropna().tolist())
+                        alerts_list = [str(c).lower().strip() for c in tech_alerts if c]
+                        passed_df['is_layoff_company'] = passed_df['current_company'].apply(lambda x: matches_list(x, alerts_list))
+                        st.info(f"Layoff Alerts: {passed_df['is_layoff_company'].sum()} matches")
+
+                if filter_sheets.get('universities'):
+                    uni_df = load_sheet_as_df(sheet_url, filter_sheets['universities'])
+                    if uni_df is not None:
+                        uni_list = uni_df.iloc[:, 0].dropna().tolist()
+                        passed_df['is_top_university'] = passed_df['education'].apply(lambda x: matches_list_in_text(x, uni_list))
+                        st.info(f"Top Universities: {passed_df['is_top_university'].sum()} matches")
+
+            st.session_state['passed_candidates_df'] = passed_df
+            st.rerun()
+
+        # Filter checkboxes
+        st.markdown("**Filter by category:**")
+        fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+        show_all = fcol1.checkbox("All", value=True, key="res_filter_all")
+        show_target = fcol2.checkbox(f"Target Co ({int(passed_df['is_target_company'].sum()) if 'is_target_company' in passed_df.columns else 0})", key="res_filter_target") if 'is_target_company' in passed_df.columns else False
+        show_layoff = fcol3.checkbox(f"Layoffs ({int(passed_df['is_layoff_company'].sum()) if 'is_layoff_company' in passed_df.columns else 0})", key="res_filter_layoff") if 'is_layoff_company' in passed_df.columns else False
+        show_uni = fcol4.checkbox(f"Top Uni ({int(passed_df['is_top_university'].sum()) if 'is_top_university' in passed_df.columns else 0})", key="res_filter_uni") if 'is_top_university' in passed_df.columns else False
+
+        # Apply filter
+        if show_all or (not show_target and not show_layoff and not show_uni):
+            view_df = passed_df
+        else:
+            mask = pd.Series([False] * len(passed_df), index=passed_df.index)
+            if show_target and 'is_target_company' in passed_df.columns:
+                mask = mask | passed_df['is_target_company'].fillna(False)
+            if show_layoff and 'is_layoff_company' in passed_df.columns:
+                mask = mask | passed_df['is_layoff_company'].fillna(False)
+            if show_uni and 'is_top_university' in passed_df.columns:
+                mask = mask | passed_df['is_top_university'].fillna(False)
+            view_df = passed_df[mask]
+
+        st.success(f"**{len(view_df)}** candidates")
+
+        display_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'education', 'location', 'public_url']
+        available_cols = [c for c in display_cols if c in view_df.columns]
+        st.dataframe(view_df[available_cols], use_container_width=True, hide_index=True,
+                    column_config={"public_url": st.column_config.LinkColumn("LinkedIn")})
+
+        csv_data = view_df.to_csv(index=False)
+        st.download_button("Download CSV", csv_data, "passed_candidates.csv", "text/csv")
+
+# ========== TAB 4: AI Screening ==========
+with tab_screening:
+    openai_key = load_openai_key()
+    if not openai_key:
+        st.warning("OpenAI API key not configured. Add 'openai_api_key' to config.json")
+    elif 'passed_candidates_df' not in st.session_state:
+        st.info("Apply filters in the Filter tab first, then come back here to screen candidates.")
+    else:
+        results = st.session_state['passed_candidates_df'].to_dict('records')
+        st.success(f"Ready to screen **{len(results)}** candidates")
+
+        job_description = st.text_area("Paste Job Description", height=150, key="jd_screening")
+
+        if job_description:
+            screen_count = st.number_input("Number to screen", 1, len(results), min(5, len(results)), key="screen_count")
+
+            if st.button("Screen Candidates", type="primary", key="start_screening"):
+                client = OpenAI(api_key=openai_key)
+                screening_results = []
+                progress = st.progress(0)
+
+                for i, profile in enumerate(results[:screen_count]):
+                    screening = screen_profile(profile, job_description, client)
+                    name = f"{profile.get('first_name', '')} {profile.get('last_name', '')}".strip() or f"Profile {i+1}"
+                    screening_results.append({'name': name, 'linkedin_url': profile.get('public_url', ''), **screening})
+                    progress.progress((i + 1) / screen_count)
+
+                st.session_state['screening_results'] = screening_results
+                st.rerun()
+
+        # Show screening results
+        if 'screening_results' in st.session_state:
+            st.divider()
+            st.subheader("Screening Results")
+            sr = sorted(st.session_state['screening_results'], key=lambda x: x.get('score', 0), reverse=True)
+            df_sr = pd.DataFrame([{'Name': r['name'], 'Score': f"{r.get('score',0)}/10", 'Fit': r.get('fit',''), 'Summary': r.get('summary','')[:80]} for r in sr])
+            st.dataframe(df_sr, use_container_width=True)
+            st.download_button("Download Results", pd.DataFrame(sr).to_csv(index=False), "screening_results.csv", "text/csv")
+
+# ========== Enrich new profiles (optional) ==========
 with st.expander("Enrich New Profiles (requires Crust Data API key)", expanded=False):
     if not has_crust_key:
         st.warning("Crust Data API key not configured. Add 'api_key' to config.json")
@@ -1166,157 +1382,3 @@ with st.expander("Enrich New Profiles (requires Crust Data API key)", expanded=F
                 # Clear enrich_urls
                 del st.session_state['enrich_urls']
                 st.rerun()
-
-st.divider()
-
-# ========== SECTION 3: AI Screening ==========
-st.subheader("4. AI Screening")
-
-openai_key = load_openai_key()
-if not openai_key:
-    st.warning("OpenAI API key not configured. Add 'openai_api_key' to config.json")
-else:
-    st.success("OpenAI API key loaded")
-
-    if 'results' not in st.session_state or not st.session_state['results']:
-        st.info("Upload data above first to enable screening.")
-    else:
-        results = st.session_state['results']
-
-        job_description = st.text_area(
-            "Paste Job Description",
-            height=200,
-            placeholder="Paste the full job description here..."
-        )
-
-        if job_description:
-            screen_count = st.number_input(
-                "Number of profiles to screen",
-                min_value=1,
-                max_value=len(results),
-                value=min(5, len(results)),
-                help="Start with a few to test"
-            )
-
-            if st.button("Screen Candidates", type="primary"):
-                client = OpenAI(api_key=openai_key)
-                screening_results = []
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-
-                for i, profile in enumerate(results[:screen_count]):
-                    status_text.text(f"Screening profile {i+1}/{screen_count}...")
-                    screening = screen_profile(profile, job_description, client)
-
-                    # Get name from profile
-                    first = profile.get('first_name', '')
-                    last = profile.get('last_name', '')
-                    if first or last:
-                        name = f"{first} {last}".strip()
-                    else:
-                        name = profile.get('full_name') or profile.get('name') or f"Profile {i+1}"
-                    linkedin_url = profile.get('public_url') or profile.get('linkedin_url') or profile.get('linkedin_profile_url') or ''
-
-                    screening_results.append({
-                        'name': name,
-                        'linkedin_url': linkedin_url,
-                        **screening
-                    })
-
-                    progress_bar.progress((i + 1) / screen_count)
-                    time.sleep(0.5)
-
-                progress_bar.progress(1.0)
-                status_text.text("Screening complete!")
-                send_notification("Screening Complete", f"Screened {len(screening_results)} candidates")
-                st.session_state['screening_results'] = screening_results
-
-# ========== SECTION 6: Screening Results ==========
-if 'screening_results' in st.session_state and st.session_state['screening_results']:
-    st.divider()
-    st.subheader("5. Screening Results")
-
-    screening_results = st.session_state['screening_results']
-    screening_results_sorted = sorted(screening_results, key=lambda x: x.get('score', 0), reverse=True)
-
-    # Filter options
-    st.markdown("**Filter by Fit:**")
-    filter_cols = st.columns(4)
-    with filter_cols[0]:
-        show_strong = st.checkbox("Strong Fit", value=True)
-    with filter_cols[1]:
-        show_good = st.checkbox("Good Fit", value=True)
-    with filter_cols[2]:
-        show_partial = st.checkbox("Partial Fit", value=True)
-    with filter_cols[3]:
-        show_not = st.checkbox("Not a Fit", value=True)
-
-    fit_filters = []
-    if show_strong:
-        fit_filters.append("Strong Fit")
-    if show_good:
-        fit_filters.append("Good Fit")
-    if show_partial:
-        fit_filters.append("Partial Fit")
-    if show_not:
-        fit_filters.append("Not a Fit")
-
-    filtered_results = [r for r in screening_results_sorted if r.get('fit', '') in fit_filters]
-    st.markdown(f"Showing **{len(filtered_results)}** of {len(screening_results_sorted)} candidates")
-
-    # Summary table
-    summary_data = []
-    for r in filtered_results:
-        summary_data.append({
-            'Name': r.get('name', ''),
-            'Score': f"{r.get('score', 0)}/10",
-            'Fit': r.get('fit', ''),
-            'Summary': r.get('summary', '')[:100] + '...' if len(r.get('summary', '')) > 100 else r.get('summary', ''),
-            'LinkedIn': r.get('linkedin_url', '')
-        })
-
-    st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
-
-    # Detailed view
-    with st.expander("View Detailed Results"):
-        for r in filtered_results:
-            score = r.get('score', 0)
-            color = "🟢" if score >= 7 else "🟡" if score >= 5 else "🔴"
-
-            st.markdown(f"### {color} {r.get('name', 'Unknown')} - {r.get('score', 0)}/10 ({r.get('fit', '')})")
-            st.markdown(f"**Summary:** {r.get('summary', '')}")
-
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**Strengths:**")
-                for s in r.get('strengths', []):
-                    st.markdown(f"- {s}")
-            with col2:
-                st.markdown("**Gaps:**")
-                for g in r.get('gaps', []):
-                    st.markdown(f"- {g}")
-
-            st.markdown(f"**Recommendation:** {r.get('recommendation', '')}")
-            st.markdown(f"[LinkedIn Profile]({r.get('linkedin_url', '')})")
-            st.divider()
-
-    # Download buttons
-    st.markdown("**Download Results:**")
-    col1, col2 = st.columns(2)
-    with col1:
-        screening_df = pd.DataFrame(screening_results_sorted)
-        csv_data = screening_df.to_csv(index=False)
-        st.download_button(
-            label="Download CSV",
-            data=csv_data,
-            file_name=f"screening_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
-        )
-    with col2:
-        json_data = json.dumps(screening_results_sorted, indent=2, ensure_ascii=False)
-        st.download_button(
-            label="Download JSON",
-            data=json_data,
-            file_name=f"screening_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json"
-        )
