@@ -54,6 +54,141 @@ def load_phantombuster_agent_id():
     return config.get('phantombuster_agent_id')
 
 
+# ===== Search History Functions =====
+def get_search_history_path() -> Path:
+    """Get path to search history file."""
+    return Path(__file__).parent / 'search_history.json'
+
+
+def load_search_history(agent_id: str = None) -> list[dict]:
+    """Load search history from file.
+
+    Args:
+        agent_id: If provided, filter history to this agent only
+
+    Returns list of dicts with keys: agent_id, csv_name, search_url, launched_at, profiles_requested
+    """
+    history_path = get_search_history_path()
+    if not history_path.exists():
+        return []
+
+    try:
+        with open(history_path, 'r') as f:
+            history = json.load(f)
+
+        # Filter by agent_id if provided
+        if agent_id:
+            history = [h for h in history if h.get('agent_id') == agent_id]
+
+        # Sort by launched_at descending (most recent first)
+        history.sort(key=lambda x: x.get('launched_at', ''), reverse=True)
+        return history
+    except Exception:
+        return []
+
+
+def save_search_to_history(agent_id: str, csv_name: str, search_url: str = None, profiles_requested: int = None) -> bool:
+    """Save a search to history file.
+
+    Returns True if saved successfully.
+    """
+    history_path = get_search_history_path()
+
+    try:
+        # Load existing history
+        if history_path.exists():
+            with open(history_path, 'r') as f:
+                history = json.load(f)
+        else:
+            history = []
+
+        # Add new entry
+        entry = {
+            'agent_id': agent_id,
+            'csv_name': csv_name,
+            'launched_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'search_url': search_url,
+            'profiles_requested': profiles_requested,
+        }
+        history.append(entry)
+
+        # Save
+        with open(history_path, 'w') as f:
+            json.dump(history, f, indent=2)
+
+        return True
+    except Exception:
+        return False
+
+
+def delete_search_from_history(agent_id: str, csv_name: str, api_key: str = None, delete_file: bool = False) -> bool:
+    """Delete a search from history and optionally delete the file from PhantomBuster.
+
+    Returns True if deleted successfully.
+    """
+    history_path = get_search_history_path()
+
+    try:
+        # Load history
+        if not history_path.exists():
+            return False
+
+        with open(history_path, 'r') as f:
+            history = json.load(f)
+
+        # Find and remove entry
+        original_len = len(history)
+        history = [h for h in history if not (h.get('agent_id') == agent_id and h.get('csv_name') == csv_name)]
+
+        if len(history) == original_len:
+            return False  # Entry not found
+
+        # Save updated history
+        with open(history_path, 'w') as f:
+            json.dump(history, f, indent=2)
+
+        # Delete file from PhantomBuster if requested
+        if delete_file and api_key:
+            delete_phantombuster_file(api_key, agent_id, f'{csv_name}.csv')
+            delete_phantombuster_file(api_key, agent_id, f'{csv_name}.json')
+
+        return True
+    except Exception:
+        return False
+
+
+def get_file_size_from_phantombuster(api_key: str, agent_id: str, csv_name: str) -> int:
+    """Get file size from PhantomBuster cache. Returns size in bytes or 0 if not found."""
+    try:
+        # Get agent info for S3 folders
+        agent_response = requests.get(
+            'https://api.phantombuster.com/api/v2/agents/fetch',
+            params={'id': agent_id},
+            headers={'X-Phantombuster-Key': api_key},
+            timeout=10
+        )
+
+        if agent_response.status_code != 200:
+            return 0
+
+        agent_data = agent_response.json()
+        s3_folder = agent_data.get('s3Folder')
+        org_s3_folder = agent_data.get('orgS3Folder')
+
+        if not s3_folder or not org_s3_folder:
+            return 0
+
+        # Check cache URL
+        cache_url = f'https://cache1.phantombooster.com/{org_s3_folder}/{s3_folder}/{csv_name}.csv'
+        resp = requests.head(cache_url, timeout=5)
+
+        if resp.status_code == 200:
+            return int(resp.headers.get('content-length', 0))
+        return 0
+    except Exception:
+        return 0
+
+
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def fetch_phantombuster_agents(api_key: str) -> list[dict]:
     """Fetch list of all PhantomBuster agents."""
@@ -790,22 +925,22 @@ def launch_phantombuster_agent(api_key: str, agent_id: str, argument: dict = Non
     try:
         # Delete existing results AND database for a fresh start
         if clear_results:
-            # Delete result files
-            delete_phantombuster_file(api_key, agent_id, 'result.csv')
-            delete_phantombuster_file(api_key, agent_id, 'result.json')
-            # Delete ALL possible database files - the phantom stores accumulated profiles here
-            database_files = [
-                'database-result.csv',
+            # First try to list actual files and delete them
+            actual_files = list_phantombuster_files(api_key, agent_id)
+            for f in actual_files:
+                filename = f['name'] if isinstance(f, dict) else f
+                delete_phantombuster_file(api_key, agent_id, filename)
+
+            # Also delete common file patterns (in case listing missed some)
+            common_files = [
+                'result.csv', 'result.json',
+                'database-result.csv', 'database.csv',
                 'database-linkedin-sales-navigator-search-export.csv',
                 'database-Sales Navigator Search Export.csv',
                 'database-sales-navigator-search-export.csv',
-                'database-sales navigator search export.csv',
-                'database_linkedin_sales_navigator_search_export.csv',
-                'database_result.csv',
-                'database.csv',
             ]
-            for db_file in database_files:
-                delete_phantombuster_file(api_key, agent_id, db_file)
+            for f in common_files:
+                delete_phantombuster_file(api_key, agent_id, f)
 
         payload = {'id': agent_id}
         if argument:
@@ -890,10 +1025,7 @@ def normalize_phantombuster_columns(df: pd.DataFrame) -> pd.DataFrame:
         'company': 'current_company',
         'currentCompanyName': 'current_company',
         'location': 'location',
-        'linkedInProfileUrl': 'public_url',
-        'profileUrl': 'public_url',
-        'linkedinUrl': 'public_url',
-        'defaultProfileUrl': 'public_url',
+        'defaultProfileUrl': 'linkedin_url',
         'vmid': 'vmid',
         'connectionDegree': 'connection_degree',
         'mutualConnectionsCount': 'mutual_connections',
@@ -904,6 +1036,8 @@ def normalize_phantombuster_columns(df: pd.DataFrame) -> pd.DataFrame:
         'summary': 'summary',
         'query': 'search_query',
         'timestamp': 'scraped_at',
+        'durationInRole': 'current_years_in_role',
+        'durationInCompany': 'current_years_at_company',
     }
 
     # Rename columns - track which target names are already used to avoid duplicates
@@ -930,10 +1064,10 @@ def normalize_phantombuster_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def extract_urls_from_phantombuster(df: pd.DataFrame) -> list[str]:
-    """Extract LinkedIn URLs from PhantomBuster results."""
+    """Extract LinkedIn URLs from PhantomBuster results (regular linkedin.com URLs only)."""
     urls = []
-    # Try different column names PhantomBuster might use
-    url_columns = ['linkedInProfileUrl', 'defaultProfileUrl', 'url', 'profileUrl', 'LinkedIn Sales Navigator profile URL']
+    # Use only regular LinkedIn URLs, not Sales Navigator URLs
+    url_columns = ['linkedin_url', 'public_url', 'defaultProfileUrl']
 
     for col in url_columns:
         if col in df.columns:
@@ -1293,67 +1427,110 @@ def apply_pre_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, di
         filtered_out['Not Relevant (Current)'] = df[df['_not_relevant']].drop(columns=['_not_relevant']).copy()
         df = df[~df['_not_relevant']].drop(columns=['_not_relevant'])
 
-    # 4. Not relevant companies (past)
-    if filters.get('not_relevant_past') and filters.get('not_relevant'):
-        not_relevant = [c.lower().strip() for c in filters['not_relevant']]
-        df['_past_not_relevant'] = df['past_positions'].apply(lambda x: matches_list_in_text(x, not_relevant))
-        stats['not_relevant_past'] = df['_past_not_relevant'].sum()
-        filtered_out['Not Relevant (Past)'] = df[df['_past_not_relevant']].drop(columns=['_past_not_relevant']).copy()
-        df = df[~df['_past_not_relevant']].drop(columns=['_past_not_relevant'])
+    # 4. Exclude title keywords filter
+    if filters.get('exclude_titles') and 'current_title' in df.columns:
+        exclude_keywords = filters['exclude_titles']
 
-    # 5. Job hoppers filter - exempt priority candidates
-    if filters.get('filter_job_hoppers'):
-        def count_short_stints(past_positions):
-            if pd.isna(past_positions) or not str(past_positions).strip():
-                return 0
-            years_pattern = r'\[(\d+\.?\d*)\s*yrs?\]'
-            matches = re.findall(years_pattern, str(past_positions))
-            return sum(1 for y in matches if float(y) < 1.0)
-
-        df['_short_stints'] = df['past_positions'].apply(count_short_stints)
-        df['_is_job_hopper'] = df['_short_stints'] >= 2
-        stats['job_hoppers'] = df['_is_job_hopper'].sum()
-        filtered_out['Job Hoppers'] = df[df['_is_job_hopper']].drop(columns=['_short_stints', '_is_job_hopper']).copy()
-        df = df[~df['_is_job_hopper']].drop(columns=['_short_stints', '_is_job_hopper'])
-
-    # 6. Consulting companies filter
-    if filters.get('filter_consulting'):
-        consulting = ['tikal', 'matrix', 'ness', 'sela', 'malam', 'bynet', 'sqlink', 'john bryce',
-                      'experis', 'manpower', 'infosys', 'tata', 'wipro', 'cognizant', 'accenture', 'capgemini']
-        df['_is_consulting'] = df['current_company'].apply(lambda x: matches_list(x, consulting))
-        stats['consulting'] = df['_is_consulting'].sum()
-        filtered_out['Consulting Companies'] = df[df['_is_consulting']].drop(columns=['_is_consulting']).copy()
-        df = df[~df['_is_consulting']].drop(columns=['_is_consulting'])
-
-    # 7. Long tenure filter
-    if filters.get('filter_long_tenure'):
-        df['_long_tenure'] = df['current_years_in_role'].apply(lambda x: x >= 8 if pd.notna(x) else False)
-        stats['long_tenure'] = df['_long_tenure'].sum()
-        filtered_out['Long Tenure (8+ years)'] = df[df['_long_tenure']].drop(columns=['_long_tenure']).copy()
-        df = df[~df['_long_tenure']].drop(columns=['_long_tenure'])
-
-    # 8. Management titles filter
-    if filters.get('filter_management'):
-        exclude_titles = ['director', 'head of', 'vp ', 'vice president', 'cto', 'ceo', 'coo',
-                          'chief ', 'group manager', 'engineering manager', 'r&d manager', 'founder']
-        keep_titles = ['team lead', 'tech lead', 'staff', 'principal', 'senior', 'architect']
-
-        def is_management_title(title):
+        def has_excluded_title(title):
             if pd.isna(title) or not str(title).strip():
                 return False
             title_lower = str(title).lower()
-            for keep in keep_titles:
-                if keep in title_lower:
-                    return False
-            for excl in exclude_titles:
-                if excl in title_lower:
-                    return True
-            return False
+            return any(kw in title_lower for kw in exclude_keywords)
 
-        df['_is_management'] = df['current_title'].apply(is_management_title)
-        stats['management_titles'] = df['_is_management'].sum()
-        filtered_out['Management Titles'] = df[df['_is_management']].drop(columns=['_is_management']).copy()
-        df = df[~df['_is_management']].drop(columns=['_is_management'])
+        df['_excluded_title'] = df['current_title'].apply(has_excluded_title)
+        stats['excluded_titles'] = df['_excluded_title'].sum()
+        filtered_out['Excluded Titles'] = df[df['_excluded_title']].drop(columns=['_excluded_title']).copy()
+        df = df[~df['_excluded_title']].drop(columns=['_excluded_title'])
+
+    # 5. Include title keywords filter (only keep matching)
+    if filters.get('include_titles') and 'current_title' in df.columns:
+        include_keywords = filters['include_titles']
+
+        def has_included_title(title):
+            if pd.isna(title) or not str(title).strip():
+                return False
+            title_lower = str(title).lower()
+            return any(kw in title_lower for kw in include_keywords)
+
+        df['_included_title'] = df['current_title'].apply(has_included_title)
+        not_included = ~df['_included_title']
+        stats['not_matching_titles'] = not_included.sum()
+        filtered_out['Not Matching Titles'] = df[not_included].drop(columns=['_included_title']).copy()
+        df = df[df['_included_title']].drop(columns=['_included_title'])
+
+    # 6. Duration filters (from Phantom data)
+    # Helper to parse duration strings like "2 years 3 months" to months
+    def parse_duration_to_months(duration_str):
+        if pd.isna(duration_str) or not str(duration_str).strip():
+            return None
+        text = str(duration_str).lower()
+        years = 0
+        months = 0
+        import re
+        year_match = re.search(r'(\d+)\s*(?:year|yr)', text)
+        if year_match:
+            years = int(year_match.group(1))
+        month_match = re.search(r'(\d+)\s*(?:month|mo)', text)
+        if month_match:
+            months = int(month_match.group(1))
+        total = years * 12 + months
+        return total if total > 0 else None
+
+    # Check for duration columns (Phantom format)
+    role_col = 'durationInRole' if 'durationInRole' in df.columns else 'current_years_in_role' if 'current_years_in_role' in df.columns else None
+    company_col = 'durationInCompany' if 'durationInCompany' in df.columns else 'current_years_at_company' if 'current_years_at_company' in df.columns else None
+
+    # Min role duration
+    if filters.get('min_role_months') and role_col:
+        min_months = filters['min_role_months']
+        df['_role_months'] = df[role_col].apply(parse_duration_to_months)
+        df['_role_too_short'] = df['_role_months'].apply(lambda x: x < min_months if pd.notna(x) else False)
+        stats['role_too_short'] = df['_role_too_short'].sum()
+        filtered_out['Role Too Short'] = df[df['_role_too_short']].drop(columns=['_role_months', '_role_too_short'], errors='ignore').copy()
+        df = df[~df['_role_too_short']].drop(columns=['_role_months', '_role_too_short'], errors='ignore')
+
+    # Max role duration
+    if filters.get('max_role_months') and role_col:
+        max_months = filters['max_role_months']
+        df['_role_months'] = df[role_col].apply(parse_duration_to_months)
+        df['_role_too_long'] = df['_role_months'].apply(lambda x: x > max_months if pd.notna(x) else False)
+        stats['role_too_long'] = df['_role_too_long'].sum()
+        filtered_out['Role Too Long'] = df[df['_role_too_long']].drop(columns=['_role_months', '_role_too_long'], errors='ignore').copy()
+        df = df[~df['_role_too_long']].drop(columns=['_role_months', '_role_too_long'], errors='ignore')
+
+    # Min company duration
+    if filters.get('min_company_months') and company_col:
+        min_months = filters['min_company_months']
+        df['_company_months'] = df[company_col].apply(parse_duration_to_months)
+        df['_company_too_short'] = df['_company_months'].apply(lambda x: x < min_months if pd.notna(x) else False)
+        stats['company_too_short'] = df['_company_too_short'].sum()
+        filtered_out['Company Too Short'] = df[df['_company_too_short']].drop(columns=['_company_months', '_company_too_short'], errors='ignore').copy()
+        df = df[~df['_company_too_short']].drop(columns=['_company_months', '_company_too_short'], errors='ignore')
+
+    # Max company duration
+    if filters.get('max_company_months') and company_col:
+        max_months = filters['max_company_months']
+        df['_company_months'] = df[company_col].apply(parse_duration_to_months)
+        df['_company_too_long'] = df['_company_months'].apply(lambda x: x > max_months if pd.notna(x) else False)
+        stats['company_too_long'] = df['_company_too_long'].sum()
+        filtered_out['Company Too Long'] = df[df['_company_too_long']].drop(columns=['_company_months', '_company_too_long'], errors='ignore').copy()
+        df = df[~df['_company_too_long']].drop(columns=['_company_months', '_company_too_long'], errors='ignore')
+
+    # 7. Universities filter (keep only top university graduates - only for enriched data)
+    if filters.get('universities') and 'education' in df.columns:
+        universities = [u.lower().strip() for u in filters['universities']]
+
+        def has_top_university(education):
+            if pd.isna(education) or not str(education).strip():
+                return False
+            edu_lower = str(education).lower()
+            return any(uni in edu_lower for uni in universities)
+
+        df['_top_uni'] = df['education'].apply(has_top_university)
+        not_top_uni = ~df['_top_uni']
+        stats['not_top_university'] = not_top_uni.sum()
+        filtered_out['Not Top University'] = df[not_top_uni].drop(columns=['_top_uni']).copy()
+        df = df[df['_top_uni']].drop(columns=['_top_uni'])
 
     stats['original'] = original_count
     stats['final'] = len(df)
@@ -1509,7 +1686,7 @@ def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: 
             result['name'] = name
             result['current_title'] = profile.get('current_title', '') or profile.get('headline', '') or profile.get('title', '') or ''
             result['current_company'] = profile.get('current_company', '') or profile.get('companyName', '') or profile.get('company', '') or ''
-            result['linkedin_url'] = profile.get('public_url', '') or profile.get('linkedInProfileUrl', '') or profile.get('profileUrl', '') or ''
+            result['linkedin_url'] = profile.get('linkedin_url', '') or profile.get('public_url', '') or profile.get('defaultProfileUrl', '') or ''
             result['index'] = index
         except Exception as e:
             import traceback
@@ -1579,8 +1756,8 @@ if 'results' in st.session_state and st.session_state['results']:
     st.info(f"📊 **{len(st.session_state['results'])}** profiles loaded")
 
 # Create tabs
-tab_upload, tab_filter, tab_results, tab_screening = st.tabs([
-    "📤 Upload", "🔍 Filter", "📋 Results", "🤖 AI Screening"
+tab_upload, tab_filter, tab_enrich, tab_filter2, tab_screening = st.tabs([
+    "1. Load", "2. Filter", "3. Enrich", "4. Filter+", "5. AI Screen"
 ])
 
 # ========== TAB 1: Upload ==========
@@ -1607,72 +1784,247 @@ with tab_upload:
             selected_agent = next((a for a in agents if a['name'] == selected_agent_name), None)
 
             if selected_agent:
-                # File selection options
-                col_load_mode, col_refresh = st.columns([3, 1])
+                # Load search history for this agent
+                search_history = load_search_history(agent_id=selected_agent['id'])
 
-                with col_load_mode:
-                    load_mode = st.radio(
-                        "Load mode",
-                        options=["Latest results", "Select specific file"],
-                        horizontal=True,
-                        key="pb_load_mode",
-                        help="Choose to load all accumulated results or a specific search file"
-                    )
+                if search_history:
+                    # Build dropdown options from history (most recent first)
+                    history_options = []
+                    for h in search_history:
+                        csv_name = h.get('csv_name', 'unknown')
+                        launched_at = h.get('launched_at', '')
+                        profiles = h.get('profiles_requested', '')
+                        profile_str = f", {profiles} profiles" if profiles else ""
+                        # Format: "Feb 2, 09:10 - search_2026-02-02_09-10 (2500 profiles)"
+                        display_name = f"{launched_at} - {csv_name}{profile_str}"
+                        history_options.append({
+                            'display': display_name,
+                            'csv_name': csv_name,
+                            'launched_at': launched_at,
+                        })
 
-                # List files if specific file mode selected
-                available_files = []
-                selected_file = None
+                    # Dropdown to select search (most recent is default - index 0)
+                    col_select, col_delete = st.columns([5, 1])
 
-                if load_mode == "Select specific file":
-                    with col_refresh:
-                        if st.button("🔄", key="pb_refresh_files", help="Refresh file list"):
-                            st.session_state['pb_files_cache'] = None
-
-                    # Cache files list to avoid repeated API calls
-                    cache_key = f"pb_files_{selected_agent['id']}"
-                    if cache_key not in st.session_state or st.session_state.get('pb_files_cache') is None:
-                        with st.spinner("Loading files..."):
-                            available_files = list_phantombuster_files(pb_key, selected_agent['id'])
-                            st.session_state[cache_key] = available_files
-                            st.session_state['pb_files_cache'] = True
-                    else:
-                        available_files = st.session_state.get(cache_key, [])
-
-                    if available_files:
-                        # Sort by name (most recent first for timestamped files)
-                        available_files.sort(key=lambda x: x['name'], reverse=True)
-                        file_names = [f['name'] for f in available_files]
-
-                        selected_file = st.selectbox(
-                            "Select file",
-                            options=file_names,
-                            key="pb_file_select",
-                            help="Select a specific result file to load"
+                    with col_select:
+                        selected_idx = st.selectbox(
+                            "Select search results",
+                            options=range(len(history_options)),
+                            format_func=lambda i: history_options[i]['display'],
+                            key="pb_history_select",
+                            help="Select which search results to load (most recent first)"
                         )
 
-                        # Show file info
-                        file_info = next((f for f in available_files if f['name'] == selected_file), None)
-                        if file_info and file_info.get('size'):
-                            size_kb = file_info['size'] / 1024
-                            st.caption(f"Size: {size_kb:.1f} KB")
-                    else:
-                        st.info("No result files found. Run a search first.")
+                    selected_search = history_options[selected_idx] if history_options else None
 
-                if st.button("Load Results", type="primary", key="pb_load_btn", use_container_width=True):
-                    with st.spinner("Loading results..."):
-                        # Pass specific filename if selected
-                        filename = selected_file.replace('.csv', '').replace('.json', '') if selected_file else None
-                        pb_df = fetch_phantombuster_result_csv(pb_key, selected_agent['id'], debug=False, filename=filename)
-                        if not pb_df.empty:
-                            pb_df = normalize_phantombuster_columns(pb_df)
-                            st.session_state['results'] = pb_df.to_dict('records')
-                            st.session_state['results_df'] = pb_df
-                            file_msg = f" from **{selected_file}**" if selected_file else ""
-                            st.success(f"Loaded **{len(pb_df)}** profiles{file_msg}!")
-                            st.rerun()
-                        else:
-                            st.error("No results found.")
-                            st.info("Use **Launch Search** below to run a new search.")
+                    # Delete button with confirmation
+                    with col_delete:
+                        st.write("")  # Spacing
+                        if st.button("🗑️", key="pb_delete_search", help="Delete this search from history and PhantomBuster"):
+                            st.session_state['pb_confirm_delete'] = selected_search['csv_name'] if selected_search else None
+
+                    # Show confirmation dialog if delete was clicked
+                    if st.session_state.get('pb_confirm_delete'):
+                        csv_to_delete = st.session_state['pb_confirm_delete']
+                        st.warning(f"Delete **{csv_to_delete}** from history and PhantomBuster?")
+                        col_yes, col_no = st.columns(2)
+                        with col_yes:
+                            if st.button("Yes, delete", key="pb_confirm_yes", type="primary"):
+                                with st.spinner("Deleting..."):
+                                    success = delete_search_from_history(
+                                        agent_id=selected_agent['id'],
+                                        csv_name=csv_to_delete,
+                                        api_key=pb_key,
+                                        delete_file=True
+                                    )
+                                    st.session_state['pb_confirm_delete'] = None
+                                    if success:
+                                        st.success(f"Deleted {csv_to_delete}")
+                                        st.rerun()
+                                    else:
+                                        st.error("Failed to delete")
+                        with col_no:
+                            if st.button("Cancel", key="pb_confirm_no"):
+                                st.session_state['pb_confirm_delete'] = None
+                                st.rerun()
+
+                    # Show current loaded count if any
+                    existing_count = len(st.session_state.get('results', []))
+                    if existing_count > 0:
+                        st.caption(f"Currently loaded: **{existing_count}** profiles")
+
+                    # Option to accumulate results
+                    col_load, col_add = st.columns([1, 1])
+
+                    with col_load:
+                        if st.button("Load Results", type="primary", key="pb_load_btn", use_container_width=True, help="Replace current results"):
+                            if selected_search:
+                                with st.spinner("Loading results..."):
+                                    filename = selected_search['csv_name']
+                                    pb_df = fetch_phantombuster_result_csv(pb_key, selected_agent['id'], debug=False, filename=filename)
+                                    if not pb_df.empty:
+                                        pb_df = normalize_phantombuster_columns(pb_df)
+                                        st.session_state['results'] = pb_df.to_dict('records')
+                                        st.session_state['results_df'] = pb_df
+                                        st.session_state['preview_page'] = 0  # Reset pagination
+                                        st.success(f"Loaded **{len(pb_df)}** profiles from **{filename}**!")
+                                        st.rerun()
+                                    else:
+                                        st.error("No results found. File may have been deleted from PhantomBuster.")
+
+                    with col_add:
+                        if st.button("+ Add to Results", key="pb_add_btn", use_container_width=True, help="Add to current results"):
+                            if selected_search:
+                                with st.spinner("Adding results..."):
+                                    filename = selected_search['csv_name']
+                                    pb_df = fetch_phantombuster_result_csv(pb_key, selected_agent['id'], debug=False, filename=filename)
+                                    if not pb_df.empty:
+                                        pb_df = normalize_phantombuster_columns(pb_df)
+
+                                        # Merge with existing results
+                                        if 'results_df' in st.session_state and not st.session_state['results_df'].empty:
+                                            existing_df = st.session_state['results_df']
+                                            # Combine and remove duplicates based on linkedin_url or name
+                                            combined_df = pd.concat([existing_df, pb_df], ignore_index=True)
+                                            # Remove duplicates - prefer keeping first occurrence
+                                            if 'linkedin_url' in combined_df.columns:
+                                                combined_df = combined_df.drop_duplicates(subset=['linkedin_url'], keep='first')
+                                            elif 'public_url' in combined_df.columns:
+                                                combined_df = combined_df.drop_duplicates(subset=['public_url'], keep='first')
+                                            elif 'name' in combined_df.columns:
+                                                combined_df = combined_df.drop_duplicates(subset=['name'], keep='first')
+                                            new_count = len(combined_df) - len(existing_df)
+                                            st.session_state['results'] = combined_df.to_dict('records')
+                                            st.session_state['results_df'] = combined_df
+                                            st.success(f"Added **{new_count}** new profiles (total: **{len(combined_df)}**)")
+                                        else:
+                                            st.session_state['results'] = pb_df.to_dict('records')
+                                            st.session_state['results_df'] = pb_df
+                                            st.success(f"Loaded **{len(pb_df)}** profiles from **{filename}**!")
+
+                                        st.session_state['preview_page'] = 0
+                                        st.rerun()
+                                    else:
+                                        st.error("No results found. File may have been deleted from PhantomBuster.")
+                else:
+                    st.info("No search history found. Launch a search below to get started.")
+
+                    # Fallback: try to load legacy result.csv
+                    if st.button("Load legacy results (result.csv)", key="pb_load_legacy"):
+                        with st.spinner("Loading..."):
+                            pb_df = fetch_phantombuster_result_csv(pb_key, selected_agent['id'], debug=False, filename=None)
+                            if not pb_df.empty:
+                                pb_df = normalize_phantombuster_columns(pb_df)
+                                st.session_state['results'] = pb_df.to_dict('records')
+                                st.session_state['results_df'] = pb_df
+                                st.session_state['preview_page'] = 0  # Reset pagination
+                                st.success(f"Loaded **{len(pb_df)}** profiles!")
+                                st.rerun()
+                            else:
+                                st.error("No results found.")
+
+                # ===== Results Preview =====
+                if 'results' in st.session_state and st.session_state['results']:
+                    st.markdown("---")
+                    st.markdown("### Results Preview")
+                    results_df = st.session_state.get('results_df')
+                    if results_df is not None and not results_df.empty:
+                        # Column mapping for preview
+                        col_mapping = {
+                            'name': ['name', 'fullName', 'full_name', 'Name'],
+                            'title': ['current_title', 'title', 'headline', 'Title', 'currentTitle'],
+                            'company': ['current_company', 'company', 'companyName', 'Company', 'currentCompany'],
+                            'location': ['location', 'Location', 'companyLocation', 'city'],
+                            'years_in_role': ['current_years_in_role', 'durationInRole'],
+                            'years_at_company': ['current_years_at_company', 'durationInCompany'],
+                            # linkedin_url is the normalized column name (from defaultProfileUrl)
+                            'linkedin_url': ['linkedin_url', 'public_url', 'defaultProfileUrl']
+                        }
+
+                        # Pagination settings
+                        page_size = 10
+                        total_profiles = len(results_df)
+                        total_pages = (total_profiles + page_size - 1) // page_size
+
+                        # Initialize page in session state
+                        if 'preview_page' not in st.session_state:
+                            st.session_state['preview_page'] = 0
+
+                        current_page = st.session_state['preview_page']
+                        start_idx = current_page * page_size
+                        end_idx = min(start_idx + page_size, total_profiles)
+
+                        # Build preview data for current page
+                        preview_data = []
+                        for _, row in results_df.iloc[start_idx:end_idx].iterrows():
+                            record = {}
+                            # Get name
+                            for col in col_mapping['name']:
+                                if col in results_df.columns and pd.notna(row.get(col)):
+                                    record['Name'] = row[col]
+                                    break
+                            # Get title
+                            for col in col_mapping['title']:
+                                if col in results_df.columns and pd.notna(row.get(col)):
+                                    record['Title'] = row[col]
+                                    break
+                            # Get company
+                            for col in col_mapping['company']:
+                                if col in results_df.columns and pd.notna(row.get(col)):
+                                    record['Company'] = row[col]
+                                    break
+                            # Get location
+                            for col in col_mapping['location']:
+                                if col in results_df.columns and pd.notna(row.get(col)):
+                                    record['Location'] = row[col]
+                                    break
+                            # Get years in role
+                            for col in col_mapping['years_in_role']:
+                                if col in results_df.columns and pd.notna(row.get(col)):
+                                    record['Role Yrs'] = row[col]
+                                    break
+                            # Get years at company
+                            for col in col_mapping['years_at_company']:
+                                if col in results_df.columns and pd.notna(row.get(col)):
+                                    record['Co. Yrs'] = row[col]
+                                    break
+                            # Get LinkedIn URL
+                            for col in col_mapping['linkedin_url']:
+                                if col in results_df.columns and pd.notna(row.get(col)):
+                                    record['LinkedIn'] = row[col]
+                                    break
+
+                            if record:
+                                preview_data.append(record)
+
+                        if preview_data:
+                            preview_df = pd.DataFrame(preview_data)
+                            # Use Streamlit dataframe with LinkedIn link shown as icon
+                            st.dataframe(
+                                preview_df,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "LinkedIn": st.column_config.LinkColumn(
+                                        "in",
+                                        width="small",
+                                        display_text="💼"
+                                    )
+                                }
+                            )
+
+                            # Pagination controls
+                            col_prev, col_info, col_next = st.columns([1, 2, 1])
+                            with col_prev:
+                                if st.button("< Prev", key="preview_prev", disabled=current_page == 0):
+                                    st.session_state['preview_page'] = current_page - 1
+                                    st.rerun()
+                            with col_info:
+                                st.caption(f"Page {current_page + 1} of {total_pages} ({start_idx + 1}-{end_idx} of {total_profiles} profiles)")
+                            with col_next:
+                                if st.button("Next >", key="preview_next", disabled=current_page >= total_pages - 1):
+                                    st.session_state['preview_page'] = current_page + 1
+                                    st.rerun()
         else:
             st.warning("No phantoms found in your PhantomBuster account")
 
@@ -1845,6 +2197,7 @@ with tab_upload:
                         pb_df = normalize_phantombuster_columns(pb_df)
                         st.session_state['results'] = pb_df.to_dict('records')
                         st.session_state['results_df'] = pb_df
+                        st.session_state['preview_page'] = 0  # Reset pagination
                         st.session_state['pb_launch_status'] = 'idle'
                         st.session_state['pb_launch_container_id'] = None
                         st.session_state['pb_launch_start_time'] = None
@@ -1866,8 +2219,13 @@ with tab_upload:
                 st.rerun()
 
         else:  # idle
-            can_launch = user_phantom and search_url
-            if st.button("Launch", type="primary", key="pb_launch_btn", disabled=not can_launch):
+            # Button is enabled when phantom is found, validates URL on click
+            if st.button("Launch", type="primary", key="pb_launch_btn", disabled=not user_phantom):
+                # Validate URL on click
+                if not search_url or 'linkedin.com' not in search_url:
+                    st.error("Please enter a valid Sales Navigator URL first")
+                    st.stop()
+
                 st.session_state['pb_launch_status'] = 'launching'
                 st.session_state['pb_launch_agent_id'] = user_phantom['id']
                 st.session_state['pb_launch_error'] = None
@@ -1885,6 +2243,16 @@ with tab_upload:
                         st.session_state['pb_launch_container_id'] = result['containerId']
                         st.session_state['pb_launch_status'] = 'running'
                         st.session_state['pb_launch_start_time'] = time.time()
+
+                        # Save search to history
+                        csv_name = update_result.get('csvName')
+                        if csv_name:
+                            save_search_to_history(
+                                agent_id=user_phantom['id'],
+                                csv_name=csv_name,
+                                search_url=search_url,
+                                profiles_requested=2500
+                            )
                     else:
                         st.session_state['pb_launch_status'] = 'error'
                         st.session_state['pb_launch_error'] = result.get('error', 'Unknown error')
@@ -1901,29 +2269,7 @@ with tab_upload:
             elif not search_url:
                 st.info("Paste a Sales Navigator search URL to launch")
 
-        # ===== Advanced Settings =====
-        with st.expander("Advanced Settings"):
-            st.markdown("**Upload CSV manually**")
-            st.caption("Download CSV from PhantomBuster dashboard and upload here")
-            pb_upload = st.file_uploader(
-                "Upload PhantomBuster CSV",
-                type=['csv'],
-                key="pb_manual_upload"
-            )
-
-            if pb_upload:
-                try:
-                    pb_df = pd.read_csv(pb_upload)
-                    if not pb_df.empty:
-                        pb_df = normalize_phantombuster_columns(pb_df)
-                        st.session_state['results'] = pb_df.to_dict('records')
-                        st.session_state['results_df'] = pb_df
-                        st.success(f"Loaded **{len(pb_df)}** profiles!")
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"Error reading CSV: {e}")
-
-        st.divider()
+    st.divider()
 
     # ===== File Upload Section =====
     st.markdown("### Upload File")
@@ -1950,16 +2296,10 @@ with tab_upload:
         except Exception as e:
             st.error(f"Error: {e}")
 
-    # ===== Data Preview =====
+    # Next button
     if 'results' in st.session_state and st.session_state['results']:
         st.divider()
-        st.markdown("### Loaded Data Preview")
-        df = st.session_state['results_df']
-        st.success(f"**{len(df)}** profiles loaded")
-        display_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'education', 'location']
-        available_cols = [c for c in display_cols if c in df.columns]
-        st.dataframe(df[available_cols].head(50) if available_cols else df.head(50), use_container_width=True, hide_index=True)
-        st.caption(f"Showing first 50 of {len(df)} profiles")
+        st.info("**Next step:** Click on **2. Filter** tab to filter profiles (optional) or **3. Enrich** to enrich directly")
 
 # ========== TAB 2: Filter ==========
 with tab_filter:
@@ -2057,21 +2397,34 @@ with tab_filter:
                 not_relevant_file = st.file_uploader("Not Relevant Companies CSV", type=['csv'], key="not_relevant")
 
         with col2:
-            st.markdown("**Exclusion Filters:**")
-            filter_not_relevant_past = st.checkbox("Also filter past positions for not relevant", value=True)
-            filter_job_hoppers = st.checkbox("Filter job hoppers (2+ roles < 1 year)", value=True)
-            filter_consulting = st.checkbox("Filter consulting/project companies", value=True)
-            filter_long_tenure = st.checkbox("Filter 8+ years at one company", value=True)
-            filter_management = st.checkbox("Filter Director/VP/Head titles", value=True)
+            st.markdown("**Title Keywords Filter:**")
+            st.caption("Exclude profiles with these keywords in title")
+            exclude_title_keywords = st.text_input(
+                "Exclude title keywords (comma-separated)",
+                placeholder="e.g., director, vp, head of, manager",
+                key="exclude_title_keywords"
+            )
+
+            st.markdown("**Include Title Keywords:**")
+            st.caption("Only keep profiles with these keywords (leave empty for all)")
+            include_title_keywords = st.text_input(
+                "Include title keywords (comma-separated)",
+                placeholder="e.g., engineer, developer, architect",
+                key="include_title_keywords"
+            )
+
+            # Duration filters (from Phantom data)
+            st.markdown("**Duration Filters:**")
+            dur_col1, dur_col2 = st.columns(2)
+            with dur_col1:
+                min_role_months = st.number_input("Min months in role", min_value=0, max_value=120, value=0, key="min_role_months")
+                min_company_months = st.number_input("Min months at company", min_value=0, max_value=120, value=0, key="min_company_months")
+            with dur_col2:
+                max_role_months = st.number_input("Max months in role", min_value=0, max_value=240, value=0, help="0 = no limit", key="max_role_months")
+                max_company_months = st.number_input("Max months at company", min_value=0, max_value=240, value=0, help="0 = no limit", key="max_company_months")
 
         if st.button("Apply Filters", type="primary"):
-            filters = {
-                'filter_job_hoppers': filter_job_hoppers,
-                'filter_consulting': filter_consulting,
-                'filter_long_tenure': filter_long_tenure,
-                'filter_management': filter_management,
-                'not_relevant_past': filter_not_relevant_past,
-            }
+            filters = {}
 
             # Load filter data from Google Sheets or files
             with st.spinner("Loading filter data..."):
@@ -2105,6 +2458,22 @@ with tab_filter:
                 elif not_relevant_file:
                     nr_df = pd.read_csv(not_relevant_file)
                     filters['not_relevant'] = nr_df.iloc[:, 0].dropna().tolist()
+
+                # Title keywords
+                if exclude_title_keywords:
+                    filters['exclude_titles'] = [kw.strip().lower() for kw in exclude_title_keywords.split(',') if kw.strip()]
+                if include_title_keywords:
+                    filters['include_titles'] = [kw.strip().lower() for kw in include_title_keywords.split(',') if kw.strip()]
+
+                # Duration filters
+                if min_role_months > 0:
+                    filters['min_role_months'] = min_role_months
+                if max_role_months > 0:
+                    filters['max_role_months'] = max_role_months
+                if min_company_months > 0:
+                    filters['min_company_months'] = min_company_months
+                if max_company_months > 0:
+                    filters['max_company_months'] = max_company_months
 
             # Apply filters
             with st.spinner("Applying filters..."):
@@ -2223,7 +2592,7 @@ with tab_filter:
                         st.info(f"Layoff Alerts: {len(alerts_list)} loaded, {passed_df['is_layoff_company'].sum()} matches")
 
                 # Universities
-                if filter_sheets.get('universities'):
+                if filter_sheets.get('universities') and 'education' in passed_df.columns:
                     uni_df = load_sheet_as_df(sheet_url, filter_sheets['universities'])
                     if uni_df is not None and len(uni_df.columns) > 0:
                         uni_list = uni_df.iloc[:, 0].dropna().tolist()
@@ -2371,137 +2740,254 @@ with tab_filter:
         else:
             st.info("No candidates were filtered out")
 
-# ========== TAB 3: Results ==========
-with tab_results:
-    if 'filter_stats' not in st.session_state:
-        st.info("Apply filters in the Filter tab first to see results.")
-    elif 'passed_candidates_df' in st.session_state:
-        passed_df = st.session_state['passed_candidates_df']
-        stats = st.session_state['filter_stats']
+    # Next button
+    st.divider()
+    st.info("**Next step:** Click on **3. Enrich** tab to enrich profiles with full LinkedIn data")
 
-        # Summary metrics
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Original", stats.get('original', 0))
-        col2.metric("Removed", stats.get('total_removed', 0))
-        col3.metric("Passed", stats.get('final', 0))
-        col4.metric("Keep Rate", f"{round((stats.get('final', 0) / max(stats.get('original', 1), 1)) * 100)}%")
+# ========== TAB 3: Enrich ==========
+with tab_enrich:
+    st.markdown("### Enrich with Crust Data API")
+    st.caption("Add full LinkedIn profile data: work history, education, skills, and more")
 
-        st.divider()
+    # Show enrichment result message if stored
+    if 'enrichment_message' in st.session_state:
+        msg = st.session_state.pop('enrichment_message')
+        if msg.startswith('warning:'):
+            st.warning(msg[8:])
+        elif msg.startswith('success:'):
+            st.success(msg[8:])
+        else:
+            st.info(msg)
 
-        # Priority categories
-        filter_sheets = get_filter_sheets_config()
+    if not has_crust_key:
+        st.warning("Crust Data API key not configured. Add 'api_key' to config.json")
+    elif 'results' not in st.session_state or not st.session_state['results']:
+        st.info("Load profiles first (tab 1). Filtering (tab 2) is optional.")
+    else:
+        results_df = st.session_state.get('results_df')
+        enriched_df = st.session_state.get('enriched_df')
+
+        # Check if already enriched (enriched_df exists)
+        is_enriched = enriched_df is not None and not enriched_df.empty
+
+        if is_enriched:
+            st.success(f"**{len(enriched_df)}** profiles enriched! Proceed to Filter+ or AI Screen tab.")
+
+            # Show enriched data preview
+            st.markdown("### Enriched Profiles Preview")
+            display_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'location', 'linkedin_url', 'public_url']
+            available_cols = [c for c in display_cols if c in enriched_df.columns]
+            if available_cols:
+                st.dataframe(
+                    enriched_df[available_cols].head(20),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
+                        "public_url": st.column_config.LinkColumn("LinkedIn")
+                    }
+                )
+
+        if results_df is not None and not results_df.empty:
+            urls = extract_urls_from_phantombuster(results_df)
+
+            if urls:
+                st.info(f"**{len(urls)}** profiles ready for enrichment")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    max_profiles = st.number_input(
+                        "Number of profiles to enrich",
+                        min_value=1,
+                        max_value=len(urls),
+                        value=min(10, len(urls)),
+                        help="Start with a few to test, then increase"
+                    )
+                with col2:
+                    batch_size = st.slider("Batch size", min_value=1, max_value=25, value=10, key="enrich_batch")
+
+                st.caption("Each profile costs 1 Crust Data credit")
+
+                if st.button("Start Enrichment", type="primary", key="start_enrich_tab"):
+                    urls_to_process = urls[:max_profiles]
+                    results = []
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    total_batches = (len(urls_to_process) + batch_size - 1) // batch_size
+
+                    for i in range(0, len(urls_to_process), batch_size):
+                        batch = urls_to_process[i:i + batch_size]
+                        batch_num = i // batch_size + 1
+                        status_text.text(f"Processing batch {batch_num}/{total_batches}...")
+                        batch_results = enrich_batch(batch, api_key)
+                        results.extend(batch_results)
+                        progress_bar.progress(min((i + batch_size) / len(urls_to_process), 1.0))
+                        if i + batch_size < len(urls_to_process):
+                            time.sleep(2)
+
+                    progress_bar.progress(1.0)
+                    status_text.text("Enrichment complete!")
+                    send_notification("Enrichment Complete", f"Processed {len(results)} profiles")
+
+                    # Check for errors in results
+                    errors = [r for r in results if 'error' in r]
+                    successful = [r for r in results if 'error' not in r]
+
+                    if successful:
+                        # Save enriched data separately - don't overwrite original loaded data
+                        st.session_state['enriched_results'] = successful
+                        st.session_state['enriched_df'] = flatten_for_csv(successful)
+                        # Store message to show after rerun
+                        if errors:
+                            st.session_state['enrichment_message'] = f"warning:Enriched {len(successful)} profiles. {len(errors)} failed: {errors[0].get('error', 'Unknown')[:150]}"
+                        else:
+                            st.session_state['enrichment_message'] = f"success:Enriched {len(successful)} profiles successfully!"
+                        st.rerun()
+                    elif errors:
+                        # All failed - show error, original data stays intact
+                        st.error(f"Enrichment failed for all profiles. Error: {errors[0].get('error', 'Unknown')[:200]}")
+                    else:
+                        st.error("No results returned from API. Check your API key and credits.")
+            else:
+                st.warning("No LinkedIn URLs found in loaded profiles.")
+
+        # Next button (show only if enriched)
+        if is_enriched:
+            st.divider()
+            st.info("**Next step:** Click on **4. Filter+** tab to filter on enriched data, or **5. AI Screen** to screen candidates")
+
+# ========== TAB 4: Filter+ (Post-Enrichment) ==========
+with tab_filter2:
+    st.markdown("### Advanced Filtering (Enriched Data)")
+    st.caption("Filter on full profile data: work history, education, skills")
+
+    enriched_df = st.session_state.get('enriched_df')
+    is_enriched = enriched_df is not None and not enriched_df.empty
+
+    if not is_enriched:
+        st.info("Enrich profiles first (tab 3) to use advanced filtering.")
+    else:
+        st.success(f"**{len(enriched_df)}** enriched profiles ready for filtering")
+
+        # Show available enriched columns
+        enriched_cols = [c for c in enriched_df.columns if c.startswith('job_') or c.startswith('education_') or 'skill' in c.lower()]
+        if enriched_cols:
+            with st.expander("Available enriched fields"):
+                st.write(enriched_cols[:20])
+
+        # Google Sheets filtering (same as Filter tab)
+        filter_sheets = get_filter_sheets_config().copy()
         gspread_client = get_gspread_client()
+
+        user_sheet_url = st.text_input(
+            "Google Sheet URL for filtering",
+            value=st.session_state.get('user_sheet_url', ''),
+            placeholder="https://docs.google.com/spreadsheets/d/...",
+            key="filter2_sheet_input"
+        )
+
+        if user_sheet_url:
+            st.session_state['user_sheet_url'] = user_sheet_url
+            filter_sheets['url'] = user_sheet_url
+
         has_sheets = bool(filter_sheets.get('url')) and gspread_client is not None
 
-        if has_sheets and st.button("Load Priority Categories", key="load_categories_results"):
-            sheet_url = filter_sheets.get('url', '')
+        if has_sheets:
+            st.success("Filter sheet connected")
 
-            def normalize_company(name):
-                if pd.isna(name) or not str(name).strip():
-                    return ''
-                name = str(name).lower().strip()
-                for suffix in [' ltd', ' inc', ' corp', ' llc', ' limited', ' israel', ' il', ' technologies', ' tech', ' software', ' solutions', ' group']:
-                    if name.endswith(suffix):
-                        name = name[:-len(suffix)].strip()
-                return name
+            if st.button("Apply Filters", type="primary", key="apply_filters_enriched"):
+                with st.spinner("Applying filters..."):
+                    # Use same filtering logic as Filter tab
+                    df = enriched_df.copy()
+                    original_count = len(df)
+                    removed = {}
 
-            def matches_list(company, company_list):
-                if pd.isna(company) or not str(company).strip():
-                    return False
-                company_norm = normalize_company(company)
-                if not company_norm:
-                    return False
-                for c in company_list:
-                    c_norm = normalize_company(c)
-                    if c_norm and (company_norm == c_norm or (len(c_norm) >= 4 and len(company_norm) >= 4 and (company_norm.startswith(c_norm) or c_norm.startswith(company_norm)))):
-                        return True
-                return False
+                    # Load filter lists from sheets
+                    sheet_url = filter_sheets.get('url', '')
 
-            def matches_list_in_text(text, items_list):
-                if pd.isna(text) or not str(text).strip():
-                    return False
-                text_lower = str(text).lower()
-                return any(str(item).lower().strip() in text_lower for item in items_list if len(str(item).strip()) >= 3)
+                    # Determine URL column name
+                    url_col = 'linkedin_url' if 'linkedin_url' in df.columns else 'public_url' if 'public_url' in df.columns else None
 
-            with st.spinner("Loading priority lists..."):
-                if filter_sheets.get('target_companies'):
-                    tc_df = load_sheet_as_df(sheet_url, filter_sheets['target_companies'])
-                    if tc_df is not None:
-                        target_companies = []
-                        for col in tc_df.columns:
-                            if 'company' in col.lower() or 'name' in col.lower():
-                                target_companies.extend(tc_df[col].dropna().tolist())
-                        target_list = [str(c).lower().strip() for c in target_companies if c]
-                        passed_df['is_target_company'] = passed_df['current_company'].apply(lambda x: matches_list(x, target_list))
-                        st.info(f"Target Companies: {passed_df['is_target_company'].sum()} matches")
+                    # Past candidates filter
+                    if filter_sheets.get('past_candidates') and url_col:
+                        pc_df = load_sheet_as_df(sheet_url, filter_sheets['past_candidates'])
+                        if pc_df is not None:
+                            past_urls = set()
+                            for col in pc_df.columns:
+                                if 'url' in col.lower() or 'linkedin' in col.lower():
+                                    past_urls.update(pc_df[col].dropna().str.lower().tolist())
+                            before = len(df)
+                            df = df[~df[url_col].str.lower().isin(past_urls)]
+                            removed['Past Candidates'] = before - len(df)
 
-                if filter_sheets.get('tech_alerts'):
-                    ta_df = load_sheet_as_df(sheet_url, filter_sheets['tech_alerts'])
-                    if ta_df is not None:
-                        tech_alerts = []
-                        for col in ta_df.columns:
-                            if 'company' in col.lower() or 'name' in col.lower():
-                                tech_alerts.extend(ta_df[col].dropna().tolist())
-                        alerts_list = [str(c).lower().strip() for c in tech_alerts if c]
-                        passed_df['is_layoff_company'] = passed_df['current_company'].apply(lambda x: matches_list(x, alerts_list))
-                        st.info(f"Layoff Alerts: {passed_df['is_layoff_company'].sum()} matches")
+                    # Blacklist filter
+                    if filter_sheets.get('blacklist') and url_col:
+                        bl_df = load_sheet_as_df(sheet_url, filter_sheets['blacklist'])
+                        if bl_df is not None:
+                            bl_urls = set()
+                            for col in bl_df.columns:
+                                if 'url' in col.lower() or 'linkedin' in col.lower():
+                                    bl_urls.update(bl_df[col].dropna().str.lower().tolist())
+                            before = len(df)
+                            df = df[~df[url_col].str.lower().isin(bl_urls)]
+                            removed['Blacklist'] = before - len(df)
 
-                if filter_sheets.get('universities'):
-                    uni_df = load_sheet_as_df(sheet_url, filter_sheets['universities'])
-                    if uni_df is not None:
-                        uni_list = uni_df.iloc[:, 0].dropna().tolist()
-                        passed_df['is_top_university'] = passed_df['education'].apply(lambda x: matches_list_in_text(x, uni_list))
-                        st.info(f"Top Universities: {passed_df['is_top_university'].sum()} matches")
+                    # Store results
+                    st.session_state['passed_candidates_df'] = df
+                    st.session_state['filter_stats'] = {
+                        'original': original_count,
+                        'total_removed': original_count - len(df),
+                        'final': len(df),
+                        'removed_by': removed
+                    }
 
-            st.session_state['passed_candidates_df'] = passed_df
-            st.rerun()
+                    st.success(f"Filtered: {original_count} → {len(df)} profiles")
+                    for reason, count in removed.items():
+                        if count > 0:
+                            st.caption(f"  - {reason}: {count} removed")
 
-        # Filter checkboxes
-        st.markdown("**Filter by category:**")
-        fcol1, fcol2, fcol3, fcol4 = st.columns(4)
-        show_all = fcol1.checkbox("All", value=True, key="res_filter_all")
-        show_target = fcol2.checkbox(f"Target Co ({int(passed_df['is_target_company'].sum()) if 'is_target_company' in passed_df.columns else 0})", key="res_filter_target") if 'is_target_company' in passed_df.columns else False
-        show_layoff = fcol3.checkbox(f"Layoffs ({int(passed_df['is_layoff_company'].sum()) if 'is_layoff_company' in passed_df.columns else 0})", key="res_filter_layoff") if 'is_layoff_company' in passed_df.columns else False
-        show_uni = fcol4.checkbox(f"Top Uni ({int(passed_df['is_top_university'].sum()) if 'is_top_university' in passed_df.columns else 0})", key="res_filter_uni") if 'is_top_university' in passed_df.columns else False
+        # Show current data
+        st.divider()
+        display_df = st.session_state.get('passed_candidates_df', enriched_df)
+        st.markdown(f"**{len(display_df)}** profiles")
 
-        # Apply filter
-        if show_all or (not show_target and not show_layoff and not show_uni):
-            view_df = passed_df
-        else:
-            mask = pd.Series([False] * len(passed_df), index=passed_df.index)
-            if show_target and 'is_target_company' in passed_df.columns:
-                mask = mask | passed_df['is_target_company'].fillna(False)
-            if show_layoff and 'is_layoff_company' in passed_df.columns:
-                mask = mask | passed_df['is_layoff_company'].fillna(False)
-            if show_uni and 'is_top_university' in passed_df.columns:
-                mask = mask | passed_df['is_top_university'].fillna(False)
-            view_df = passed_df[mask]
+        display_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'location', 'linkedin_url', 'public_url']
+        available_cols = [c for c in display_cols if c in display_df.columns]
+        st.dataframe(display_df[available_cols].head(50), use_container_width=True, hide_index=True,
+                    column_config={
+                        "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
+                        "public_url": st.column_config.LinkColumn("LinkedIn")
+                    })
 
-        st.success(f"**{len(view_df)}** candidates")
+        if len(display_df) > 0:
+            csv_data = display_df.to_csv(index=False)
+            st.download_button("Download CSV", csv_data, "filtered_profiles.csv", "text/csv", key="download_filtered")
 
-        display_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'education', 'location', 'public_url']
-        available_cols = [c for c in display_cols if c in view_df.columns]
-        st.dataframe(view_df[available_cols], use_container_width=True, hide_index=True,
-                    column_config={"public_url": st.column_config.LinkColumn("LinkedIn")})
+        # Next button
+        st.divider()
+        st.info("**Next step:** Click on **5. AI Screen** tab to screen candidates with AI")
 
-        csv_data = view_df.to_csv(index=False)
-        st.download_button("Download CSV", csv_data, "passed_candidates.csv", "text/csv")
-
-# ========== TAB 4: AI Screening ==========
+# ========== TAB 5: AI Screening ==========
 with tab_screening:
     openai_key = load_openai_key()
+
+    # Check if data is enriched
+    enriched_df = st.session_state.get('enriched_df')
+    is_enriched = enriched_df is not None and not enriched_df.empty
+
     if not openai_key:
         st.warning("OpenAI API key not configured. Add 'openai_api_key' to config.json")
-    elif 'results_df' not in st.session_state or st.session_state['results_df'].empty:
-        st.info("Load profiles first (Upload tab or PhantomBuster tab), then come back here to screen.")
+    elif not is_enriched:
+        st.warning("Profiles must be enriched before AI screening.")
+        st.info("Go to **tab 3 (Enrich)** to enrich profiles with full LinkedIn data, then come back here.")
     else:
-        # Use passed_candidates_df if available (filtered), otherwise use results_df (all)
+        # Use passed_candidates_df if available (filtered), otherwise use enriched_df
         if 'passed_candidates_df' in st.session_state and not st.session_state['passed_candidates_df'].empty:
             profiles_df = st.session_state['passed_candidates_df']
             st.success(f"**{len(profiles_df)}** filtered candidates ready for screening")
         else:
-            profiles_df = st.session_state['results_df']
-            st.info(f"**{len(profiles_df)}** profiles loaded (no filters applied)")
+            profiles_df = enriched_df
+            st.info(f"**{len(profiles_df)}** enriched profiles ready for screening")
 
         profiles = profiles_df.to_dict('records')
 
@@ -2691,134 +3177,3 @@ with tab_screening:
                     del st.session_state['screening_results']
                     st.rerun()
 
-# ========== Enrich new profiles (optional) ==========
-with st.expander("Enrich New Profiles (requires Crust Data API key)", expanded=False):
-    if not has_crust_key:
-        st.warning("Crust Data API key not configured. Add 'api_key' to config.json")
-    else:
-        st.success("Crust Data API key loaded")
-
-        # Source selection tabs
-        source_tab1, source_tab2 = st.tabs(["Upload File", "PhantomBuster"])
-
-        urls_to_enrich = []
-
-        with source_tab1:
-            uploaded_file = st.file_uploader(
-                "Upload CSV or JSON file with LinkedIn URLs",
-                type=['csv', 'json'],
-                key="enrich_upload"
-            )
-
-            if uploaded_file:
-                urls = extract_urls(uploaded_file)
-                if urls:
-                    st.success(f"Found **{len(urls)}** LinkedIn URLs")
-                    st.session_state['enrich_urls'] = urls
-                    with st.expander("Preview URLs"):
-                        for i, url in enumerate(urls[:10]):
-                            st.text(f"{i+1}. {url}")
-                        if len(urls) > 10:
-                            st.text(f"... and {len(urls) - 10} more")
-                else:
-                    st.warning("No LinkedIn URLs found in file")
-
-        with source_tab2:
-            pb_key = load_phantombuster_key()
-            has_pb_key = pb_key and pb_key != "YOUR_PHANTOMBUSTER_API_KEY_HERE"
-
-            if not has_pb_key:
-                st.warning("PhantomBuster API key not configured. Add 'phantombuster_api_key' to config.json")
-            else:
-                st.success("PhantomBuster API key loaded")
-
-                # Fetch agents list
-                agents = fetch_phantombuster_agents(pb_key)
-
-                if agents:
-                    # Create dropdown with agent names
-                    agent_options = {a['name']: a['id'] for a in agents}
-                    selected_agent = st.selectbox(
-                        "Select Phantom",
-                        options=list(agent_options.keys()),
-                        index=0,
-                        help="Select from your PhantomBuster agents"
-                    )
-                    agent_id = agent_options.get(selected_agent, '')
-                else:
-                    st.warning("No agents found or could not fetch agent list")
-                    agent_id = st.text_input(
-                        "PhantomBuster Agent ID",
-                        placeholder="Enter your agent/phantom ID manually",
-                    )
-
-                if agent_id:
-                    if st.button("Fetch from PhantomBuster", key="fetch_pb"):
-                        with st.spinner("Fetching results from PhantomBuster..."):
-                            pb_df = fetch_phantombuster_result_csv(pb_key, agent_id)
-
-                            if not pb_df.empty:
-                                # Normalize column names
-                                pb_df = normalize_phantombuster_columns(pb_df)
-                                st.success(f"Fetched **{len(pb_df)}** profiles from PhantomBuster")
-                                st.session_state['pb_results'] = pb_df
-
-                                # Show preview
-                                preview_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'location']
-                                available = [c for c in preview_cols if c in pb_df.columns]
-                                if available:
-                                    st.dataframe(pb_df[available].head(10), use_container_width=True, hide_index=True)
-
-                                # Extract URLs
-                                urls = extract_urls_from_phantombuster(pb_df)
-                                if urls:
-                                    st.info(f"Found **{len(urls)}** LinkedIn URLs to enrich")
-                                    st.session_state['enrich_urls'] = urls
-                                else:
-                                    st.warning("No LinkedIn URLs found in PhantomBuster results")
-                            else:
-                                st.error("No results found. Check agent ID and make sure agent has run.")
-
-        # Enrichment controls (shared between both sources)
-        st.divider()
-        if 'enrich_urls' in st.session_state and st.session_state['enrich_urls']:
-            urls = st.session_state['enrich_urls']
-            st.info(f"**{len(urls)}** URLs ready for enrichment")
-
-            col1, col2 = st.columns(2)
-            with col1:
-                max_profiles = st.number_input(
-                    "Number of profiles to process",
-                    min_value=1,
-                    max_value=len(urls),
-                    value=min(5, len(urls)),
-                    help="Start with a few to test"
-                )
-            with col2:
-                batch_size = st.slider("Batch size", min_value=1, max_value=25, value=10)
-
-            if st.button("Start Enrichment", type="primary", key="start_enrich"):
-                urls_to_process = urls[:max_profiles]
-                results = []
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                total_batches = (len(urls_to_process) + batch_size - 1) // batch_size
-
-                for i in range(0, len(urls_to_process), batch_size):
-                    batch = urls_to_process[i:i + batch_size]
-                    batch_num = i // batch_size + 1
-                    status_text.text(f"Processing batch {batch_num}/{total_batches}...")
-                    batch_results = enrich_batch(batch, api_key)
-                    results.extend(batch_results)
-                    progress_bar.progress(min((i + batch_size) / len(urls_to_process), 1.0))
-                    if i + batch_size < len(urls_to_process):
-                        time.sleep(2)
-
-                progress_bar.progress(1.0)
-                status_text.text("Enrichment complete!")
-                send_notification("Enrichment Complete", f"Processed {len(results)} profiles")
-                st.session_state['results'] = results
-                st.session_state['results_df'] = flatten_for_csv(results)
-                # Clear enrich_urls
-                del st.session_state['enrich_urls']
-                st.rerun()

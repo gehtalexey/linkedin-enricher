@@ -3,6 +3,9 @@ config.json
 google_credentials.json
 *.json.backup
 
+# Search history (user-specific)
+search_history.json
+
 # Python
 __pycache__/
 *.py[cod]
