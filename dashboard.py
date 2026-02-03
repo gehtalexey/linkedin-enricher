@@ -3084,34 +3084,37 @@ with tab_filter:
             st.caption(f"{current_count} profiles | {already_enriched} already have emails | {not_enriched} remaining")
 
             # Ask how many to enrich
-            col_option, col_number = st.columns([1, 1])
-            with col_option:
-                enrich_option = st.radio("How many to enrich?", ["All", "Specific number"], key="enrich_option_tab2", horizontal=True)
-            with col_number:
-                if enrich_option == "Specific number":
-                    enrich_count = st.number_input("Number of profiles", min_value=1, max_value=not_enriched, value=min(50, not_enriched), key="enrich_count_tab2")
-                else:
-                    enrich_count = not_enriched
+            if not_enriched > 0:
+                col_option, col_number = st.columns([1, 1])
+                with col_option:
+                    enrich_option = st.radio("How many to enrich?", ["All", "Specific number"], key="enrich_option_tab2", horizontal=True)
+                with col_number:
+                    if enrich_option == "Specific number":
+                        enrich_count = st.number_input("Number of profiles", min_value=1, max_value=not_enriched, value=min(50, not_enriched), key="enrich_count_tab2")
+                    else:
+                        enrich_count = not_enriched
 
-            if st.button(f"Enrich {enrich_count} profiles with Emails", key="salesql_tab2", type="primary"):
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+                if st.button(f"Enrich {enrich_count} profiles with Emails", key="salesql_tab2", type="primary"):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
 
-                def update_progress(current, total):
-                    progress_bar.progress(current / total)
-                    status_text.text(f"Enriching {current}/{total}...")
+                    def update_progress(current, total):
+                        progress_bar.progress(current / total)
+                        status_text.text(f"Enriching {current}/{total}...")
 
-                enriched_df = enrich_profiles_with_salesql(
-                    st.session_state['results_df'],
-                    salesql_key,
-                    progress_callback=update_progress,
-                    limit=enrich_count
-                )
-                st.session_state['results_df'] = enriched_df
-                st.session_state['results'] = enriched_df.to_dict('records')
-                new_emails = enriched_df['salesql_email'].notna().sum() if 'salesql_email' in enriched_df.columns else 0
-                st.success(f"Done! {new_emails} profiles now have emails.")
-                st.rerun()
+                    enriched_df = enrich_profiles_with_salesql(
+                        st.session_state['results_df'],
+                        salesql_key,
+                        progress_callback=update_progress,
+                        limit=enrich_count
+                    )
+                    st.session_state['results_df'] = enriched_df
+                    st.session_state['results'] = enriched_df.to_dict('records')
+                    new_emails = enriched_df['salesql_email'].notna().sum() if 'salesql_email' in enriched_df.columns else 0
+                    st.success(f"Done! {new_emails} profiles now have emails.")
+                    st.rerun()
+            else:
+                st.success("All profiles already have emails!")
         else:
             st.info("Load profiles first to enrich with emails")
     else:
@@ -3354,28 +3357,31 @@ with tab_filter2:
                 st.caption(f"{current_count} profiles | {already_enriched} already have emails | {not_enriched} remaining")
 
                 # Ask how many to enrich
-                col_option, col_number = st.columns([1, 1])
-                with col_option:
-                    enrich_option = st.radio("How many to enrich?", ["All", "Specific number"], key="enrich_option_tab4", horizontal=True)
-                with col_number:
-                    if enrich_option == "Specific number":
-                        enrich_count = st.number_input("Number of profiles", min_value=1, max_value=max(1, not_enriched), value=min(50, max(1, not_enriched)), key="enrich_count_tab4")
-                    else:
-                        enrich_count = not_enriched
+                if not_enriched > 0:
+                    col_option, col_number = st.columns([1, 1])
+                    with col_option:
+                        enrich_option = st.radio("How many to enrich?", ["All", "Specific number"], key="enrich_option_tab4", horizontal=True)
+                    with col_number:
+                        if enrich_option == "Specific number":
+                            enrich_count = st.number_input("Number of profiles", min_value=1, max_value=not_enriched, value=min(50, not_enriched), key="enrich_count_tab4")
+                        else:
+                            enrich_count = not_enriched
 
-                if st.button(f"Enrich {enrich_count} profiles with Emails", key="salesql_tab4", type="primary"):
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+                    if st.button(f"Enrich {enrich_count} profiles with Emails", key="salesql_tab4", type="primary"):
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
 
-                    def update_progress(current, total):
-                        progress_bar.progress(current / total)
-                        status_text.text(f"Enriching {current}/{total}...")
+                        def update_progress(current, total):
+                            progress_bar.progress(current / total)
+                            status_text.text(f"Enriching {current}/{total}...")
 
-                    enriched_df = enrich_profiles_with_salesql(email_df, salesql_key, progress_callback=update_progress, limit=enrich_count)
-                    st.session_state['passed_candidates_df'] = enriched_df
-                    new_emails = enriched_df['salesql_email'].notna().sum() if 'salesql_email' in enriched_df.columns else 0
-                    st.success(f"Done! {new_emails} profiles now have emails.")
-                    st.rerun()
+                        enriched_df = enrich_profiles_with_salesql(email_df, salesql_key, progress_callback=update_progress, limit=enrich_count)
+                        st.session_state['passed_candidates_df'] = enriched_df
+                        new_emails = enriched_df['salesql_email'].notna().sum() if 'salesql_email' in enriched_df.columns else 0
+                        st.success(f"Done! {new_emails} profiles now have emails.")
+                        st.rerun()
+                else:
+                    st.success("All profiles already have emails!")
         else:
             st.caption("SalesQL not configured. Add 'salesql_api_key' to secrets.")
 
@@ -3572,29 +3578,32 @@ with tab_screening:
                 st.caption(f"{current_count} profiles | {already_enriched} already have emails | {not_enriched} remaining")
 
                 # Ask how many to enrich
-                col_option, col_number = st.columns([1, 1])
-                with col_option:
-                    enrich_option = st.radio("How many to enrich?", ["All", "Specific number"], key="enrich_option_tab5", horizontal=True)
-                with col_number:
-                    if enrich_option == "Specific number":
-                        enrich_count = st.number_input("Number of profiles", min_value=1, max_value=max(1, not_enriched), value=min(50, max(1, not_enriched)), key="enrich_count_tab5")
-                    else:
-                        enrich_count = not_enriched
+                if not_enriched > 0:
+                    col_option, col_number = st.columns([1, 1])
+                    with col_option:
+                        enrich_option = st.radio("How many to enrich?", ["All", "Specific number"], key="enrich_option_tab5", horizontal=True)
+                    with col_number:
+                        if enrich_option == "Specific number":
+                            enrich_count = st.number_input("Number of profiles", min_value=1, max_value=not_enriched, value=min(50, not_enriched), key="enrich_count_tab5")
+                        else:
+                            enrich_count = not_enriched
 
-                if st.button(f"Enrich {enrich_count} profiles with Emails", key="salesql_tab5", type="primary"):
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+                    if st.button(f"Enrich {enrich_count} profiles with Emails", key="salesql_tab5", type="primary"):
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
 
-                    def update_progress(current, total):
-                        progress_bar.progress(current / total)
-                        status_text.text(f"Enriching {current}/{total}...")
+                        def update_progress(current, total):
+                            progress_bar.progress(current / total)
+                            status_text.text(f"Enriching {current}/{total}...")
 
-                    enriched_df = enrich_profiles_with_salesql(screening_df, salesql_key, progress_callback=update_progress, limit=enrich_count)
-                    # Update screening results with emails
-                    st.session_state['screening_results'] = enriched_df.to_dict('records')
-                    new_emails = enriched_df['salesql_email'].notna().sum() if 'salesql_email' in enriched_df.columns else 0
-                    st.success(f"Done! {new_emails} profiles now have emails.")
-                    st.rerun()
+                        enriched_df = enrich_profiles_with_salesql(screening_df, salesql_key, progress_callback=update_progress, limit=enrich_count)
+                        # Update screening results with emails
+                        st.session_state['screening_results'] = enriched_df.to_dict('records')
+                        new_emails = enriched_df['salesql_email'].notna().sum() if 'salesql_email' in enriched_df.columns else 0
+                        st.success(f"Done! {new_emails} profiles now have emails.")
+                        st.rerun()
+                else:
+                    st.success("All profiles already have emails!")
             else:
                 st.caption("SalesQL not configured. Add 'salesql_api_key' to secrets.")
 
