@@ -1909,6 +1909,10 @@ with tab_upload:
     pb_key = load_phantombuster_key()
     has_pb_key = pb_key and pb_key != "YOUR_PHANTOMBUSTER_API_KEY_HERE"
 
+    # Debug: show if PB key is loaded (remove after debugging)
+    if not has_pb_key:
+        st.warning(f"PhantomBuster not configured. Key loaded: {bool(pb_key)}")
+
     if has_pb_key:
         # Fetch all agents once
         pb_result = fetch_phantombuster_agents(pb_key)
