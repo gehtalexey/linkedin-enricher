@@ -78,6 +78,7 @@ st.set_page_config(
 
 # Authentication check (only when auth is configured)
 auth_config = get_auth_config()
+authenticator = None
 if auth_config and HAS_AUTHENTICATOR:
     authenticator = stauth.Authenticate(
         auth_config['credentials'],
@@ -93,6 +94,11 @@ if auth_config and HAS_AUTHENTICATOR:
     elif st.session_state.get('authentication_status') is None:
         st.warning('Please enter your username and password')
         st.stop()
+    else:
+        # User is logged in - add logout button to sidebar
+        with st.sidebar:
+            st.write(f"Welcome, **{st.session_state.get('name', 'User')}**")
+            authenticator.logout("Logout", "sidebar")
 
 # Professional UI styling
 st.markdown("""
