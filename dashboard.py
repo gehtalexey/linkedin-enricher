@@ -166,6 +166,8 @@ def load_config():
                 config['google_credentials'] = dict(st.secrets['google_credentials'])
             if 'filter_sheets' in st.secrets:
                 config['filter_sheets'] = dict(st.secrets['filter_sheets'])
+            if 'salesql_api_key' in st.secrets:
+                config['salesql_api_key'] = st.secrets['salesql_api_key']
     except Exception:
         pass
 
@@ -188,6 +190,112 @@ def load_phantombuster_key():
 def load_phantombuster_agent_id():
     config = load_config()
     return config.get('phantombuster_agent_id')
+
+
+def load_salesql_key():
+    config = load_config()
+    return config.get('salesql_api_key')
+
+
+# ===== SalesQL Email Enrichment =====
+def enrich_with_salesql(linkedin_url: str, api_key: str) -> dict:
+    """Enrich a single profile with SalesQL to get email.
+
+    Returns dict with 'emails' list and 'error' if any.
+    """
+    try:
+        response = requests.get(
+            'https://api-public.salesql.com/v1/persons/enrich/',
+            params={'linkedin_url': linkedin_url},
+            headers={'Authorization': f'Bearer {api_key}'},
+            timeout=30
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                'emails': data.get('emails', []),
+                'first_name': data.get('first_name'),
+                'last_name': data.get('last_name'),
+                'title': data.get('title'),
+                'organization': data.get('organization', {}).get('name'),
+            }
+        elif response.status_code == 404:
+            return {'emails': [], 'error': 'Profile not found'}
+        else:
+            return {'emails': [], 'error': f'API error {response.status_code}'}
+    except Exception as e:
+        return {'emails': [], 'error': str(e)}
+
+
+def enrich_profiles_with_salesql(profiles_df: pd.DataFrame, api_key: str, progress_callback=None) -> pd.DataFrame:
+    """Enrich multiple profiles with SalesQL emails.
+
+    Args:
+        profiles_df: DataFrame with linkedin_url column
+        api_key: SalesQL API key
+        progress_callback: Optional callback(current, total) for progress updates
+
+    Returns DataFrame with added email columns.
+    """
+    df = profiles_df.copy()
+
+    # Find LinkedIn URL column
+    url_col = None
+    for col in ['linkedin_url', 'public_url', 'defaultProfileUrl', 'LinkedIn URL']:
+        if col in df.columns:
+            url_col = col
+            break
+
+    if not url_col:
+        return df
+
+    # Add email columns if not exist
+    if 'salesql_email' not in df.columns:
+        df['salesql_email'] = ''
+    if 'salesql_email_type' not in df.columns:
+        df['salesql_email_type'] = ''
+
+    total = len(df)
+    for idx, row in df.iterrows():
+        linkedin_url = row.get(url_col)
+        if not linkedin_url or pd.isna(linkedin_url):
+            continue
+
+        # Skip if already enriched
+        if row.get('salesql_email') and not pd.isna(row.get('salesql_email')):
+            continue
+
+        result = enrich_with_salesql(linkedin_url, api_key)
+
+        if result.get('emails'):
+            # Prefer Direct email, then Work email
+            best_email = None
+            best_type = None
+            for email_obj in result['emails']:
+                email = email_obj.get('email', '')
+                email_type = email_obj.get('type', '')
+                if email_type == 'Direct':
+                    best_email = email
+                    best_type = 'Direct'
+                    break
+                elif email_type == 'Work' and not best_email:
+                    best_email = email
+                    best_type = 'Work'
+                elif not best_email:
+                    best_email = email
+                    best_type = email_type
+
+            if best_email:
+                df.at[idx, 'salesql_email'] = best_email
+                df.at[idx, 'salesql_email_type'] = best_type
+
+        if progress_callback:
+            progress_callback(idx + 1, total)
+
+        # Rate limiting - small delay between requests
+        time.sleep(0.2)
+
+    return df
 
 
 # ===== Search History Functions =====
@@ -1915,15 +2023,6 @@ with tab_upload:
     pb_key = load_phantombuster_key()
     has_pb_key = pb_key and pb_key != "YOUR_PHANTOMBUSTER_API_KEY_HERE"
 
-    # Debug: show if PB key is loaded (remove after debugging)
-    if not has_pb_key:
-        # Check what secrets are available
-        try:
-            secrets_keys = list(st.secrets.keys()) if hasattr(st, 'secrets') else []
-            st.warning(f"PhantomBuster not configured. Key loaded: {bool(pb_key)}. Secrets available: {secrets_keys}")
-        except Exception as e:
-            st.warning(f"PhantomBuster not configured. Error reading secrets: {e}")
-
     if has_pb_key:
         # Fetch all agents once
         pb_result = fetch_phantombuster_agents(pb_key)
@@ -2908,6 +3007,39 @@ with tab_filter:
         else:
             st.info("No candidates were filtered out")
 
+    # ===== SalesQL Email Enrichment =====
+    st.divider()
+    st.markdown("### Email Enrichment (SalesQL)")
+    salesql_key = load_salesql_key()
+    if salesql_key:
+        if 'results' in st.session_state and st.session_state['results']:
+            current_count = len(st.session_state['results_df'])
+            already_enriched = st.session_state['results_df']['salesql_email'].notna().sum() if 'salesql_email' in st.session_state['results_df'].columns else 0
+            st.caption(f"{current_count} profiles | {already_enriched} already have emails")
+
+            if st.button("Enrich with Emails", key="salesql_tab2", type="primary"):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                def update_progress(current, total):
+                    progress_bar.progress(current / total)
+                    status_text.text(f"Enriching {current}/{total}...")
+
+                enriched_df = enrich_profiles_with_salesql(
+                    st.session_state['results_df'],
+                    salesql_key,
+                    progress_callback=update_progress
+                )
+                st.session_state['results_df'] = enriched_df
+                st.session_state['results'] = enriched_df.to_dict('records')
+                new_emails = enriched_df['salesql_email'].notna().sum() if 'salesql_email' in enriched_df.columns else 0
+                st.success(f"Done! {new_emails} profiles now have emails.")
+                st.rerun()
+        else:
+            st.info("Load profiles first to enrich with emails")
+    else:
+        st.caption("SalesQL not configured. Add 'salesql_api_key' to secrets.")
+
     # Next button
     st.divider()
     st.info("**Next step:** Click on **3. Enrich** tab to enrich profiles with full LinkedIn data")
@@ -3131,6 +3263,34 @@ with tab_filter2:
             csv_data = display_df.to_csv(index=False)
             st.download_button("Download CSV", csv_data, "filtered_profiles.csv", "text/csv", key="download_filtered")
 
+        # ===== SalesQL Email Enrichment =====
+        st.divider()
+        st.markdown("### Email Enrichment (SalesQL)")
+        salesql_key = load_salesql_key()
+        if salesql_key:
+            # Use passed_candidates_df if available
+            email_df = st.session_state.get('passed_candidates_df', display_df)
+            if email_df is not None and not email_df.empty:
+                current_count = len(email_df)
+                already_enriched = email_df['salesql_email'].notna().sum() if 'salesql_email' in email_df.columns else 0
+                st.caption(f"{current_count} profiles | {already_enriched} already have emails")
+
+                if st.button("Enrich with Emails", key="salesql_tab4", type="primary"):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+
+                    def update_progress(current, total):
+                        progress_bar.progress(current / total)
+                        status_text.text(f"Enriching {current}/{total}...")
+
+                    enriched_df = enrich_profiles_with_salesql(email_df, salesql_key, progress_callback=update_progress)
+                    st.session_state['passed_candidates_df'] = enriched_df
+                    new_emails = enriched_df['salesql_email'].notna().sum() if 'salesql_email' in enriched_df.columns else 0
+                    st.success(f"Done! {new_emails} profiles now have emails.")
+                    st.rerun()
+        else:
+            st.caption("SalesQL not configured. Add 'salesql_api_key' to secrets.")
+
         # Next button
         st.divider()
         st.info("**Next step:** Click on **5. AI Screen** tab to screen candidates with AI")
@@ -3312,6 +3472,31 @@ with tab_screening:
                     "LinkedIn": st.column_config.LinkColumn("LinkedIn", width="small")
                 }
             )
+
+            # ===== SalesQL Email Enrichment =====
+            st.markdown("### Email Enrichment (SalesQL)")
+            salesql_key = load_salesql_key()
+            if salesql_key:
+                screening_df = pd.DataFrame(sorted_results)
+                already_enriched = screening_df['salesql_email'].notna().sum() if 'salesql_email' in screening_df.columns else 0
+                st.caption(f"{len(screening_df)} profiles | {already_enriched} already have emails")
+
+                if st.button("Enrich with Emails", key="salesql_tab5", type="primary"):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+
+                    def update_progress(current, total):
+                        progress_bar.progress(current / total)
+                        status_text.text(f"Enriching {current}/{total}...")
+
+                    enriched_df = enrich_profiles_with_salesql(screening_df, salesql_key, progress_callback=update_progress)
+                    # Update screening results with emails
+                    st.session_state['screening_results'] = enriched_df.to_dict('records')
+                    new_emails = enriched_df['salesql_email'].notna().sum() if 'salesql_email' in enriched_df.columns else 0
+                    st.success(f"Done! {new_emails} profiles now have emails.")
+                    st.rerun()
+            else:
+                st.caption("SalesQL not configured. Add 'salesql_api_key' to secrets.")
 
             # Export options
             st.markdown("### Export Results")
