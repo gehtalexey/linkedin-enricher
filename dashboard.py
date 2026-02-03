@@ -198,22 +198,39 @@ def load_salesql_key():
 
 
 # ===== SalesQL Email Enrichment =====
-def enrich_with_salesql(linkedin_url: str, api_key: str) -> dict:
+# Rate limiting: 60 requests/minute (1 per second to be safe)
+SALESQL_REQUESTS_PER_MINUTE = 60
+SALESQL_DELAY_BETWEEN_REQUESTS = 1.0  # seconds
+
+def enrich_with_salesql(linkedin_url: str, api_key: str, personal_only: bool = True) -> dict:
     """Enrich a single profile with SalesQL to get email.
+
+    Args:
+        linkedin_url: LinkedIn profile URL
+        api_key: SalesQL API key
+        personal_only: If True, only return results with personal/direct emails
 
     Returns dict with 'emails' list and 'error' if any.
     """
     try:
+        params = {'linkedin_url': linkedin_url}
+        if personal_only:
+            params['match_if_direct_email'] = 'true'
+
         response = requests.get(
             'https://api-public.salesql.com/v1/persons/enrich/',
-            params={'linkedin_url': linkedin_url},
+            params=params,
             headers={'Authorization': f'Bearer {api_key}'},
             timeout=30
         )
         if response.status_code == 200:
             data = response.json()
+            # Filter to only Direct (personal) emails
+            emails = data.get('emails', [])
+            if personal_only:
+                emails = [e for e in emails if e.get('type') == 'Direct']
             return {
-                'emails': data.get('emails', []),
+                'emails': emails,
                 'first_name': data.get('first_name'),
                 'last_name': data.get('last_name'),
                 'title': data.get('title'),
@@ -221,19 +238,22 @@ def enrich_with_salesql(linkedin_url: str, api_key: str) -> dict:
             }
         elif response.status_code == 404:
             return {'emails': [], 'error': 'Profile not found'}
+        elif response.status_code == 429:
+            return {'emails': [], 'error': 'Rate limit exceeded'}
         else:
             return {'emails': [], 'error': f'API error {response.status_code}'}
     except Exception as e:
         return {'emails': [], 'error': str(e)}
 
 
-def enrich_profiles_with_salesql(profiles_df: pd.DataFrame, api_key: str, progress_callback=None) -> pd.DataFrame:
-    """Enrich multiple profiles with SalesQL emails.
+def enrich_profiles_with_salesql(profiles_df: pd.DataFrame, api_key: str, progress_callback=None, personal_only: bool = True) -> pd.DataFrame:
+    """Enrich multiple profiles with SalesQL emails (personal emails only).
 
     Args:
         profiles_df: DataFrame with linkedin_url column
         api_key: SalesQL API key
         progress_callback: Optional callback(current, total) for progress updates
+        personal_only: If True, only get personal/direct emails (default True)
 
     Returns DataFrame with added email columns.
     """
@@ -256,19 +276,20 @@ def enrich_profiles_with_salesql(profiles_df: pd.DataFrame, api_key: str, progre
         df['salesql_email_type'] = ''
 
     total = len(df)
+    enriched_count = 0
     for idx, row in df.iterrows():
         linkedin_url = row.get(url_col)
         if not linkedin_url or pd.isna(linkedin_url):
             continue
 
         # Skip if already enriched
-        if row.get('salesql_email') and not pd.isna(row.get('salesql_email')):
+        if row.get('salesql_email') and not pd.isna(row.get('salesql_email')) and row.get('salesql_email') != '':
             continue
 
-        result = enrich_with_salesql(linkedin_url, api_key)
+        result = enrich_with_salesql(linkedin_url, api_key, personal_only=personal_only)
 
         if result.get('emails'):
-            # Prefer Direct email, then Work email
+            # Only use Direct (personal) emails
             best_email = None
             best_type = None
             for email_obj in result['emails']:
@@ -277,13 +298,8 @@ def enrich_profiles_with_salesql(profiles_df: pd.DataFrame, api_key: str, progre
                 if email_type == 'Direct':
                     best_email = email
                     best_type = 'Direct'
+                    enriched_count += 1
                     break
-                elif email_type == 'Work' and not best_email:
-                    best_email = email
-                    best_type = 'Work'
-                elif not best_email:
-                    best_email = email
-                    best_type = email_type
 
             if best_email:
                 df.at[idx, 'salesql_email'] = best_email
@@ -292,8 +308,8 @@ def enrich_profiles_with_salesql(profiles_df: pd.DataFrame, api_key: str, progre
         if progress_callback:
             progress_callback(idx + 1, total)
 
-        # Rate limiting - small delay between requests
-        time.sleep(0.2)
+        # Rate limiting - 1 request per second to stay within limits
+        time.sleep(SALESQL_DELAY_BETWEEN_REQUESTS)
 
     return df
 
