@@ -307,8 +307,11 @@ def get_file_size_from_phantombuster(api_key: str, agent_id: str, csv_name: str)
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
-def fetch_phantombuster_agents(api_key: str) -> list[dict]:
-    """Fetch list of all PhantomBuster agents."""
+def fetch_phantombuster_agents(api_key: str) -> dict:
+    """Fetch list of all PhantomBuster agents.
+
+    Returns dict with 'agents' list and optional 'error' message.
+    """
     try:
         response = requests.get(
             'https://api.phantombuster.com/api/v2/agents/fetch-all',
@@ -318,10 +321,10 @@ def fetch_phantombuster_agents(api_key: str) -> list[dict]:
         if response.status_code == 200:
             agents = response.json()
             # Return list of {id, name} for dropdown
-            return [{'id': a['id'], 'name': a['name']} for a in agents]
-        return []
+            return {'agents': [{'id': a['id'], 'name': a['name']} for a in agents]}
+        return {'agents': [], 'error': f"API returned status {response.status_code}"}
     except Exception as e:
-        return []
+        return {'agents': [], 'error': str(e)}
 
 
 def fetch_phantombuster_results(api_key: str, agent_id: str) -> list[dict]:
@@ -1895,10 +1898,15 @@ with tab_upload:
 
     if has_pb_key:
         # Fetch all agents once
-        agents = fetch_phantombuster_agents(pb_key)
+        pb_result = fetch_phantombuster_agents(pb_key)
+        agents = pb_result.get('agents', [])
+        pb_error = pb_result.get('error')
 
         # ===== SECTION 1: Load from PhantomBuster =====
         st.markdown("### Load from PhantomBuster")
+
+        if pb_error:
+            st.error(f"PhantomBuster API error: {pb_error}")
 
         if agents:
             agent_names = [a['name'] for a in agents]
