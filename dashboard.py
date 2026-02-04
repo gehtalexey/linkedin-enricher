@@ -39,7 +39,7 @@ try:
         get_pipeline_stats, get_profiles_by_fit_level, get_all_linkedin_urls,
         get_dedup_stats, profiles_to_dataframe
     )
-    from pb_dedup import filter_results_against_database
+    from pb_dedup import filter_results_against_database, update_phantombuster_with_skip_list, get_skip_list_from_database
     HAS_DATABASE = True
 except ImportError:
     HAS_DATABASE = False
@@ -2592,7 +2592,11 @@ with tab_upload:
             progress_pct = progress_info.get('progress_pct', 0)
 
             # Progress display
-            st.info(f"**Running** - {elapsed} (auto-refreshing every 10s)")
+            skip_count = st.session_state.get('pb_launch_skip_count', 0)
+            if skip_count > 0:
+                st.info(f"**Running** - {elapsed} (auto-refreshing every 10s)\n\n⏭️ Skipping **{skip_count}** profiles already in database")
+            else:
+                st.info(f"**Running** - {elapsed} (auto-refreshing every 10s)")
             if profiles_count > 0 or progress_pct > 0:
                 col_prog1, col_prog2 = st.columns(2)
                 with col_prog1:
@@ -2612,6 +2616,7 @@ with tab_upload:
                 st.session_state['pb_launch_container_id'] = None
                 st.session_state['pb_launch_start_time'] = None
                 st.session_state['pb_progress_info'] = {}
+                st.session_state['pb_launch_skip_count'] = 0
                 st.rerun()
 
             # Auto-refresh every 10 seconds
@@ -2622,9 +2627,13 @@ with tab_upload:
             progress_info = st.session_state.get('pb_progress_info', {})
             profiles_count = progress_info.get('profiles_count', 0)
             csv_name = st.session_state.get('pb_launch_csv_name')
+            skip_count = st.session_state.get('pb_launch_skip_count', 0)
 
             if profiles_count > 0:
-                st.success(f"Phantom finished! Extracted **{profiles_count}** profiles")
+                if skip_count > 0:
+                    st.success(f"Phantom finished! Extracted **{profiles_count}** profiles (skipped {skip_count} already in database)")
+                else:
+                    st.success(f"Phantom finished! Extracted **{profiles_count}** profiles")
             else:
                 st.success("Phantom finished!")
 
@@ -2657,6 +2666,7 @@ with tab_upload:
                         st.session_state['pb_launch_start_time'] = None
                         st.session_state['pb_launch_csv_name'] = None
                         st.session_state['pb_progress_info'] = {}
+                        st.session_state['pb_launch_skip_count'] = 0
                         st.session_state['last_load_count'] = len(pb_df)
                         st.session_state['last_load_file'] = f"{csv_name}.csv" if csv_name else "results"
                         st.session_state['last_db_stats'] = db_stats
@@ -2671,6 +2681,7 @@ with tab_upload:
                 st.session_state['pb_launch_error'] = None
                 st.session_state['pb_launch_csv_name'] = None
                 st.session_state['pb_progress_info'] = {}
+                st.session_state['pb_launch_skip_count'] = 0
                 st.rerun()
 
         else:  # idle
@@ -2696,8 +2707,19 @@ with tab_upload:
                 st.session_state['pb_launch_agent_id'] = user_phantom['id']
                 st.session_state['pb_launch_error'] = None
 
-                # Update phantom with new search URL and timestamped output filename
-                update_result = update_phantombuster_search_url(pb_key, user_phantom['id'], search_url, 2500)
+                # Get skip list from database to avoid re-scraping existing profiles
+                skip_urls = []
+                skip_stats = {}
+                if HAS_DATABASE:
+                    skip_urls, skip_stats = get_skip_list_from_database()
+                    if skip_urls:
+                        st.session_state['pb_launch_skip_count'] = len(skip_urls)
+
+                # Update phantom with new search URL, skip list, and timestamped output filename
+                update_result = update_phantombuster_with_skip_list(
+                    pb_key, user_phantom['id'], search_url, 2500,
+                    csv_name=None, skip_urls=skip_urls
+                )
                 if update_result.get('success'):
                     # Store the generated filename for later retrieval
                     st.session_state['pb_launch_csv_name'] = update_result.get('csvName')
