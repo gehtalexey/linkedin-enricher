@@ -2886,14 +2886,42 @@ with tab_upload:
                 msg = f"Loaded **{len(df_uploaded)}** profiles"
                 if valid_urls > 0:
                     msg += f" ({valid_urls} with LinkedIn URLs)"
-                if db_stats.get('new', 0) > 0 or db_stats.get('updated', 0) > 0:
-                    msg += f"\n\nSaved to database: {db_stats.get('new', 0)} new, {db_stats.get('updated', 0)} updated"
                 st.success(msg)
+
+                # Show database save status
+                if db_stats.get('error'):
+                    st.warning(f"Database error: {db_stats.get('error')}")
+                elif db_stats.get('new', 0) > 0 or db_stats.get('updated', 0) > 0:
+                    st.info(f"Saved to database: {db_stats.get('new', 0)} new, {db_stats.get('updated', 0)} updated")
+                elif valid_urls > 0:
+                    st.warning("No profiles saved to database")
+
         except Exception as e:
             st.error(f"Error: {e}")
 
-    # Next button
+    # Preview uploaded data
     if 'results' in st.session_state and st.session_state['results']:
+        st.divider()
+        st.markdown("### Preview")
+        preview_df = st.session_state['results_df']
+
+        # Show key columns
+        preview_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'location', 'linkedin_url', 'email']
+        available_cols = [c for c in preview_cols if c in preview_df.columns]
+
+        if available_cols:
+            st.dataframe(
+                preview_df[available_cols].head(20),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
+                }
+            )
+            st.caption(f"Showing first 20 of {len(preview_df)} profiles")
+        else:
+            st.dataframe(preview_df.head(20), use_container_width=True, hide_index=True)
+
         st.divider()
         st.info("**Next step:** Click on **2. Filter** tab to filter profiles (optional) or **3. Enrich** to enrich directly")
 
