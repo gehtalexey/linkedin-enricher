@@ -1388,6 +1388,89 @@ def normalize_phantombuster_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def normalize_uploaded_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize uploaded CSV columns to match expected dashboard format.
+
+    Handles GEM exports and other common CSV formats.
+    """
+    # GEM column mapping
+    gem_column_map = {
+        'First Name': 'first_name',
+        'Last Name': 'last_name',
+        'Company': 'current_company',
+        'Title': 'headline',
+        'Location': 'location',
+        'Primary Email': 'email',
+        'Phone Number': 'phone',
+        'LinkedIn': 'linkedin_url',
+        'School': 'school',
+        'Sourcer': 'sourcer',
+        'Time Sourced': 'sourced_at',
+        'All Emails': 'all_emails',
+        'All Phone Numbers': 'all_phones',
+    }
+
+    # Generic column mapping (other CSV formats)
+    generic_column_map = {
+        'first_name': 'first_name',
+        'last_name': 'last_name',
+        'firstName': 'first_name',
+        'lastName': 'last_name',
+        'company': 'current_company',
+        'title': 'headline',
+        'job_title': 'headline',
+        'email': 'email',
+        'phone': 'phone',
+        'linkedin_url': 'linkedin_url',
+        'LinkedIn URL': 'linkedin_url',
+        'linkedinUrl': 'linkedin_url',
+        'profile_url': 'linkedin_url',
+    }
+
+    # Combine mappings (GEM takes priority)
+    column_map = {**generic_column_map, **gem_column_map}
+
+    # Rename columns
+    rename_dict = {}
+    used_targets = set()
+
+    for old_name, new_name in column_map.items():
+        if old_name in df.columns and new_name not in used_targets:
+            rename_dict[old_name] = new_name
+            used_targets.add(new_name)
+
+    df = df.rename(columns=rename_dict)
+
+    # Use headline as current_title if current_title doesn't exist
+    if 'headline' in df.columns and 'current_title' not in df.columns:
+        df['current_title'] = df['headline']
+
+    # Clean and normalize LinkedIn URLs
+    if 'linkedin_url' in df.columns:
+        def clean_linkedin_url(url):
+            if pd.isna(url) or not url:
+                return None
+            url = str(url).strip()
+            # Add https:// if missing
+            if url.startswith('www.'):
+                url = 'https://' + url
+            elif not url.startswith('http'):
+                url = 'https://' + url
+            # Must be linkedin.com and have /in/
+            if 'linkedin.com' in url and '/in/' in url:
+                # Remove query params
+                url = url.split('?')[0].rstrip('/')
+                return url
+            return None
+        df['linkedin_url'] = df['linkedin_url'].apply(clean_linkedin_url)
+
+    # Create public_url as alias for linkedin_url (for display compatibility)
+    if 'linkedin_url' in df.columns and 'public_url' not in df.columns:
+        df['public_url'] = df['linkedin_url']
+
+    return df
+
+
 def extract_urls_from_phantombuster(df: pd.DataFrame) -> list[str]:
     """Extract LinkedIn URLs from PhantomBuster results (regular linkedin.com URLs only)."""
     urls = []
@@ -2779,9 +2862,33 @@ with tab_upload:
             else:
                 pre_enriched_file.seek(0)
                 df_uploaded = pd.read_csv(pre_enriched_file, encoding='utf-8')
+
+                # Normalize columns (handles GEM and other CSV formats)
+                df_uploaded = normalize_uploaded_csv(df_uploaded)
+
+                # Count valid LinkedIn URLs
+                valid_urls = df_uploaded['linkedin_url'].notna().sum() if 'linkedin_url' in df_uploaded.columns else 0
+
+                # Save to database if available
+                db_stats = {}
+                if HAS_DATABASE and valid_urls > 0:
+                    try:
+                        client = get_supabase_client()
+                        if client:
+                            db_stats = upsert_profiles_from_phantombuster(client, df_uploaded)
+                    except Exception as e:
+                        db_stats = {'error': str(e)}
+
                 st.session_state['results'] = df_uploaded.to_dict('records')
                 st.session_state['results_df'] = df_uploaded
-                st.success(f"Loaded **{len(df_uploaded)}** profiles!")
+
+                # Show success message with details
+                msg = f"Loaded **{len(df_uploaded)}** profiles"
+                if valid_urls > 0:
+                    msg += f" ({valid_urls} with LinkedIn URLs)"
+                if db_stats.get('new', 0) > 0 or db_stats.get('updated', 0) > 0:
+                    msg += f"\n\nSaved to database: {db_stats.get('new', 0)} new, {db_stats.get('updated', 0)} updated"
+                st.success(msg)
         except Exception as e:
             st.error(f"Error: {e}")
 
