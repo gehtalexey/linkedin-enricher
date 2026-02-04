@@ -2875,7 +2875,9 @@ with tab_upload:
                     try:
                         client = get_supabase_client()
                         if client:
-                            db_stats = upsert_profiles_from_phantombuster(client, df_uploaded)
+                            # Convert DataFrame to list of dicts for the function
+                            profiles_list = df_uploaded.to_dict('records')
+                            db_stats = upsert_profiles_from_phantombuster(client, profiles_list)
                     except Exception as e:
                         db_stats = {'error': str(e)}
 
