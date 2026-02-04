@@ -37,12 +37,28 @@ try:
         get_supabase_client, check_connection, upsert_profiles_from_phantombuster,
         update_profile_enrichment, update_profile_screening, get_all_profiles,
         get_pipeline_stats, get_profiles_by_fit_level, get_all_linkedin_urls,
-        get_dedup_stats, profiles_to_dataframe
+        get_dedup_stats, profiles_to_dataframe, get_usage_summary, get_usage_logs,
+        get_usage_by_date
     )
     from pb_dedup import filter_results_against_database, update_phantombuster_with_skip_list, get_skip_list_from_database
     HAS_DATABASE = True
 except ImportError:
     HAS_DATABASE = False
+
+# Usage tracking module
+try:
+    from usage_tracker import UsageTracker, calculate_openai_cost
+    HAS_USAGE_TRACKER = True
+except ImportError:
+    HAS_USAGE_TRACKER = False
+
+# Plotly for charts
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
 
 # Authentication (optional - only enabled when auth secrets are configured)
 try:
@@ -152,6 +168,43 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Sidebar - Session Controls
+with st.sidebar:
+    st.markdown("### Session")
+    col_save, col_clear = st.columns(2)
+    with col_save:
+        if st.button("Save", key="sidebar_save_session", help="Save session to restore after refresh"):
+            from pathlib import Path
+            SESSION_FILE = Path(__file__).parent / '.last_session.json'
+            # Quick inline save
+            try:
+                session_data = {}
+                for key in ['results', 'results_df', 'enriched_results', 'enriched_df', 'screening_results', 'passed_candidates_df']:
+                    if key in st.session_state and st.session_state[key] is not None:
+                        value = st.session_state[key]
+                        if isinstance(value, pd.DataFrame):
+                            session_data[key] = {'_type': 'dataframe', 'data': value.to_dict('records')}
+                        else:
+                            session_data[key] = {'_type': 'list', 'data': value}
+                if session_data:
+                    with open(SESSION_FILE, 'w') as f:
+                        json.dump(session_data, f)
+                    st.success("Saved!")
+            except Exception as e:
+                st.error(f"Failed: {e}")
+    with col_clear:
+        if st.button("Clear", key="sidebar_clear_session", help="Clear saved session"):
+            from pathlib import Path
+            SESSION_FILE = Path(__file__).parent / '.last_session.json'
+            if SESSION_FILE.exists():
+                SESSION_FILE.unlink()
+            for key in ['results', 'results_df', 'enriched_results', 'enriched_df', 'screening_results', 'passed_candidates_df']:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.success("Cleared!")
+            st.rerun()
+    st.divider()
+
 # Load API keys
 def load_config():
     """Load config from config.json or Streamlit secrets (for cloud deployment)."""
@@ -210,22 +263,104 @@ def load_salesql_key():
     return config.get('salesql_api_key')
 
 
+# ===== Session Persistence =====
+SESSION_FILE = Path(__file__).parent / '.last_session.json'
+
+def save_session_state():
+    """Save current session state to a local file for persistence across refreshes."""
+    try:
+        session_data = {}
+        keys_to_save = [
+            'results', 'results_df', 'enriched_results', 'enriched_df',
+            'screening_results', 'filtered_results', 'passed_candidates_df',
+            'filter_stats', 'last_load_count', 'last_load_file'
+        ]
+        for key in keys_to_save:
+            if key in st.session_state and st.session_state[key] is not None:
+                value = st.session_state[key]
+                # Convert DataFrames to dict for JSON serialization
+                if isinstance(value, pd.DataFrame):
+                    session_data[key] = {'_type': 'dataframe', 'data': value.to_dict('records')}
+                elif isinstance(value, list):
+                    session_data[key] = {'_type': 'list', 'data': value}
+                elif isinstance(value, dict):
+                    session_data[key] = {'_type': 'dict', 'data': value}
+                else:
+                    session_data[key] = {'_type': 'value', 'data': value}
+
+        if session_data:
+            with open(SESSION_FILE, 'w') as f:
+                json.dump(session_data, f)
+            return True
+    except Exception as e:
+        print(f"[Session] Save failed: {e}")
+    return False
+
+
+def load_session_state():
+    """Load session state from local file."""
+    try:
+        if SESSION_FILE.exists():
+            with open(SESSION_FILE, 'r') as f:
+                session_data = json.load(f)
+
+            for key, item in session_data.items():
+                if item['_type'] == 'dataframe':
+                    st.session_state[key] = pd.DataFrame(item['data'])
+                elif item['_type'] == 'list':
+                    st.session_state[key] = item['data']
+                elif item['_type'] == 'dict':
+                    st.session_state[key] = item['data']
+                else:
+                    st.session_state[key] = item['data']
+            return True
+    except Exception as e:
+        print(f"[Session] Load failed: {e}")
+    return False
+
+
+def clear_session_file():
+    """Delete the session file."""
+    try:
+        if SESSION_FILE.exists():
+            SESSION_FILE.unlink()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def get_usage_tracker():
+    """Get a UsageTracker instance with database connection."""
+    if not HAS_USAGE_TRACKER or not HAS_DATABASE:
+        return None
+    try:
+        db_client = get_supabase_client()
+        if db_client and check_connection(db_client):
+            return UsageTracker(db_client)
+    except Exception:
+        pass
+    return None
+
+
 # ===== SalesQL Email Enrichment =====
 # Rate limiting: 180 requests/minute, 5000/day
 SALESQL_REQUESTS_PER_MINUTE = 180
 SALESQL_DAILY_LIMIT = 5000
 SALESQL_DELAY_BETWEEN_REQUESTS = 0.35  # ~170 requests/minute to stay safe
 
-def enrich_with_salesql(linkedin_url: str, api_key: str, personal_only: bool = True) -> dict:
+def enrich_with_salesql(linkedin_url: str, api_key: str, personal_only: bool = True, tracker: 'UsageTracker' = None) -> dict:
     """Enrich a single profile with SalesQL to get email.
 
     Args:
         linkedin_url: LinkedIn profile URL
         api_key: SalesQL API key
         personal_only: If True, only return results with personal/direct emails
+        tracker: Optional UsageTracker for logging API usage
 
     Returns dict with 'emails' list and 'error' if any.
     """
+    start_time = time.time()
     try:
         params = {'linkedin_url': linkedin_url}
         if personal_only:
@@ -237,12 +372,24 @@ def enrich_with_salesql(linkedin_url: str, api_key: str, personal_only: bool = T
             headers={'Authorization': f'Bearer {api_key}'},
             timeout=30
         )
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
         if response.status_code == 200:
             data = response.json()
             # Filter to only Direct (personal) emails
             emails = data.get('emails', [])
             if personal_only:
                 emails = [e for e in emails if e.get('type') == 'Direct']
+
+            # Log successful usage
+            if tracker:
+                tracker.log_salesql(
+                    lookups=1,
+                    emails_found=len(emails),
+                    status='success',
+                    response_time_ms=elapsed_ms
+                )
+
             return {
                 'emails': emails,
                 'first_name': data.get('first_name'),
@@ -251,12 +398,21 @@ def enrich_with_salesql(linkedin_url: str, api_key: str, personal_only: bool = T
                 'organization': data.get('organization', {}).get('name'),
             }
         elif response.status_code == 404:
+            if tracker:
+                tracker.log_salesql(lookups=1, status='success', response_time_ms=elapsed_ms)
             return {'emails': [], 'error': 'Profile not found'}
         elif response.status_code == 429:
+            if tracker:
+                tracker.log_salesql(lookups=0, status='error', error_message='Rate limit exceeded', response_time_ms=elapsed_ms)
             return {'emails': [], 'error': 'Rate limit exceeded'}
         else:
+            if tracker:
+                tracker.log_salesql(lookups=1, status='error', error_message=f'API error {response.status_code}', response_time_ms=elapsed_ms)
             return {'emails': [], 'error': f'API error {response.status_code}'}
     except Exception as e:
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        if tracker:
+            tracker.log_salesql(lookups=0, status='error', error_message=str(e)[:200], response_time_ms=elapsed_ms)
         return {'emails': [], 'error': str(e)}
 
 
@@ -273,6 +429,9 @@ def enrich_profiles_with_salesql(profiles_df: pd.DataFrame, api_key: str, progre
     Returns DataFrame with added email columns.
     """
     df = profiles_df.copy()
+
+    # Get usage tracker for logging
+    tracker = get_usage_tracker()
 
     # Find LinkedIn URL column
     url_col = None
@@ -310,7 +469,7 @@ def enrich_profiles_with_salesql(profiles_df: pd.DataFrame, api_key: str, progre
         row = df.loc[idx]
         linkedin_url = row.get(url_col)
 
-        result = enrich_with_salesql(linkedin_url, api_key, personal_only=personal_only)
+        result = enrich_with_salesql(linkedin_url, api_key, personal_only=personal_only, tracker=tracker)
         processed_count += 1
 
         if result.get('emails'):
@@ -1201,7 +1360,7 @@ def clear_all_phantombuster_files(api_key: str, agent_id: str) -> int:
     return deleted_count
 
 
-def launch_phantombuster_agent(api_key: str, agent_id: str, argument: dict = None, clear_results: bool = False) -> dict:
+def launch_phantombuster_agent(api_key: str, agent_id: str, argument: dict = None, clear_results: bool = False, tracker: 'UsageTracker' = None) -> dict:
     """Launch a PhantomBuster agent with the given argument.
 
     Returns dict with 'containerId' on success, or 'error' on failure.
@@ -1209,7 +1368,9 @@ def launch_phantombuster_agent(api_key: str, agent_id: str, argument: dict = Non
 
     Args:
         clear_results: If True, delete existing result AND database files before launching for fresh results
+        tracker: Optional UsageTracker for logging API usage
     """
+    start_time = time.time()
     try:
         # Delete existing results AND database for a fresh start
         if clear_results:
@@ -1247,10 +1408,35 @@ def launch_phantombuster_agent(api_key: str, agent_id: str, argument: dict = Non
 
         if response.status_code == 200:
             data = response.json()
-            return {'containerId': data.get('containerId')}
+            container_id = data.get('containerId')
+
+            # Log successful launch
+            if tracker:
+                tracker.log_phantombuster(
+                    operation='launch',
+                    status='success',
+                    agent_id=agent_id,
+                    container_id=container_id
+                )
+
+            return {'containerId': container_id}
         else:
+            if tracker:
+                tracker.log_phantombuster(
+                    operation='launch',
+                    status='error',
+                    error_message=f"API error {response.status_code}",
+                    agent_id=agent_id
+                )
             return {'error': f"API error {response.status_code}: {response.text}"}
     except Exception as e:
+        if tracker:
+            tracker.log_phantombuster(
+                operation='launch',
+                status='error',
+                error_message=str(e)[:200],
+                agent_id=agent_id
+            )
         return {'error': str(e)}
 
 
@@ -1633,9 +1819,10 @@ def extract_urls(uploaded_file) -> list[str]:
     return normalized
 
 
-def enrich_batch(urls: list[str], api_key: str) -> list[dict]:
+def enrich_batch(urls: list[str], api_key: str, tracker: 'UsageTracker' = None) -> list[dict]:
     """Enrich a batch of URLs via Crust Data API."""
     batch_str = ','.join(urls)
+    start_time = time.time()
 
     try:
         response = requests.get(
@@ -1644,16 +1831,41 @@ def enrich_batch(urls: list[str], api_key: str) -> list[dict]:
             headers={'Authorization': f'Token {api_key}'},
             timeout=120
         )
+        elapsed_ms = int((time.time() - start_time) * 1000)
 
         if response.status_code == 200:
             data = response.json()
-            if isinstance(data, list):
-                return data
-            return [data]
+            result = data if isinstance(data, list) else [data]
+
+            # Log successful usage
+            if tracker:
+                tracker.log_crustdata(
+                    profiles_enriched=len(urls),
+                    status='success',
+                    response_time_ms=elapsed_ms
+                )
+
+            return result
         else:
+            # Log error
+            if tracker:
+                tracker.log_crustdata(
+                    profiles_enriched=0,
+                    status='error',
+                    error_message=f'API error {response.status_code}: {response.text[:200]}',
+                    response_time_ms=elapsed_ms
+                )
             return [{'error': response.text, 'linkedin_url': u} for u in urls]
 
     except Exception as e:
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        if tracker:
+            tracker.log_crustdata(
+                profiles_enriched=0,
+                status='error',
+                error_message=str(e)[:200],
+                response_time_ms=elapsed_ms
+            )
         return [{'error': str(e), 'linkedin_url': u} for u in urls]
 
 
@@ -2025,8 +2237,9 @@ Give higher scores when candidate has:
 4. **Company > Skills**: Strong company pedigree compensates for skill list gaps."""
 
 
-def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_requirements: str = "") -> dict:
+def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_requirements: str = "", tracker: 'UsageTracker' = None) -> dict:
     """Screen a profile against a job description using OpenAI."""
+    start_time = time.time()
 
     # Build concise profile summary for the prompt (with safe string conversion)
     def safe_str(value, max_len=500):
@@ -2068,6 +2281,18 @@ Respond with ONLY valid JSON in this exact format:
             temperature=0.3,
             max_tokens=500
         )
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        # Log usage with token counts
+        if tracker and hasattr(response, 'usage') and response.usage:
+            tracker.log_openai(
+                tokens_input=response.usage.prompt_tokens,
+                tokens_output=response.usage.completion_tokens,
+                model='gpt-4o-mini',
+                profiles_screened=1,
+                status='success',
+                response_time_ms=elapsed_ms
+            )
 
         content = response.choices[0].message.content.strip()
         # Handle potential markdown code blocks
@@ -2089,6 +2314,17 @@ Respond with ONLY valid JSON in this exact format:
             "concerns": []
         }
     except Exception as e:
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        if tracker:
+            tracker.log_openai(
+                tokens_input=0,
+                tokens_output=0,
+                model='gpt-4o-mini',
+                profiles_screened=0,
+                status='error',
+                error_message=str(e)[:200],
+                response_time_ms=elapsed_ms
+            )
         return {
             "score": 0,
             "fit": "Error",
@@ -2120,11 +2356,14 @@ def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: 
     lock = threading.Lock()
     total = len(profiles)
 
+    # Get usage tracker (will be shared across threads)
+    tracker = get_usage_tracker()
+
     def screen_single(profile, index):
         # Create client per thread to avoid thread-safety issues
         client = OpenAI(api_key=openai_api_key)
         try:
-            result = screen_profile(profile, job_description, client, extra_requirements)
+            result = screen_profile(profile, job_description, client, extra_requirements, tracker=tracker)
             # Add profile info to result
             name = f"{profile.get('first_name', '')} {profile.get('last_name', '')}".strip()
             if not name:
@@ -2202,12 +2441,104 @@ if 'results' in st.session_state and st.session_state['results']:
     st.info(f"📊 **{len(st.session_state['results'])}** profiles loaded")
 
 # Create tabs
-tab_upload, tab_filter, tab_enrich, tab_filter2, tab_screening, tab_database = st.tabs([
-    "1. Load", "2. Filter", "3. Enrich", "4. Filter+", "5. AI Screen", "6. Database"
+tab_upload, tab_filter, tab_enrich, tab_filter2, tab_screening, tab_database, tab_usage = st.tabs([
+    "1. Load", "2. Filter", "3. Enrich", "4. Filter+", "5. AI Screen", "6. Database", "7. Usage"
 ])
 
 # ========== TAB 1: Upload ==========
 with tab_upload:
+    # ===== Resume Last Session =====
+    has_local_session = SESSION_FILE.exists()
+
+    # Show restore options if there's data to restore
+    if has_local_session or HAS_DATABASE:
+        with st.expander("Resume Last Session", expanded=False):
+            # Local session restore (includes filtered data)
+            if has_local_session:
+                st.markdown("**Local Session** (includes filtered data)")
+                col_local1, col_local2 = st.columns([3, 1])
+                with col_local1:
+                    if st.button("Restore Last Session", key="restore_local_session", type="primary"):
+                        if load_session_state():
+                            st.success("Session restored!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to restore session")
+                with col_local2:
+                    if st.button("Clear", key="clear_local_session"):
+                        clear_session_file()
+                        st.success("Session cleared")
+                        st.rerun()
+                st.divider()
+
+            # Database restore
+            if HAS_DATABASE:
+                try:
+                    db_client = get_supabase_client()
+                    if db_client and check_connection(db_client):
+                        from db import get_profiles_by_status
+                        enriched_count = db_client.count('profiles', {'status': 'eq.enriched'})
+                        screened_count = db_client.count('profiles', {'status': 'eq.screened'})
+
+                        if enriched_count > 0 or screened_count > 0:
+                            st.markdown("**From Database**")
+                            st.caption("Load enriched or screened profiles from Supabase")
+
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                if enriched_count > 0 and st.button(f"Load Enriched ({enriched_count})", key="resume_enriched"):
+                                    profiles = get_profiles_by_status(db_client, "enriched", limit=1000)
+                                    if profiles:
+                                        df = profiles_to_dataframe(profiles)
+                                        st.session_state['results'] = profiles
+                                        st.session_state['results_df'] = df
+                                        st.session_state['enriched_results'] = profiles
+                                        st.session_state['enriched_df'] = df
+                                        st.success(f"Loaded {len(profiles)} enriched profiles!")
+                                        st.rerun()
+
+                            with col2:
+                                if screened_count > 0 and st.button(f"Load Screened ({screened_count})", key="resume_screened"):
+                                    profiles = get_profiles_by_status(db_client, "screened", limit=1000)
+                                    if profiles:
+                                        df = profiles_to_dataframe(profiles)
+                                        st.session_state['results'] = profiles
+                                        st.session_state['results_df'] = df
+                                        st.session_state['enriched_results'] = profiles
+                                        st.session_state['enriched_df'] = df
+                                        screening_results = []
+                                        for p in profiles:
+                                            screening_results.append({
+                                                'name': f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
+                                                'score': p.get('screening_score', 0),
+                                                'fit': p.get('screening_fit_level', ''),
+                                                'summary': p.get('screening_summary', ''),
+                                                'why': p.get('screening_reasoning', ''),
+                                                'current_title': p.get('current_title', ''),
+                                                'current_company': p.get('current_company', ''),
+                                                'linkedin_url': p.get('linkedin_url', ''),
+                                                'strengths': [],
+                                                'concerns': []
+                                            })
+                                        st.session_state['screening_results'] = screening_results
+                                        st.success(f"Loaded {len(profiles)} screened profiles!")
+                                        st.rerun()
+
+                            with col3:
+                                all_count = enriched_count + screened_count
+                                if st.button(f"Load All ({all_count})", key="resume_all"):
+                                    profiles = get_all_profiles(db_client, limit=2000)
+                                    if profiles:
+                                        df = profiles_to_dataframe(profiles)
+                                        st.session_state['results'] = profiles
+                                        st.session_state['results_df'] = df
+                                        st.success(f"Loaded {len(profiles)} profiles!")
+                                        st.rerun()
+                except Exception as e:
+                    pass  # Silently fail if database not available
+
+    st.divider()
+
     pb_key = load_phantombuster_key()
     has_pb_key = pb_key and pb_key != "YOUR_PHANTOMBUSTER_API_KEY_HERE"
 
@@ -2758,6 +3089,17 @@ with tab_upload:
                     if not pb_df.empty:
                         pb_df = normalize_phantombuster_columns(pb_df)
 
+                        # Log PhantomBuster completion with profiles scraped
+                        pb_tracker = get_usage_tracker()
+                        if pb_tracker:
+                            pb_tracker.log_phantombuster(
+                                operation='scrape',
+                                profiles_scraped=len(pb_df),
+                                status='success',
+                                agent_id=agent_id,
+                                container_id=st.session_state.get('pb_launch_container_id')
+                            )
+
                         # Save to database
                         db_stats = None
                         if HAS_DATABASE:
@@ -2834,8 +3176,11 @@ with tab_upload:
                     # Store the generated filename for later retrieval
                     st.session_state['pb_launch_csv_name'] = update_result.get('csvName')
 
+                    # Get usage tracker for logging
+                    pb_tracker = get_usage_tracker()
+
                     # Launch without clearing results - new file will be created with unique name
-                    result = launch_phantombuster_agent(pb_key, user_phantom['id'], None, clear_results=False)
+                    result = launch_phantombuster_agent(pb_key, user_phantom['id'], None, clear_results=False, tracker=pb_tracker)
 
                     if 'containerId' in result:
                         st.session_state['pb_launch_container_id'] = result['containerId']
@@ -3539,18 +3884,46 @@ with tab_enrich:
 
             # Show enriched data preview
             st.markdown("### Enriched Profiles Preview")
-            display_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'location', 'linkedin_url', 'public_url']
-            available_cols = [c for c in display_cols if c in enriched_df.columns]
-            if available_cols:
+
+            # Toggle to show all columns
+            show_all_cols = st.checkbox("Show all columns", value=False, key="enrich_show_all_cols")
+
+            if show_all_cols:
+                # Show all columns
                 st.dataframe(
-                    enriched_df[available_cols].head(20),
+                    enriched_df.head(20),
                     use_container_width=True,
                     hide_index=True,
                     column_config={
                         "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
-                        "public_url": st.column_config.LinkColumn("LinkedIn")
+                        "public_url": st.column_config.LinkColumn("LinkedIn"),
+                        "linkedin_profile_url": st.column_config.LinkColumn("LinkedIn"),
                     }
                 )
+                st.caption(f"Showing {min(20, len(enriched_df))} of {len(enriched_df)} profiles | {len(enriched_df.columns)} columns")
+            else:
+                # Show key columns only
+                display_cols = ['first_name', 'last_name', 'headline', 'current_title', 'current_company',
+                               'location', 'summary', 'skills', 'linkedin_url', 'public_url']
+                available_cols = [c for c in display_cols if c in enriched_df.columns]
+                if available_cols:
+                    st.dataframe(
+                        enriched_df[available_cols].head(20),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
+                            "public_url": st.column_config.LinkColumn("LinkedIn")
+                        }
+                    )
+
+            # Download full enriched data
+            st.download_button(
+                "Download Enriched Data (CSV)",
+                enriched_df.to_csv(index=False),
+                "enriched_profiles.csv",
+                "text/csv"
+            )
 
         if results_df is not None and not results_df.empty:
             urls = extract_urls_from_phantombuster(results_df)
@@ -3579,11 +3952,14 @@ with tab_enrich:
                     status_text = st.empty()
                     total_batches = (len(urls_to_process) + batch_size - 1) // batch_size
 
+                    # Get usage tracker for logging
+                    tracker = get_usage_tracker()
+
                     for i in range(0, len(urls_to_process), batch_size):
                         batch = urls_to_process[i:i + batch_size]
                         batch_num = i // batch_size + 1
                         status_text.text(f"Processing batch {batch_num}/{total_batches}...")
-                        batch_results = enrich_batch(batch, api_key)
+                        batch_results = enrich_batch(batch, api_key, tracker=tracker)
                         results.extend(batch_results)
                         progress_bar.progress(min((i + batch_size) / len(urls_to_process), 1.0))
                         if i + batch_size < len(urls_to_process):
@@ -4218,3 +4594,239 @@ with tab_database:
 
         except Exception as e:
             st.error(f"Database error: {e}")
+
+# ========== TAB 7: Usage ==========
+with tab_usage:
+    st.markdown("### API Usage Dashboard")
+    st.caption("Track API consumption across all providers")
+
+    if not HAS_DATABASE:
+        st.warning("Database module not available. Usage tracking requires Supabase.")
+    else:
+        try:
+            db_client = get_supabase_client()
+            if not db_client:
+                st.warning("Supabase not configured. Add 'supabase_url' and 'supabase_key' to secrets.")
+            elif not check_connection(db_client):
+                st.error("Cannot connect to Supabase. Check your credentials.")
+            else:
+                # Date range selector
+                date_range = st.selectbox(
+                    "Date Range",
+                    ["Today", "7 Days", "30 Days", "All Time"],
+                    index=1,
+                    key="usage_date_range"
+                )
+
+                # Map selection to days
+                days_map = {"Today": 1, "7 Days": 7, "30 Days": 30, "All Time": None}
+                selected_days = days_map[date_range]
+
+                # Fetch usage summary
+                summary = get_usage_summary(db_client, days=selected_days)
+
+                # Display metrics in columns
+                st.markdown("#### Provider Summary")
+                metric_cols = st.columns(4)
+
+                with metric_cols[0]:
+                    crustdata = summary.get('crustdata', {})
+                    st.metric(
+                        "Crustdata",
+                        f"{int(crustdata.get('credits', 0)):,} credits",
+                        help="1 credit per profile enriched"
+                    )
+                    st.caption(f"{crustdata.get('requests', 0)} requests")
+
+                with metric_cols[1]:
+                    salesql = summary.get('salesql', {})
+                    st.metric(
+                        "SalesQL",
+                        f"{int(salesql.get('lookups', 0)):,} lookups",
+                        help="5,000/day limit"
+                    )
+                    st.caption(f"{salesql.get('requests', 0)} requests")
+
+                with metric_cols[2]:
+                    openai = summary.get('openai', {})
+                    cost = openai.get('cost_usd', 0)
+                    st.metric(
+                        "OpenAI",
+                        f"${cost:.4f}",
+                        help="gpt-4o-mini: $0.15/1M input, $0.60/1M output"
+                    )
+                    tokens_in = openai.get('tokens_input', 0)
+                    tokens_out = openai.get('tokens_output', 0)
+                    st.caption(f"{tokens_in:,} in / {tokens_out:,} out tokens")
+
+                with metric_cols[3]:
+                    phantombuster = summary.get('phantombuster', {})
+                    st.metric(
+                        "PhantomBuster",
+                        f"{phantombuster.get('runs', 0)} runs",
+                        help="Scraping operations"
+                    )
+                    st.caption(f"{phantombuster.get('profiles_scraped', 0):,} profiles scraped")
+
+                st.divider()
+
+                # Charts section
+                if HAS_PLOTLY and selected_days:
+                    st.markdown("#### Usage Over Time")
+
+                    # Fetch daily usage data
+                    daily_data = get_usage_by_date(db_client, days=selected_days or 365)
+
+                    if daily_data:
+                        df_daily = pd.DataFrame(daily_data)
+
+                        # Line chart for usage over time
+                        fig_line = go.Figure()
+
+                        fig_line.add_trace(go.Scatter(
+                            x=df_daily['date'],
+                            y=df_daily['crustdata'],
+                            mode='lines+markers',
+                            name='Crustdata (credits)',
+                            line=dict(color='#0077B5')
+                        ))
+
+                        fig_line.add_trace(go.Scatter(
+                            x=df_daily['date'],
+                            y=df_daily['salesql'],
+                            mode='lines+markers',
+                            name='SalesQL (lookups)',
+                            line=dict(color='#00A0DC')
+                        ))
+
+                        fig_line.add_trace(go.Scatter(
+                            x=df_daily['date'],
+                            y=df_daily['phantombuster'],
+                            mode='lines+markers',
+                            name='PhantomBuster (runs)',
+                            line=dict(color='#6B5B95')
+                        ))
+
+                        fig_line.update_layout(
+                            title='API Usage by Day',
+                            xaxis_title='Date',
+                            yaxis_title='Count',
+                            hovermode='x unified',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02),
+                            height=350
+                        )
+
+                        st.plotly_chart(fig_line, use_container_width=True)
+
+                        # Cost chart (OpenAI)
+                        if df_daily['openai'].sum() > 0:
+                            fig_cost = px.area(
+                                df_daily,
+                                x='date',
+                                y='openai',
+                                title='OpenAI Cost by Day ($)',
+                                labels={'openai': 'Cost (USD)', 'date': 'Date'}
+                            )
+                            fig_cost.update_traces(fill='tozeroy', line_color='#10A37F')
+                            fig_cost.update_layout(height=250)
+                            st.plotly_chart(fig_cost, use_container_width=True)
+
+                    else:
+                        st.info("No usage data available for the selected period")
+
+                    # Pie chart for cost breakdown
+                    st.markdown("#### Cost Breakdown")
+                    cost_data = {
+                        'Provider': ['OpenAI'],
+                        'Cost': [summary.get('openai', {}).get('cost_usd', 0)]
+                    }
+                    # Note: Crustdata and SalesQL costs would need pricing info to include
+
+                    if cost_data['Cost'][0] > 0:
+                        fig_pie = px.pie(
+                            pd.DataFrame(cost_data),
+                            values='Cost',
+                            names='Provider',
+                            title='Cost Distribution (USD)',
+                            color_discrete_sequence=['#10A37F', '#0077B5', '#00A0DC', '#6B5B95']
+                        )
+                        fig_pie.update_layout(height=300)
+                        st.plotly_chart(fig_pie, use_container_width=True)
+                    else:
+                        st.info("No cost data to display")
+
+                elif not HAS_PLOTLY:
+                    st.info("Install plotly for charts: `pip install plotly>=5.18.0`")
+
+                st.divider()
+
+                # Detailed logs table
+                st.markdown("#### Detailed Logs")
+
+                # Filter options
+                log_cols = st.columns([2, 2, 1])
+                with log_cols[0]:
+                    provider_filter = st.selectbox(
+                        "Provider",
+                        ["All", "crustdata", "salesql", "openai", "phantombuster"],
+                        key="usage_provider_filter"
+                    )
+                with log_cols[1]:
+                    log_limit = st.selectbox(
+                        "Show",
+                        [25, 50, 100, 200],
+                        index=1,
+                        key="usage_log_limit"
+                    )
+                with log_cols[2]:
+                    if st.button("Refresh", key="usage_refresh"):
+                        st.rerun()
+
+                # Fetch logs
+                logs = get_usage_logs(
+                    db_client,
+                    provider=provider_filter if provider_filter != "All" else None,
+                    days=selected_days,
+                    limit=log_limit
+                )
+
+                if logs:
+                    # Convert to DataFrame for display
+                    logs_df = pd.DataFrame(logs)
+
+                    # Select and rename columns for display
+                    display_cols = ['created_at', 'provider', 'operation', 'request_count',
+                                    'credits_used', 'tokens_input', 'tokens_output', 'cost_usd',
+                                    'status', 'response_time_ms']
+                    available_cols = [c for c in display_cols if c in logs_df.columns]
+
+                    st.dataframe(
+                        logs_df[available_cols],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "created_at": st.column_config.DatetimeColumn("Time", format="YYYY-MM-DD HH:mm"),
+                            "provider": st.column_config.TextColumn("Provider"),
+                            "operation": st.column_config.TextColumn("Operation"),
+                            "request_count": st.column_config.NumberColumn("Requests", format="%d"),
+                            "credits_used": st.column_config.NumberColumn("Credits", format="%.1f"),
+                            "tokens_input": st.column_config.NumberColumn("Tokens In", format="%d"),
+                            "tokens_output": st.column_config.NumberColumn("Tokens Out", format="%d"),
+                            "cost_usd": st.column_config.NumberColumn("Cost ($)", format="%.6f"),
+                            "status": st.column_config.TextColumn("Status"),
+                            "response_time_ms": st.column_config.NumberColumn("Time (ms)", format="%d"),
+                        }
+                    )
+
+                    # Export option
+                    st.download_button(
+                        "Download Logs (CSV)",
+                        logs_df.to_csv(index=False),
+                        f"api_usage_logs_{date_range.lower().replace(' ', '_')}.csv",
+                        "text/csv"
+                    )
+                else:
+                    st.info("No usage logs found for the selected filters")
+
+        except Exception as e:
+            st.error(f"Usage dashboard error: {e}")

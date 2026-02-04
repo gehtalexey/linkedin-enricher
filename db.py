@@ -621,3 +621,176 @@ def get_dedup_stats(client: SupabaseClient) -> dict:
         'recently_enriched': recently_enriched,
         'will_skip': recently_enriched,
     }
+
+
+# ===== API Usage Tracking =====
+
+def log_api_usage(client: SupabaseClient, data: dict) -> Optional[dict]:
+    """Insert a usage record into api_usage_logs table.
+
+    Args:
+        client: SupabaseClient instance
+        data: Dict with keys: provider, operation, request_count, credits_used,
+              tokens_input, tokens_output, cost_usd, status, error_message,
+              response_time_ms, metadata
+
+    Returns:
+        The inserted record or None on error
+    """
+    try:
+        result = client.insert('api_usage_logs', data)
+        return result[0] if result else None
+    except Exception as e:
+        print(f"[DB] Failed to log API usage: {e}")
+        return None
+
+
+def get_usage_summary(client: SupabaseClient, days: int = None) -> dict:
+    """Get aggregated usage stats by provider.
+
+    Args:
+        client: SupabaseClient instance
+        days: Number of days to look back (None = all time)
+
+    Returns:
+        Dict with provider stats: {
+            'crustdata': {'credits': X, 'requests': Y},
+            'salesql': {'lookups': X, 'requests': Y},
+            'openai': {'cost_usd': X, 'tokens_input': Y, 'tokens_output': Z, 'requests': W},
+            'phantombuster': {'runs': X}
+        }
+    """
+    filters = {}
+    if days:
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        filters['created_at'] = f'gte.{cutoff}'
+
+    try:
+        # Fetch all usage logs for the period
+        logs = client.select('api_usage_logs', '*', filters, limit=10000)
+    except Exception as e:
+        print(f"[DB] Failed to fetch usage logs: {e}")
+        return {}
+
+    # Aggregate by provider
+    summary = {
+        'crustdata': {'credits': 0, 'requests': 0, 'errors': 0},
+        'salesql': {'lookups': 0, 'requests': 0, 'errors': 0},
+        'openai': {'cost_usd': 0.0, 'tokens_input': 0, 'tokens_output': 0, 'requests': 0, 'errors': 0},
+        'phantombuster': {'runs': 0, 'profiles_scraped': 0, 'errors': 0},
+    }
+
+    for log in logs:
+        provider = log.get('provider', '').lower()
+        if provider not in summary:
+            continue
+
+        summary[provider]['requests'] = summary[provider].get('requests', 0) + (log.get('request_count') or 1)
+
+        if log.get('status') == 'error':
+            summary[provider]['errors'] = summary[provider].get('errors', 0) + 1
+
+        if provider == 'crustdata':
+            summary[provider]['credits'] += log.get('credits_used') or 0
+
+        elif provider == 'salesql':
+            summary[provider]['lookups'] += log.get('credits_used') or 0
+
+        elif provider == 'openai':
+            summary[provider]['cost_usd'] += log.get('cost_usd') or 0
+            summary[provider]['tokens_input'] += log.get('tokens_input') or 0
+            summary[provider]['tokens_output'] += log.get('tokens_output') or 0
+
+        elif provider == 'phantombuster':
+            summary[provider]['runs'] += 1
+            metadata = log.get('metadata') or {}
+            summary[provider]['profiles_scraped'] += metadata.get('profiles_scraped') or 0
+
+    return summary
+
+
+def get_usage_logs(client: SupabaseClient, provider: str = None, days: int = None,
+                   limit: int = 100, offset: int = 0) -> list:
+    """Get detailed usage logs with optional filtering.
+
+    Args:
+        client: SupabaseClient instance
+        provider: Filter by provider name (optional)
+        days: Number of days to look back (None = all time)
+        limit: Max records to return
+        offset: Number of records to skip (for pagination)
+
+    Returns:
+        List of usage log records
+    """
+    filters = {}
+
+    if provider:
+        filters['provider'] = f'eq.{provider.lower()}'
+
+    if days:
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        filters['created_at'] = f'gte.{cutoff}'
+
+    try:
+        # Build params for pagination and ordering
+        params = {'select': '*', 'order': 'created_at.desc'}
+        if filters:
+            params.update(filters)
+        if limit:
+            params['limit'] = limit
+        if offset:
+            params['offset'] = offset
+
+        url = f"{client.url}/rest/v1/api_usage_logs"
+        response = requests.get(url, headers=client.headers, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json() if response.text else []
+    except Exception as e:
+        print(f"[DB] Failed to fetch usage logs: {e}")
+        return []
+
+
+def get_usage_by_date(client: SupabaseClient, days: int = 30) -> list:
+    """Get usage aggregated by date for charting.
+
+    Args:
+        client: SupabaseClient instance
+        days: Number of days to look back
+
+    Returns:
+        List of dicts: [{'date': '2024-01-15', 'crustdata': X, 'salesql': Y, ...}, ...]
+    """
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    try:
+        logs = client.select('api_usage_logs', '*', {'created_at': f'gte.{cutoff}'}, limit=10000)
+    except Exception as e:
+        print(f"[DB] Failed to fetch usage logs: {e}")
+        return []
+
+    # Group by date and provider
+    by_date = {}
+    for log in logs:
+        created_at = log.get('created_at', '')
+        if not created_at:
+            continue
+        # Extract date part
+        date_str = created_at[:10]
+        provider = log.get('provider', '').lower()
+
+        if date_str not in by_date:
+            by_date[date_str] = {'date': date_str, 'crustdata': 0, 'salesql': 0, 'openai': 0, 'phantombuster': 0}
+
+        if provider == 'crustdata':
+            by_date[date_str]['crustdata'] += log.get('credits_used') or 0
+        elif provider == 'salesql':
+            by_date[date_str]['salesql'] += log.get('credits_used') or 0
+        elif provider == 'openai':
+            by_date[date_str]['openai'] += log.get('cost_usd') or 0
+        elif provider == 'phantombuster':
+            by_date[date_str]['phantombuster'] += 1
+
+    # Sort by date
+    result = sorted(by_date.values(), key=lambda x: x['date'])
+    return result
