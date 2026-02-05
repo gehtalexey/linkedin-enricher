@@ -1503,6 +1503,7 @@ def normalize_phantombuster_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize PhantomBuster column names using shared normalizers.
 
     Uses normalizers.py for consistent field mapping across dashboard and db.
+    Does NOT add Crustdata-specific fields - keeps PhantomBuster data clean.
     """
     # Debug: log all columns to help identify URL fields
     url_cols = [c for c in df.columns if 'url' in c.lower() or 'link' in c.lower() or 'profile' in c.lower() or 'identifier' in c.lower()]
@@ -1516,10 +1517,31 @@ def normalize_phantombuster_columns(df: pd.DataFrame) -> pd.DataFrame:
     for raw in records:
         normalized = normalize_phantombuster_profile(raw)
         if normalized:
-            # For display, we want the display dict format
-            display_record = profile_to_display_dict(normalized)
-            # But also keep the raw data for db save
-            display_record['raw_phantombuster'] = normalized.get('raw_phantombuster')
+            # Build display record with PhantomBuster fields only (no Crustdata fields)
+            first = normalized.get('first_name') or ''
+            last = normalized.get('last_name') or ''
+            name = f"{first} {last}".strip() or 'Unknown'
+
+            # Get raw PhantomBuster data for additional fields
+            raw_pb = normalized.get('raw_phantombuster') or {}
+
+            display_record = {
+                'name': name,
+                'first_name': first,
+                'last_name': last,
+                'current_company': normalized.get('current_company') or '',
+                'current_title': normalized.get('current_title') or '',
+                'headline': normalized.get('headline') or '',
+                'location': normalized.get('location') or '',
+                'linkedin_url': normalized.get('linkedin_url') or '',
+                'summary': normalized.get('summary') or raw_pb.get('summary') or '',
+                'title_description': raw_pb.get('titleDescription') or '',
+                'industry': raw_pb.get('industry') or '',
+                'company_location': raw_pb.get('companyLocation') or '',
+                'current_years_in_role': normalized.get('current_years_in_role'),
+                'current_years_at_company': normalized.get('current_years_at_company'),
+                'raw_phantombuster': raw_pb,
+            }
             normalized_records.append(display_record)
         else:
             # Keep original record but mark as invalid (no URL)
@@ -1855,17 +1877,13 @@ def normalize_crustdata_profile(record: dict) -> dict:
             'summary': '',
             'skills': '',
             'education': '',
+            'all_employers': '',
+            'all_titles': '',
+            'all_schools': '',
         }
 
-    # Convert to display format
+    # Convert to display format (includes all_employers, all_titles, all_schools, skills)
     display = profile_to_display_dict(normalized)
-
-    # Add JSON fields for reference (backwards compatibility)
-    raw = normalized.get('raw_crustdata', record)
-    display['positions_json'] = json.dumps(raw.get('positions', [])) if raw.get('positions') else ''
-    display['education_json'] = json.dumps(raw.get('education', [])) if raw.get('education') else ''
-    display['connections_count'] = normalized.get('connections_count') or ''
-    display['followers_count'] = normalized.get('followers_count') or ''
 
     return display
 
@@ -2530,6 +2548,137 @@ with tab_upload:
                 except Exception as e:
                     pass  # Silently fail if database not available
 
+    # ===== File Upload Section =====
+    st.markdown("### Upload File")
+    pre_enriched_file = st.file_uploader(
+        "Upload pre-enriched CSV or JSON",
+        type=['csv', 'json'],
+        key="pre_enriched_upload"
+    )
+
+    if pre_enriched_file:
+        try:
+            if pre_enriched_file.name.endswith('.json'):
+                pre_enriched_data = json.load(pre_enriched_file)
+                if isinstance(pre_enriched_data, list):
+                    st.session_state['results'] = pre_enriched_data
+                    st.session_state['results_df'] = flatten_for_csv(pre_enriched_data)
+                    st.success(f"Loaded **{len(pre_enriched_data)}** profiles!")
+            else:
+                pre_enriched_file.seek(0)
+                df_uploaded = pd.read_csv(pre_enriched_file, encoding='utf-8')
+
+                # Normalize columns (handles GEM and other CSV formats)
+                df_uploaded = normalize_uploaded_csv(df_uploaded)
+
+                # Count valid LinkedIn URLs
+                valid_urls = df_uploaded['linkedin_url'].notna().sum() if 'linkedin_url' in df_uploaded.columns else 0
+
+                # PhantomBuster/CSV data stays in session state only (not saved to DB)
+                # DB save happens after Crustdata enrichment
+                st.session_state['results'] = df_uploaded.to_dict('records')
+                st.session_state['results_df'] = df_uploaded
+
+                # Show success message with details
+                msg = f"Loaded **{len(df_uploaded)}** profiles"
+                if valid_urls > 0:
+                    msg += f" ({valid_urls} with LinkedIn URLs ready for enrichment)"
+                st.success(msg)
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+    # ===== Preview =====
+    # Shows loaded results from PhantomBuster or CSV upload
+    if 'results' in st.session_state and st.session_state['results']:
+        results_df = st.session_state.get('results_df')
+        if results_df is not None and not results_df.empty:
+            st.divider()
+            st.markdown("### Preview")
+
+            # Show last load message (from PhantomBuster or CSV)
+            if 'last_load_count' in st.session_state:
+                load_count = st.session_state['last_load_count']
+                load_file = st.session_state.get('last_load_file', '')
+                load_mode = st.session_state.get('last_load_mode', 'loaded')
+                load_total = st.session_state.get('last_load_total')
+
+                if load_mode == 'added':
+                    st.success(f"Added **{load_count}** new profiles (total: **{load_total}**) from **{load_file}**")
+                else:
+                    st.success(f"Loaded **{load_count}** profiles from **{load_file}** - ready for enrichment")
+
+                # Clear after showing once
+                del st.session_state['last_load_count']
+                if 'last_load_file' in st.session_state:
+                    del st.session_state['last_load_file']
+                if 'last_load_mode' in st.session_state:
+                    del st.session_state['last_load_mode']
+                if 'last_load_total' in st.session_state:
+                    del st.session_state['last_load_total']
+
+            # Toggle to show all columns
+            show_all_cols_csv = st.checkbox("Show all columns", value=False, key="upload_show_all_cols")
+
+            # Pagination settings
+            page_size = 10
+            total_profiles = len(results_df)
+            total_pages = max(1, (total_profiles + page_size - 1) // page_size)
+
+            if 'csv_preview_page' not in st.session_state:
+                st.session_state['csv_preview_page'] = 0
+
+            current_page = st.session_state['csv_preview_page']
+            start_idx = current_page * page_size
+            end_idx = min(start_idx + page_size, total_profiles)
+
+            page_df = results_df.iloc[start_idx:end_idx]
+
+            if show_all_cols_csv:
+                # Show all columns from the source
+                st.dataframe(
+                    page_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
+                        "defaultProfileUrl": st.column_config.LinkColumn("Profile URL"),
+                    }
+                )
+                st.caption(f"{len(results_df.columns)} columns")
+            else:
+                # Show basic columns only
+                key_cols = ['name', 'current_title', 'current_company', 'location', 'linkedin_url']
+                available_cols = [c for c in key_cols if c in results_df.columns]
+
+                if available_cols:
+                    st.dataframe(
+                        page_df[available_cols],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
+                        }
+                    )
+                else:
+                    st.dataframe(page_df.head(10), use_container_width=True, hide_index=True)
+
+            # Pagination controls
+            col_prev, col_info, col_next = st.columns([1, 2, 1])
+            with col_prev:
+                if st.button("< Prev", key="csv_prev", disabled=current_page == 0):
+                    st.session_state['csv_preview_page'] = current_page - 1
+                    st.rerun()
+            with col_info:
+                st.caption(f"Page {current_page + 1} of {total_pages} ({start_idx + 1}-{end_idx} of {total_profiles} profiles)")
+            with col_next:
+                if st.button("Next >", key="csv_next", disabled=current_page >= total_pages - 1):
+                    st.session_state['csv_preview_page'] = current_page + 1
+                    st.rerun()
+
+            st.divider()
+            st.info("**Next step:** Click on **2. Filter** tab to filter profiles (optional) or **3. Enrich** to enrich directly")
+
     st.divider()
 
     pb_key = load_phantombuster_key()
@@ -2697,131 +2846,6 @@ with tab_upload:
                                         st.error("No results found. File may have been deleted from PhantomBuster.")
                 else:
                     st.info("No search history found. Launch a search below to get started.")
-
-                # ===== Results Preview =====
-                if 'results' in st.session_state and st.session_state['results']:
-                    st.markdown("---")
-                    st.markdown("### Results Preview")
-
-                    # Show last load message
-                    if 'last_load_count' in st.session_state:
-                        load_count = st.session_state['last_load_count']
-                        load_file = st.session_state.get('last_load_file', '')
-                        load_mode = st.session_state.get('last_load_mode', 'loaded')
-                        load_total = st.session_state.get('last_load_total')
-
-                        if load_mode == 'added':
-                            st.success(f"Added **{load_count}** new profiles (total: **{load_total}**) from **{load_file}**")
-                        else:
-                            st.success(f"Loaded **{load_count}** profiles from **{load_file}** - ready for enrichment")
-
-                        # Clear after showing once
-                        del st.session_state['last_load_count']
-                        if 'last_load_file' in st.session_state:
-                            del st.session_state['last_load_file']
-                        if 'last_load_mode' in st.session_state:
-                            del st.session_state['last_load_mode']
-                        if 'last_load_total' in st.session_state:
-                            del st.session_state['last_load_total']
-
-                    results_df = st.session_state.get('results_df')
-                    if results_df is not None and not results_df.empty:
-                        # Column mapping for preview
-                        col_mapping = {
-                            'name': ['name', 'fullName', 'full_name', 'Name'],
-                            'title': ['current_title', 'title', 'headline', 'Title', 'currentTitle'],
-                            'company': ['current_company', 'company', 'companyName', 'Company', 'currentCompany'],
-                            'location': ['location', 'Location', 'companyLocation', 'city'],
-                            'years_in_role': ['current_years_in_role', 'durationInRole'],
-                            'years_at_company': ['current_years_at_company', 'durationInCompany'],
-                            # linkedin_url is the normalized column name (from defaultProfileUrl)
-                            'linkedin_url': ['linkedin_url', 'public_url', 'defaultProfileUrl']
-                        }
-
-                        # Pagination settings
-                        page_size = 10
-                        total_profiles = len(results_df)
-                        total_pages = (total_profiles + page_size - 1) // page_size
-
-                        # Initialize page in session state
-                        if 'preview_page' not in st.session_state:
-                            st.session_state['preview_page'] = 0
-
-                        current_page = st.session_state['preview_page']
-                        start_idx = current_page * page_size
-                        end_idx = min(start_idx + page_size, total_profiles)
-
-                        # Build preview data for current page
-                        preview_data = []
-                        for _, row in results_df.iloc[start_idx:end_idx].iterrows():
-                            record = {}
-                            # Get name
-                            for col in col_mapping['name']:
-                                if col in results_df.columns and pd.notna(row.get(col)):
-                                    record['Name'] = row[col]
-                                    break
-                            # Get title
-                            for col in col_mapping['title']:
-                                if col in results_df.columns and pd.notna(row.get(col)):
-                                    record['Title'] = row[col]
-                                    break
-                            # Get company
-                            for col in col_mapping['company']:
-                                if col in results_df.columns and pd.notna(row.get(col)):
-                                    record['Company'] = row[col]
-                                    break
-                            # Get location
-                            for col in col_mapping['location']:
-                                if col in results_df.columns and pd.notna(row.get(col)):
-                                    record['Location'] = row[col]
-                                    break
-                            # Get years in role
-                            for col in col_mapping['years_in_role']:
-                                if col in results_df.columns and pd.notna(row.get(col)):
-                                    record['Role Yrs'] = row[col]
-                                    break
-                            # Get years at company
-                            for col in col_mapping['years_at_company']:
-                                if col in results_df.columns and pd.notna(row.get(col)):
-                                    record['Co. Yrs'] = row[col]
-                                    break
-                            # Get LinkedIn URL
-                            for col in col_mapping['linkedin_url']:
-                                if col in results_df.columns and pd.notna(row.get(col)):
-                                    record['LinkedIn'] = row[col]
-                                    break
-
-                            if record:
-                                preview_data.append(record)
-
-                        if preview_data:
-                            preview_df = pd.DataFrame(preview_data)
-                            # Use Streamlit dataframe with LinkedIn link shown as icon
-                            st.dataframe(
-                                preview_df,
-                                use_container_width=True,
-                                hide_index=True,
-                                column_config={
-                                    "LinkedIn": st.column_config.LinkColumn(
-                                        "in",
-                                        width="small",
-                                        display_text="💼"
-                                    )
-                                }
-                            )
-
-                            # Pagination controls
-                            col_prev, col_info, col_next = st.columns([1, 2, 1])
-                            with col_prev:
-                                if st.button("< Prev", key="preview_prev", disabled=current_page == 0):
-                                    st.session_state['preview_page'] = current_page - 1
-                                    st.rerun()
-                            with col_info:
-                                st.caption(f"Page {current_page + 1} of {total_pages} ({start_idx + 1}-{end_idx} of {total_profiles} profiles)")
-                            with col_next:
-                                if st.button("Next >", key="preview_next", disabled=current_page >= total_pages - 1):
-                                    st.session_state['preview_page'] = current_page + 1
-                                    st.rerun()
         else:
             st.warning("No phantoms found in your PhantomBuster account")
 
@@ -3128,99 +3152,6 @@ with tab_upload:
                 st.info("No phantom found - ask admin to create one for you")
             elif not search_url:
                 st.info("Paste a Sales Navigator search URL to launch")
-
-    st.divider()
-
-    # ===== File Upload Section =====
-    st.markdown("### Upload File")
-    pre_enriched_file = st.file_uploader(
-        "Upload pre-enriched CSV or JSON",
-        type=['csv', 'json'],
-        key="pre_enriched_upload"
-    )
-
-    if pre_enriched_file:
-        try:
-            if pre_enriched_file.name.endswith('.json'):
-                pre_enriched_data = json.load(pre_enriched_file)
-                if isinstance(pre_enriched_data, list):
-                    st.session_state['results'] = pre_enriched_data
-                    st.session_state['results_df'] = flatten_for_csv(pre_enriched_data)
-                    st.success(f"Loaded **{len(pre_enriched_data)}** profiles!")
-            else:
-                pre_enriched_file.seek(0)
-                df_uploaded = pd.read_csv(pre_enriched_file, encoding='utf-8')
-
-                # Normalize columns (handles GEM and other CSV formats)
-                df_uploaded = normalize_uploaded_csv(df_uploaded)
-
-                # Count valid LinkedIn URLs
-                valid_urls = df_uploaded['linkedin_url'].notna().sum() if 'linkedin_url' in df_uploaded.columns else 0
-
-                # PhantomBuster/CSV data stays in session state only (not saved to DB)
-                # DB save happens after Crustdata enrichment
-                st.session_state['results'] = df_uploaded.to_dict('records')
-                st.session_state['results_df'] = df_uploaded
-
-                # Show success message with details
-                msg = f"Loaded **{len(df_uploaded)}** profiles"
-                if valid_urls > 0:
-                    msg += f" ({valid_urls} with LinkedIn URLs ready for enrichment)"
-                st.success(msg)
-
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-    # Preview uploaded data
-    if 'results' in st.session_state and st.session_state['results']:
-        st.divider()
-        st.markdown("### Preview")
-        preview_df = st.session_state['results_df']
-
-        # Pagination
-        page_size = 20
-        total_profiles = len(preview_df)
-        total_pages = max(1, (total_profiles + page_size - 1) // page_size)
-
-        if 'upload_preview_page' not in st.session_state:
-            st.session_state['upload_preview_page'] = 0
-
-        current_page = st.session_state['upload_preview_page']
-        start_idx = current_page * page_size
-        end_idx = min(start_idx + page_size, total_profiles)
-
-        # Show key columns
-        preview_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'location', 'linkedin_url', 'email']
-        available_cols = [c for c in preview_cols if c in preview_df.columns]
-
-        page_df = preview_df.iloc[start_idx:end_idx]
-        if available_cols:
-            st.dataframe(
-                page_df[available_cols],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
-                }
-            )
-        else:
-            st.dataframe(page_df, use_container_width=True, hide_index=True)
-
-        # Pagination controls
-        col_prev, col_info, col_next = st.columns([1, 2, 1])
-        with col_prev:
-            if st.button("← Previous", key="upload_prev", disabled=current_page == 0):
-                st.session_state['upload_preview_page'] = current_page - 1
-                st.rerun()
-        with col_info:
-            st.caption(f"Showing {start_idx + 1}-{end_idx} of {total_profiles} profiles (Page {current_page + 1}/{total_pages})")
-        with col_next:
-            if st.button("Next →", key="upload_next", disabled=current_page >= total_pages - 1):
-                st.session_state['upload_preview_page'] = current_page + 1
-                st.rerun()
-
-        st.divider()
-        st.info("**Next step:** Click on **2. Filter** tab to filter profiles (optional) or **3. Enrich** to enrich directly")
 
 # ========== TAB 2: Filter ==========
 with tab_filter:
@@ -3802,21 +3733,22 @@ with tab_enrich:
                             st.write(f"  {col}: {sample.get(col, 'N/A')}")
 
             if show_all_cols:
-                # Show all columns
+                # Show all Crustdata columns
+                all_cols = ['name', 'current_title', 'current_company', 'all_employers', 'all_titles', 'all_schools', 'skills', 'past_positions', 'headline', 'location', 'summary', 'connections_count', 'linkedin_url']
+                available_cols = [c for c in all_cols if c in display_df.columns]
                 st.dataframe(
-                    display_df.head(20),
+                    display_df[available_cols].head(20) if available_cols else display_df.head(20),
                     use_container_width=True,
                     hide_index=True,
                     column_config={
                         "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
                     }
                 )
-                st.caption(f"Showing {min(20, len(display_df))} of {len(display_df)} profiles | {len(display_df.columns)} columns")
+                st.caption(f"Showing {min(20, len(display_df))} of {len(display_df)} profiles | {len(available_cols)} columns")
             else:
-                # Show key columns: name, company, title, linkedin url
-                # These are normalized column names from flatten_for_csv
-                display_cols = ['name', 'current_company', 'current_title', 'linkedin_url']
-                available_cols = [c for c in display_cols if c in display_df.columns]
+                # Simple preview: name, title, company, linkedin
+                preview_cols = ['name', 'current_title', 'current_company', 'linkedin_url']
+                available_cols = [c for c in preview_cols if c in display_df.columns]
 
                 if available_cols:
                     st.dataframe(
@@ -3931,10 +3863,8 @@ with tab_enrich:
                         status_text.text("Enrichment complete!")
                         send_notification("Enrichment Complete", f"Processed {len(results)} profiles")
 
-                        # Pair results with original URLs
-                        for idx, profile in enumerate(results):
-                            if idx < len(original_urls):
-                                profile['_original_linkedin_url'] = original_urls[idx]
+                        # Use Crustdata's response directly - no URL matching needed
+                        # Crustdata's linkedin_profile_url is the source of truth
 
                         # Check for errors in results
                         errors = [r for r in results if 'error' in r]
@@ -3952,8 +3882,8 @@ with tab_enrich:
                                     db_client = get_supabase_client()
                                     if db_client and check_connection(db_client):
                                         for profile in successful:
-                                            # Use original URL (what we sent to Crustdata), not the one in response
-                                            linkedin_url = profile.get('_original_linkedin_url') or profile.get('linkedin_profile_url') or profile.get('linkedin_url')
+                                            # Use linkedin_flagship_url (clean format) from Crustdata
+                                            linkedin_url = profile.get('linkedin_flagship_url') or profile.get('linkedin_profile_url') or profile.get('linkedin_url')
                                             if linkedin_url:
                                                 update_profile_enrichment(db_client, linkedin_url, profile)
                                                 db_saved += 1
@@ -4511,9 +4441,11 @@ with tab_database:
                     show_all_db_cols = st.checkbox("Show all columns", value=False, key="db_show_all_cols")
 
                     if show_all_db_cols:
-                        # Show all columns
+                        # Show all Crustdata columns + screening fields
+                        all_cols = ['name', 'current_title', 'current_company', 'all_employers', 'all_titles', 'all_schools', 'skills', 'past_positions', 'headline', 'location', 'summary', 'connections_count', 'screening_score', 'screening_fit_level', 'email', 'status', 'enriched_at', 'linkedin_url']
+                        available_cols = [c for c in all_cols if c in df.columns]
                         st.dataframe(
-                            df,
+                            df[available_cols] if available_cols else df,
                             use_container_width=True,
                             hide_index=True,
                             column_config={
@@ -4522,13 +4454,11 @@ with tab_database:
                                 "enriched_at": st.column_config.DatetimeColumn("Enriched", format="YYYY-MM-DD"),
                             }
                         )
-                        st.caption(f"{len(df.columns)} columns")
+                        st.caption(f"{len(available_cols)} columns")
                     else:
-                        # Select columns to display - name first for readability
-                        display_cols = ['name', 'current_title', 'current_company',
-                                        'screening_score', 'screening_fit_level', 'email', 'status',
-                                        'enriched_at', 'linkedin_url']
-                        available_cols = [c for c in display_cols if c in df.columns]
+                        # Simple preview: name, title, company, linkedin
+                        preview_cols = ['name', 'current_title', 'current_company', 'linkedin_url']
+                        available_cols = [c for c in preview_cols if c in df.columns]
 
                         st.dataframe(
                             df[available_cols] if available_cols else df,
@@ -4537,8 +4467,8 @@ with tab_database:
                             column_config={
                                 "name": st.column_config.TextColumn("Name"),
                                 "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
-                                "screening_score": st.column_config.NumberColumn("Score", format="%d"),
-                                "enriched_at": st.column_config.DatetimeColumn("Enriched", format="YYYY-MM-DD"),
+                                "current_company": st.column_config.TextColumn("Company"),
+                                "current_title": st.column_config.TextColumn("Title"),
                             }
                         )
 

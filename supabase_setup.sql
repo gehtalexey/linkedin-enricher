@@ -8,39 +8,25 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Main profiles table - stores Crustdata enriched profiles only
+-- All detailed fields are stored in raw_data JSONB, extracted at display time
 CREATE TABLE profiles (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   linkedin_url TEXT UNIQUE NOT NULL,
 
-  -- Basic info (from Crustdata)
-  first_name TEXT,
-  last_name TEXT,
-  headline TEXT,
-  location TEXT,
-  summary TEXT,
+  -- Raw Crustdata response (source of truth for all profile data)
+  raw_data JSONB,
 
-  -- Current position (extracted for easy querying)
+  -- Indexed fields for filtering (extracted from raw_data on save)
   current_title TEXT,
   current_company TEXT,
-  current_years_in_role NUMERIC,
-  current_years_at_company NUMERIC,
 
-  -- Full arrays from Crustdata (for advanced filtering)
-  positions JSONB,          -- [{title, company_name, start_date, end_date, ...}, ...]
-  education_list JSONB,     -- [{school, degree, field_of_study, ...}, ...]
-  skills_list JSONB,        -- ["skill1", "skill2", ...]
-
-  -- Flattened for display
-  skills TEXT,              -- Comma-separated skills string
-  education TEXT,           -- Most recent school name
-
-  -- Profile metadata
-  connections_count INTEGER,
-  followers_count INTEGER,
-  profile_picture_url TEXT,
-
-  -- Raw Crustdata response (full backup)
-  raw_data JSONB,
+  -- Pre-flattened arrays from Crustdata (for filtering)
+  -- Query examples: WHERE 'Google' = ANY(all_employers)
+  --                 WHERE skills @> ARRAY['Python', 'React']
+  all_employers TEXT[],     -- All companies worked at
+  all_titles TEXT[],        -- All job titles held
+  all_schools TEXT[],       -- All schools attended
+  skills TEXT[],            -- All skills
 
   -- Screening results (from OpenAI)
   screening_score INTEGER,
@@ -70,9 +56,11 @@ CREATE INDEX idx_profiles_screening_fit ON profiles(screening_fit_level);
 CREATE INDEX idx_profiles_current_company ON profiles(current_company);
 CREATE INDEX idx_profiles_enriched_at ON profiles(enriched_at);
 
--- GIN indexes for JSONB array searches
-CREATE INDEX idx_profiles_positions ON profiles USING GIN (positions);
-CREATE INDEX idx_profiles_skills ON profiles USING GIN (skills_list);
+-- GIN indexes for array filtering (e.g., WHERE 'Google' = ANY(all_employers))
+CREATE INDEX idx_profiles_all_employers ON profiles USING GIN (all_employers);
+CREATE INDEX idx_profiles_all_titles ON profiles USING GIN (all_titles);
+CREATE INDEX idx_profiles_all_schools ON profiles USING GIN (all_schools);
+CREATE INDEX idx_profiles_skills ON profiles USING GIN (skills);
 
 -- Auto-update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at()

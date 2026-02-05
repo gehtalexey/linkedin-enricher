@@ -31,8 +31,11 @@ CANONICAL_FIELDS = [
     'current_company',
     'current_years_in_role',    # Numeric (years as float)
     'current_years_at_company', # Numeric (years as float)
-    'skills',                   # Comma-separated string
+    'skills',                   # Comma-separated string (display) / TEXT[] (DB)
     'education',                # Most recent school name
+    'all_employers',            # Comma-separated string (display) / TEXT[] (DB)
+    'all_titles',               # Comma-separated string (display) / TEXT[] (DB)
+    'all_schools',              # Comma-separated string (display) / TEXT[] (DB)
     'connections_count',
     'followers_count',
     'profile_picture_url',
@@ -65,8 +68,8 @@ PHANTOMBUSTER_FIELD_MAP = {
 
 # Crustdata field name variations → canonical field
 CRUSTDATA_FIELD_MAP = {
-    # URL fields
-    'linkedin_url': ['_original_linkedin_url', 'linkedin_profile_url', 'linkedin_url'],
+    # URL fields - linkedin_flagship_url has the clean format, linkedin_profile_url is encoded
+    'linkedin_url': ['linkedin_flagship_url', 'linkedin_profile_url', 'linkedin_url'],
 
     # Name fields
     'first_name': ['first_name'],
@@ -84,10 +87,10 @@ CRUSTDATA_FIELD_MAP = {
     'position_duration_role': ['duration_in_role', 'years_in_role'],
     'position_duration_company': ['duration_at_company', 'years_at_company'],
 
-    # Other fields
-    'connections': ['connections_count', 'connections'],
+    # Other fields - Crustdata uses num_of_connections
+    'connections': ['num_of_connections', 'connections_count', 'connections'],
     'followers': ['followers_count', 'followers'],
-    'profile_pic': ['profile_picture_url', 'profile_pic_url'],
+    'profile_pic': ['profile_picture_url', 'profile_pic_url', 'profile_picture_permalink'],
 }
 
 
@@ -394,6 +397,10 @@ def normalize_crustdata_profile(raw: dict, original_url: str = None) -> Optional
     if not raw:
         return None
 
+    # Keep original raw data before any modifications
+    import copy
+    original_raw = copy.deepcopy(raw)
+
     # Store original URL if provided (for matching back)
     if original_url:
         raw['_original_linkedin_url'] = original_url
@@ -423,36 +430,22 @@ def normalize_crustdata_profile(raw: dict, original_url: str = None) -> Optional
     location = get_first_valid(raw, CRUSTDATA_FIELD_MAP['location'])
     summary = get_first_valid(raw, CRUSTDATA_FIELD_MAP['summary'])
 
-    # Extract current position from positions array
+    # Extract current position from current_employers array (Crustdata format)
     current_title = None
     current_company = None
-    current_years_in_role = None
-    current_years_at_company = None
 
-    positions = raw.get('positions', [])
-    if isinstance(positions, str):
-        try:
-            positions = json.loads(positions)
-        except (json.JSONDecodeError, TypeError):
-            positions = []
+    current_employers = raw.get('current_employers', [])
+    if current_employers and isinstance(current_employers, list) and len(current_employers) > 0:
+        emp = current_employers[0]
+        if isinstance(emp, dict):
+            current_title = emp.get('employee_title') or emp.get('title')
+            current_company = emp.get('employer_name') or emp.get('company_name')
 
-    if positions and isinstance(positions, list) and len(positions) > 0:
-        current_pos = positions[0]
-        if isinstance(current_pos, dict):
-            current_title = get_first_valid(current_pos, CRUSTDATA_FIELD_MAP['position_title'])
-            current_company = get_first_valid(current_pos, CRUSTDATA_FIELD_MAP['position_company'])
-
-            duration_role = get_first_valid(current_pos, CRUSTDATA_FIELD_MAP['position_duration_role'])
-            duration_company = get_first_valid(current_pos, CRUSTDATA_FIELD_MAP['position_duration_company'])
-
-            current_years_in_role = parse_duration(duration_role)
-            current_years_at_company = parse_duration(duration_company)
-
-    # Fallback to top-level fields if positions array didn't have data
+    # Fallback to top-level fields
     if not current_title:
-        current_title = raw.get('current_title') or raw.get('title') or raw.get('job_title')
+        current_title = raw.get('title') or raw.get('headline', '').split(' at ')[0] if ' at ' in raw.get('headline', '') else raw.get('title')
     if not current_company:
-        current_company = raw.get('current_company') or raw.get('company') or raw.get('company_name')
+        current_company = raw.get('company') or raw.get('company_name')
 
     # Skills - convert array to comma-separated string
     skills = raw.get('skills', [])
@@ -463,29 +456,40 @@ def normalize_crustdata_profile(raw: dict, original_url: str = None) -> Optional
     else:
         skills_str = None
 
-    # Education - extract most recent school
-    education = raw.get('education', [])
-    if isinstance(education, str):
-        try:
-            education = json.loads(education)
-        except (json.JSONDecodeError, TypeError):
-            education = []
+    # Past positions - format work history for preview
+    past_employers = raw.get('past_employers', [])
+    past_positions_parts = []
+    for emp in past_employers[:10]:  # Limit to 10
+        if isinstance(emp, dict):
+            title = emp.get('employee_title') or emp.get('title') or ''
+            company = emp.get('employer_name') or emp.get('company_name') or ''
+            if title and company:
+                past_positions_parts.append(f"{title} at {company}")
+            elif title or company:
+                past_positions_parts.append(title or company)
+    past_positions_str = ' | '.join(past_positions_parts) if past_positions_parts else None
 
-    education_str = None
-    if isinstance(education, list) and len(education) > 0:
-        edu = education[0]
-        if isinstance(edu, dict):
-            education_str = edu.get('school') or edu.get('school_name')
-        elif edu:
-            education_str = str(edu)
+    # Pre-flattened arrays from Crustdata (convert to comma-separated for display)
+    all_employers = raw.get('all_employers', [])
+    all_employers_str = ', '.join(str(x) for x in all_employers if x) if isinstance(all_employers, list) else None
+
+    all_titles = raw.get('all_titles', [])
+    all_titles_str = ', '.join(str(x) for x in all_titles if x) if isinstance(all_titles, list) else None
+
+    all_schools = raw.get('all_schools', [])
+    all_schools_str = ', '.join(str(x) for x in all_schools if x) if isinstance(all_schools, list) else None
 
     # Other fields
     connections = get_first_valid(raw, CRUSTDATA_FIELD_MAP['connections'])
     followers = get_first_valid(raw, CRUSTDATA_FIELD_MAP['followers'])
     profile_pic = get_first_valid(raw, CRUSTDATA_FIELD_MAP['profile_pic'])
 
+    # Combine name for display
+    name = f"{first_name or ''} {last_name or ''}".strip() or None
+
     return {
         'linkedin_url': linkedin_url,
+        'name': name,
         'first_name': first_name,
         'last_name': last_name,
         'headline': headline,
@@ -493,14 +497,13 @@ def normalize_crustdata_profile(raw: dict, original_url: str = None) -> Optional
         'summary': summary,
         'current_title': current_title,
         'current_company': current_company,
-        'current_years_in_role': current_years_in_role,
-        'current_years_at_company': current_years_at_company,
         'skills': skills_str,
-        'education': education_str,
+        'all_employers': all_employers_str,
+        'all_titles': all_titles_str,
+        'all_schools': all_schools_str,
+        'past_positions': past_positions_str,
         'connections_count': connections,
-        'followers_count': followers,
-        'profile_picture_url': profile_pic,
-        'raw_crustdata': raw,  # Keep original for JSONB storage
+        'raw_crustdata': original_raw,  # Keep original unmodified data
     }
 
 
@@ -552,6 +555,11 @@ def profile_to_display_dict(profile: dict) -> dict:
     last = profile.get('last_name') or ''
     name = f"{first} {last}".strip() or 'Unknown'
 
+    # Extract past_positions from raw_crustdata - full JSON for preview
+    raw = profile.get('raw_crustdata', {})
+    past_employers = raw.get('past_employers', [])
+    past_positions = json.dumps(past_employers, ensure_ascii=False) if past_employers else ''
+
     return {
         'name': name,
         'first_name': first,
@@ -562,12 +570,12 @@ def profile_to_display_dict(profile: dict) -> dict:
         'location': profile.get('location') or '',
         'linkedin_url': profile.get('linkedin_url') or '',
         'skills': profile.get('skills') or '',
-        'education': profile.get('education') or '',
+        'all_employers': profile.get('all_employers') or '',
+        'all_titles': profile.get('all_titles') or '',
+        'all_schools': profile.get('all_schools') or '',
+        'past_positions': past_positions,
         'summary': profile.get('summary') or '',
-        'current_years_in_role': profile.get('current_years_in_role'),
-        'current_years_at_company': profile.get('current_years_at_company'),
         'connections_count': profile.get('connections_count'),
-        'followers_count': profile.get('followers_count'),
     }
 
 

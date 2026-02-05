@@ -52,7 +52,8 @@ def extract_display_fields(raw_data: dict) -> dict:
         'all_schools': all_schools,
         'all_employers': cd.get('all_employers') or [],
         'all_titles': cd.get('all_titles') or [],
-        'positions': cd.get('positions') or current_employers or [],
+        'past_employers': cd.get('past_employers') or [],
+        'current_employers': current_employers,
         'education_background': education_background,
         'skills': cd.get('skills') or [],
 
@@ -64,7 +65,7 @@ def extract_display_fields(raw_data: dict) -> dict:
         'profile_picture': cd.get('profile_pic_url') or cd.get('profile_picture_url') or '',
 
         # For job hopping analysis
-        'num_positions': len(cd.get('positions') or current_employers or []),
+        'num_positions': len(cd.get('past_employers') or []) + len(current_employers),
         'num_employers': len(cd.get('all_employers') or []),
     }
 
@@ -88,7 +89,8 @@ def extract_for_screening(raw_data: dict) -> dict:
         'all_titles': display['all_titles'],
         'all_schools': display['all_schools'],
         'skills': display['skills'],
-        'positions': display['positions'],
+        'past_employers': display['past_employers'],
+        'current_employers': display['current_employers'],
         'education_background': display['education_background'],
         'connections': display['connections'],
     }
@@ -120,8 +122,10 @@ def profile_to_display_row(profile: dict) -> dict:
     raw = profile.get('raw_data') or {}
     display = extract_display_fields(raw)
 
-    # Format past positions for screening
-    past_positions = format_past_positions(display['positions'])
+    # Past positions as full JSON from Crustdata
+    import json
+    past_employers = display.get('past_employers') or []
+    past_positions = json.dumps(past_employers, ensure_ascii=False) if past_employers else ''
 
     return {
         'linkedin_url': profile.get('linkedin_url', ''),

@@ -198,12 +198,28 @@ def save_enriched_profile(client: SupabaseClient, linkedin_url: str, crustdata_r
             if not current_company and len(parts) > 1:
                 current_company = parts[1].split('/')[0].strip()
 
-    # Minimal data - everything else comes from raw_data at display time
+    # Extract pre-flattened arrays from Crustdata (already provided by API)
+    all_employers = cd.get('all_employers') or []
+    all_titles = cd.get('all_titles') or []
+    all_schools = cd.get('all_schools') or []
+    skills = cd.get('skills') or []
+
+    # Ensure they're lists of strings
+    all_employers = [str(x) for x in all_employers if x] if isinstance(all_employers, list) else []
+    all_titles = [str(x) for x in all_titles if x] if isinstance(all_titles, list) else []
+    all_schools = [str(x) for x in all_schools if x] if isinstance(all_schools, list) else []
+    skills = [str(x) for x in skills if x] if isinstance(skills, list) else []
+
+    # Data to save - indexed fields + raw_data for everything else
     data = {
         'linkedin_url': linkedin_url,
         'raw_data': crustdata_response,
         'current_title': current_title,
         'current_company': current_company,
+        'all_employers': all_employers if all_employers else None,
+        'all_titles': all_titles if all_titles else None,
+        'all_schools': all_schools if all_schools else None,
+        'skills': skills if skills else None,
         'status': 'enriched',
         'enriched_at': datetime.utcnow().isoformat(),
     }
