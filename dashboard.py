@@ -3190,10 +3190,19 @@ with tab_filter:
         has_sheets = bool(filter_sheets.get('url')) and gspread_client is not None
 
         if has_sheets:
-            if user_sheet_url:
-                st.success("Using your personal filter sheet")
-            else:
-                st.success("Using default filter sheet")
+            # Try to fetch and display sheet name
+            try:
+                spreadsheet = gspread_client.open_by_url(filter_sheets['url'])
+                sheet_name = spreadsheet.title
+                if user_sheet_url:
+                    st.success(f"📊 **{sheet_name}** (your personal filter sheet)")
+                else:
+                    st.success(f"📊 **{sheet_name}** (default filter sheet)")
+            except Exception:
+                if user_sheet_url:
+                    st.success("Using your personal filter sheet")
+                else:
+                    st.success("Using default filter sheet")
 
             # Validate sheet connection
             if st.button("Verify Sheet Connection", key="verify_sheet"):
@@ -3811,17 +3820,21 @@ with tab_enrich:
                     if urls:
                         st.write("Sample URLs from loaded data (normalized):", [normalize_linkedin_url(u) for u in urls[:3]])
 
-                # Show stats
+                # Show stats - always skip already enriched by default
                 if skipped_urls:
-                    st.info(f"**{len(new_urls)}** new profiles to enrich | **{len(skipped_urls)}** already enriched (will be skipped)")
-                    skip_enriched = st.checkbox("Skip already-enriched profiles", value=True, key="skip_enriched_cb")
-                    urls_for_enrichment = new_urls if skip_enriched else urls
+                    st.info(f"**{len(new_urls)}** new profiles to enrich | **{len(skipped_urls)}** already enriched (skipped)")
+                    urls_for_enrichment = new_urls
+                    # Only show re-enrich option in expander if user really wants it
+                    with st.expander("Re-enrich options", expanded=False):
+                        if st.checkbox("Re-enrich already-enriched profiles", value=False, key="reenrich_cb"):
+                            urls_for_enrichment = urls
+                            st.warning(f"Will re-enrich all {len(urls)} profiles including {len(skipped_urls)} already enriched")
                 else:
                     st.info(f"**{len(urls)}** profiles ready for enrichment")
                     urls_for_enrichment = urls
 
                 if not urls_for_enrichment:
-                    st.warning("All profiles have already been enriched. Uncheck 'Skip already-enriched' to re-enrich them.")
+                    st.warning("All profiles have already been enriched.")
                 else:
                     col1, col2 = st.columns(2)
                     with col1:
