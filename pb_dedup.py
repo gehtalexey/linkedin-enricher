@@ -133,7 +133,7 @@ def get_skip_list_from_database() -> tuple[list[str], dict]:
         return [], {'error': 'Supabase not configured'}
 
     try:
-        # Get recently enriched profiles (within 6 months) - these should be skipped
+        # Get recently enriched profiles (within 3 months) - these should be skipped
         skip_urls = get_recently_enriched_urls(client)
         stats = get_dedup_stats(client)
         return skip_urls, stats

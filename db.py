@@ -16,7 +16,7 @@ import pandas as pd
 from normalizers import normalize_linkedin_url
 
 # Refresh threshold for re-enriching stale profiles
-ENRICHMENT_REFRESH_MONTHS = 6
+ENRICHMENT_REFRESH_MONTHS = 3
 
 
 class SupabaseClient:

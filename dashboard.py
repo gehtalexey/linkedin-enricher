@@ -52,7 +52,8 @@ try:
         update_profile_enrichment, update_profile_screening, get_all_profiles,
         get_pipeline_stats, get_profiles_by_fit_level, get_all_linkedin_urls,
         get_dedup_stats, profiles_to_dataframe, get_usage_summary, get_usage_logs,
-        get_usage_by_date, get_enriched_urls,
+        get_usage_by_date, get_enriched_urls, get_recently_enriched_urls,
+        ENRICHMENT_REFRESH_MONTHS,
     )
     from pb_dedup import filter_results_against_database, update_phantombuster_with_skip_list, get_skip_list_from_database
     HAS_DATABASE = True
@@ -2067,34 +2068,47 @@ def apply_pre_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, di
         return False
 
     # ========== EXCLUSION FILTERS ==========
+    # Track skipped filters for diagnostics
+    stats['_skipped_filters'] = []
 
     # 1. Past candidates filter
     if filters.get('past_candidates_df') is not None:
         past_df = filters['past_candidates_df']
         if 'Name' in past_df.columns:
             past_names = set(str(name).lower().strip() for name in past_df['Name'].dropna())
-            df['_full_name'] = (df['first_name'].fillna('').str.lower().str.strip() + ' ' +
-                               df['last_name'].fillna('').str.lower().str.strip())
-            df['_is_past'] = df['_full_name'].isin(past_names)
-            stats['past_candidates'] = df['_is_past'].sum()
-            filtered_out['Past Candidates'] = df[df['_is_past']].drop(columns=['_is_past', '_full_name']).copy()
-            df = df[~df['_is_past']].drop(columns=['_is_past', '_full_name'])
+            if 'first_name' in df.columns and 'last_name' in df.columns:
+                df['_full_name'] = (df['first_name'].fillna('').str.lower().str.strip() + ' ' +
+                                   df['last_name'].fillna('').str.lower().str.strip())
+                df['_is_past'] = df['_full_name'].isin(past_names)
+                stats['past_candidates'] = df['_is_past'].sum()
+                filtered_out['Past Candidates'] = df[df['_is_past']].drop(columns=['_is_past', '_full_name']).copy()
+                df = df[~df['_is_past']].drop(columns=['_is_past', '_full_name'])
+            else:
+                stats['_skipped_filters'].append('past_candidates (missing first_name/last_name columns)')
+        else:
+            stats['_skipped_filters'].append(f"past_candidates (sheet needs 'Name' column, has: {list(past_df.columns)})")
 
     # 2. Blacklist filter
     if filters.get('blacklist'):
         blacklist = [c.lower().strip() for c in filters['blacklist']]
-        df['_blacklisted'] = df['current_company'].apply(lambda x: matches_list(x, blacklist))
-        stats['blacklist'] = df['_blacklisted'].sum()
-        filtered_out['Blacklist Companies'] = df[df['_blacklisted']].drop(columns=['_blacklisted']).copy()
-        df = df[~df['_blacklisted']].drop(columns=['_blacklisted'])
+        if 'current_company' in df.columns:
+            df['_blacklisted'] = df['current_company'].apply(lambda x: matches_list(x, blacklist))
+            stats['blacklist'] = df['_blacklisted'].sum()
+            filtered_out['Blacklist Companies'] = df[df['_blacklisted']].drop(columns=['_blacklisted']).copy()
+            df = df[~df['_blacklisted']].drop(columns=['_blacklisted'])
+        else:
+            stats['_skipped_filters'].append('blacklist (missing current_company column)')
 
     # 3. Not relevant companies (current)
     if filters.get('not_relevant'):
         not_relevant = [c.lower().strip() for c in filters['not_relevant']]
-        df['_not_relevant'] = df['current_company'].apply(lambda x: matches_list(x, not_relevant))
-        stats['not_relevant_current'] = df['_not_relevant'].sum()
-        filtered_out['Not Relevant (Current)'] = df[df['_not_relevant']].drop(columns=['_not_relevant']).copy()
-        df = df[~df['_not_relevant']].drop(columns=['_not_relevant'])
+        if 'current_company' in df.columns:
+            df['_not_relevant'] = df['current_company'].apply(lambda x: matches_list(x, not_relevant))
+            stats['not_relevant_current'] = df['_not_relevant'].sum()
+            filtered_out['Not Relevant (Current)'] = df[df['_not_relevant']].drop(columns=['_not_relevant']).copy()
+            df = df[~df['_not_relevant']].drop(columns=['_not_relevant'])
+        else:
+            stats['_skipped_filters'].append('not_relevant (missing current_company column)')
 
     # 4. Exclude title keywords filter
     if filters.get('exclude_titles') and 'current_title' in df.columns:
@@ -2149,6 +2163,16 @@ def apply_pre_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, di
     role_col = 'durationInRole' if 'durationInRole' in df.columns else 'current_years_in_role' if 'current_years_in_role' in df.columns else None
     company_col = 'durationInCompany' if 'durationInCompany' in df.columns else 'current_years_at_company' if 'current_years_at_company' in df.columns else None
 
+    # Track if duration columns are missing
+    if filters.get('min_role_months') and not role_col:
+        stats['_skipped_filters'].append('min_role_months (no duration column found)')
+    if filters.get('max_role_months') and not role_col:
+        stats['_skipped_filters'].append('max_role_months (no duration column found)')
+    if filters.get('min_company_months') and not company_col:
+        stats['_skipped_filters'].append('min_company_months (no duration column found)')
+    if filters.get('max_company_months') and not company_col:
+        stats['_skipped_filters'].append('max_company_months (no duration column found)')
+
     # Min role duration
     if filters.get('min_role_months') and role_col:
         min_months = filters['min_role_months']
@@ -2190,10 +2214,35 @@ def apply_pre_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, di
         universities = [u.lower().strip() for u in filters['universities']]
 
         def has_top_university(education):
+            """Check if education matches a target university using stricter matching."""
             if pd.isna(education) or not str(education).strip():
                 return False
             edu_lower = str(education).lower()
-            return any(uni in edu_lower for uni in universities)
+            # Split education into parts (may contain multiple schools)
+            edu_parts = [p.strip() for p in edu_lower.replace('|', ',').split(',')]
+
+            for edu_part in edu_parts:
+                for uni in universities:
+                    if not uni:
+                        continue
+                    # Exact match
+                    if edu_part == uni:
+                        return True
+                    # Education part starts with university name
+                    if edu_part.startswith(uni):
+                        return True
+                    # University name starts with education part (if part is substantial)
+                    if uni.startswith(edu_part) and len(edu_part) > 10:
+                        return True
+                    # Word-based matching for longer names
+                    if len(uni) > 8:
+                        uni_words = set(uni.split())
+                        edu_words = set(edu_part.split())
+                        common = uni_words & edu_words
+                        # Require 70%+ of university words to match
+                        if len(common) >= len(uni_words) * 0.7:
+                            return True
+            return False
 
         df['_top_uni'] = df['education'].apply(has_top_university)
         not_top_uni = ~df['_top_uni']
@@ -2248,8 +2297,12 @@ Give higher scores when candidate has:
 4. **Company > Skills**: Strong company pedigree compensates for skill list gaps."""
 
 
-def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_requirements: str = "", tracker: 'UsageTracker' = None) -> dict:
-    """Screen a profile against a job description using OpenAI."""
+def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_requirements: str = "", tracker: 'UsageTracker' = None, mode: str = "detailed") -> dict:
+    """Screen a profile against a job description using OpenAI.
+
+    Args:
+        mode: "quick" for cheaper/faster (score + fit + summary) or "detailed" for full analysis
+    """
     start_time = time.time()
 
     # Build concise profile summary for the prompt (with safe string conversion)
@@ -2269,6 +2322,14 @@ Skills: {safe_str(profile.get('skills', 'N/A'))}
 Summary: {safe_str(profile.get('summary', 'N/A'))}
 Past Positions: {safe_str(profile.get('past_positions', 'N/A'))}"""
 
+    # Different prompts based on mode
+    if mode == "quick":
+        response_format = '{"score": <1-10>, "fit": "<Strong Fit|Good Fit|Partial Fit|Not a Fit>", "summary": "<one sentence>"}'
+        max_tokens = 100
+    else:
+        response_format = '{"score": <1-10>, "fit": "<Strong Fit|Good Fit|Partial Fit|Not a Fit>", "summary": "<2-3 sentences about the candidate>", "why": "<2-3 sentences explaining the score>", "strengths": ["<strength1>", "<strength2>"], "concerns": ["<concern1>", "<concern2>"]}'
+        max_tokens = 500
+
     user_prompt = f"""Evaluate this candidate against the job description.
 
 ## Job Description:
@@ -2280,7 +2341,7 @@ Past Positions: {safe_str(profile.get('past_positions', 'N/A'))}"""
 {profile_summary}
 
 Respond with ONLY valid JSON in this exact format:
-{{"score": <1-10>, "fit": "<Strong Fit|Good Fit|Partial Fit|Not a Fit>", "summary": "<2-3 sentences about the candidate>", "why": "<2-3 sentences explaining the score>", "strengths": ["<strength1>", "<strength2>"], "concerns": ["<concern1>", "<concern2>"]}}"""
+{response_format}"""
 
     try:
         response = client.chat.completions.create(
@@ -2290,7 +2351,7 @@ Respond with ONLY valid JSON in this exact format:
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.3,
-            max_tokens=500
+            max_tokens=max_tokens
         )
         elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -2348,7 +2409,7 @@ Respond with ONLY valid JSON in this exact format:
 
 def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: str,
                           extra_requirements: str = "", max_workers: int = 50,
-                          progress_placeholder=None) -> list:
+                          progress_callback=None, cancel_flag=None, mode: str = "detailed") -> list:
     """Screen multiple profiles in parallel using ThreadPoolExecutor.
 
     Args:
@@ -2357,7 +2418,8 @@ def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: 
         openai_api_key: OpenAI API key (we create client per thread for safety)
         extra_requirements: Additional screening criteria
         max_workers: Number of concurrent threads (default 50 for Tier 3)
-        progress_placeholder: Streamlit placeholder for progress updates
+        progress_callback: Function(completed, total, result) called after each profile
+        cancel_flag: Dict with 'cancelled' key to check for cancellation
 
     Returns:
         List of screening results with profile info included
@@ -2371,10 +2433,14 @@ def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: 
     tracker = get_usage_tracker()
 
     def screen_single(profile, index):
+        # Check cancellation before starting
+        if cancel_flag and cancel_flag.get('cancelled'):
+            return None
+
         # Create client per thread to avoid thread-safety issues
         client = OpenAI(api_key=openai_api_key)
         try:
-            result = screen_profile(profile, job_description, client, extra_requirements, tracker=tracker)
+            result = screen_profile(profile, job_description, client, extra_requirements, tracker=tracker, mode=mode)
             # Add profile info to result
             name = f"{profile.get('first_name', '')} {profile.get('last_name', '')}".strip()
             if not name:
@@ -2414,14 +2480,23 @@ def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: 
 
         # Collect results as they complete
         for future in as_completed(future_to_index):
+            # Check cancellation
+            if cancel_flag and cancel_flag.get('cancelled'):
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+
             try:
                 result = future.result()
-                results.append(result)
+                if result is not None:  # Skip cancelled results
+                    results.append(result)
+                    # Call progress callback
+                    if progress_callback:
+                        progress_callback(len(results), total, result)
             except Exception as e:
                 import traceback
                 idx = future_to_index[future]
                 error_msg = str(e) if str(e) else "Unknown error"
-                results.append({
+                error_result = {
                     "score": 0,
                     "fit": "Error",
                     "summary": f"Thread error: {error_msg[:80]}",
@@ -2433,7 +2508,10 @@ def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: 
                     "current_company": "",
                     "linkedin_url": "",
                     "index": idx
-                })
+                }
+                results.append(error_result)
+                if progress_callback:
+                    progress_callback(len(results), total, error_result)
 
     # Sort by original index to maintain order
     results.sort(key=lambda x: x.get('index', 0))
@@ -3335,25 +3413,37 @@ with tab_filter:
                 elif past_candidates_file:
                     filters['past_candidates_df'] = pd.read_csv(past_candidates_file)
 
-                # Blacklist
+                # Blacklist (read ALL columns)
                 if use_sheets_blacklist and filter_sheets.get('blacklist'):
                     bl_df = load_sheet_as_df(sheet_url, filter_sheets['blacklist'])
                     if bl_df is not None and len(bl_df.columns) > 0:
-                        filters['blacklist'] = bl_df.iloc[:, 0].dropna().tolist()
-                        st.info(f"Loaded {len(filters['blacklist'])} blacklist companies from Google Sheet")
+                        blacklist_items = []
+                        for col in bl_df.columns:
+                            blacklist_items.extend(bl_df[col].dropna().tolist())
+                        filters['blacklist'] = list(set(blacklist_items))  # Dedupe
+                        st.info(f"Loaded {len(filters['blacklist'])} blacklist companies from Google Sheet ({len(bl_df.columns)} columns)")
                 elif blacklist_file:
                     bl_df = pd.read_csv(blacklist_file)
-                    filters['blacklist'] = bl_df.iloc[:, 0].dropna().tolist()
+                    blacklist_items = []
+                    for col in bl_df.columns:
+                        blacklist_items.extend(bl_df[col].dropna().tolist())
+                    filters['blacklist'] = list(set(blacklist_items))
 
-                # Not relevant
+                # Not relevant (read ALL columns)
                 if use_sheets_not_relevant and filter_sheets.get('not_relevant'):
                     nr_df = load_sheet_as_df(sheet_url, filter_sheets['not_relevant'])
                     if nr_df is not None and len(nr_df.columns) > 0:
-                        filters['not_relevant'] = nr_df.iloc[:, 0].dropna().tolist()
-                        st.info(f"Loaded {len(filters['not_relevant'])} not-relevant companies from Google Sheet")
+                        not_relevant_list = []
+                        for col in nr_df.columns:
+                            not_relevant_list.extend(nr_df[col].dropna().tolist())
+                        filters['not_relevant'] = list(set(not_relevant_list))  # Dedupe
+                        st.info(f"Loaded {len(filters['not_relevant'])} not-relevant companies from Google Sheet ({len(nr_df.columns)} columns)")
                 elif not_relevant_file:
                     nr_df = pd.read_csv(not_relevant_file)
-                    filters['not_relevant'] = nr_df.iloc[:, 0].dropna().tolist()
+                    not_relevant_list = []
+                    for col in nr_df.columns:
+                        not_relevant_list.extend(nr_df[col].dropna().tolist())
+                    filters['not_relevant'] = list(set(not_relevant_list))
 
                 # Title keywords - combine presets and custom
                 all_exclude_titles = list(selected_exclude)  # From multiselect
@@ -3378,6 +3468,9 @@ with tab_filter:
             with st.spinner("Applying filters..."):
                 df = st.session_state['results_df']
                 filtered_df, stats, filtered_out = apply_pre_filters(df, filters)
+
+                # Track which filters were enabled
+                stats['_filters_enabled'] = list(filters.keys())
 
                 st.session_state['passed_candidates_df'] = filtered_df  # Store filtered results separately
                 st.session_state['results_df'] = filtered_df
@@ -3405,10 +3498,30 @@ with tab_filter:
 
         with st.expander("Detailed Breakdown"):
             st.markdown("**Filtered Out:**")
-            exclude_keys = ['original', 'final', 'total_removed', 'removed_by', 'priority_count']
+            exclude_keys = ['original', 'final', 'total_removed', 'removed_by', 'priority_count', '_filters_enabled', '_skipped_filters']
+            shown_any = False
             for key, value in stats.items():
-                if key not in exclude_keys and isinstance(value, (int, float)) and value > 0:
-                    st.text(f"  ✗ {key.replace('_', ' ').title()}: {value} removed")
+                if key not in exclude_keys and not key.startswith('_'):
+                    try:
+                        num_value = int(value)
+                        if num_value > 0:
+                            st.text(f"  ✗ {key.replace('_', ' ').title()}: {num_value} removed")
+                            shown_any = True
+                    except (TypeError, ValueError):
+                        pass
+
+            # Show skipped filters (missing columns)
+            skipped = stats.get('_skipped_filters', [])
+            if skipped:
+                st.markdown("**⚠️ Skipped Filters (missing data):**")
+                for skip_reason in skipped:
+                    st.caption(f"  - {skip_reason}")
+
+            if not shown_any and stats.get('total_removed', 0) > 0:
+                filters_enabled = stats.get('_filters_enabled', [])
+                if filters_enabled:
+                    st.caption(f"Filters enabled: {', '.join(filters_enabled)}")
+                st.caption("No individual matches found. Check column names in your data.")
 
     # View passed candidates section (only show after filtering)
     if 'filter_stats' in st.session_state and 'passed_candidates_df' in st.session_state:
@@ -3454,15 +3567,35 @@ with tab_filter:
                 return False
 
             def matches_list_in_text(text, items_list):
+                """Stricter matching for universities - avoids partial matches like
+                'Tel Aviv University' matching 'Afeka Tel Aviv College'."""
                 if pd.isna(text) or not str(text).strip():
                     return False
                 text_lower = str(text).lower()
+                text_parts = [p.strip() for p in text_lower.replace('|', ',').split(',')]
+
                 for item in items_list:
                     item_norm = str(item).lower().strip()
                     if not item_norm or len(item_norm) < 3:
                         continue
-                    if item_norm in text_lower:
-                        return True
+
+                    for text_part in text_parts:
+                        # Exact match
+                        if text_part == item_norm:
+                            return True
+                        # Text part starts with item
+                        if text_part.startswith(item_norm):
+                            return True
+                        # Item starts with text part (if substantial)
+                        if item_norm.startswith(text_part) and len(text_part) > 10:
+                            return True
+                        # Word-based matching for longer items
+                        if len(item_norm) > 8:
+                            item_words = set(item_norm.split())
+                            text_words = set(text_part.split())
+                            common = item_words & text_words
+                            if len(common) >= len(item_words) * 0.7:
+                                return True
                 return False
 
             with st.spinner("Loading priority lists..."):
@@ -3490,13 +3623,16 @@ with tab_filter:
                         passed_df['is_layoff_company'] = passed_df['current_company'].apply(lambda x: matches_list(x, alerts_list))
                         st.info(f"Layoff Alerts: {len(alerts_list)} loaded, {passed_df['is_layoff_company'].sum()} matches")
 
-                # Universities
+                # Universities (read ALL columns)
                 if filter_sheets.get('universities') and 'education' in passed_df.columns:
                     uni_df = load_sheet_as_df(sheet_url, filter_sheets['universities'])
                     if uni_df is not None and len(uni_df.columns) > 0:
-                        uni_list = uni_df.iloc[:, 0].dropna().tolist()
+                        uni_list = []
+                        for col in uni_df.columns:
+                            uni_list.extend(uni_df[col].dropna().tolist())
+                        uni_list = list(set(uni_list))  # Dedupe
                         passed_df['is_top_university'] = passed_df['education'].apply(lambda x: matches_list_in_text(x, uni_list))
-                        st.info(f"Top Universities: {len(uni_list)} loaded, {passed_df['is_top_university'].sum()} matches")
+                        st.info(f"Top Universities: {len(uni_list)} loaded ({len(uni_df.columns)} columns), {passed_df['is_top_university'].sum()} matches")
 
             # Save categorized data
             st.session_state['passed_candidates_df'] = passed_df
@@ -3785,24 +3921,27 @@ with tab_enrich:
             urls = extract_urls_from_phantombuster(results_df)
 
             if urls:
-                # Check for already enriched profiles in database
-                already_enriched = set()
-                skip_enriched = False
+                # Check for recently enriched profiles in database (within ENRICHMENT_REFRESH_MONTHS)
+                recently_enriched = set()
                 db_check_error = None
+                refresh_months = 3  # Default fallback
                 if HAS_DATABASE:
                     try:
+                        refresh_months = ENRICHMENT_REFRESH_MONTHS
                         db_client = get_supabase_client()
                         if db_client and check_connection(db_client):
-                            already_enriched = get_enriched_urls(db_client)
+                            # Only skip profiles enriched within the refresh period
+                            recently_enriched_list = get_recently_enriched_urls(db_client, months=refresh_months)
+                            recently_enriched = set(normalize_linkedin_url(u) for u in recently_enriched_list)
                     except Exception as e:
                         db_check_error = str(e)
 
-                # Filter out already enriched URLs
+                # Filter out recently enriched URLs (older ones can be re-enriched)
                 new_urls = []
                 skipped_urls = []
                 for url in urls:
                     normalized = normalize_linkedin_url(url) if HAS_DATABASE else url
-                    if normalized in already_enriched:
+                    if normalized in recently_enriched:
                         skipped_urls.append(url)
                     else:
                         new_urls.append(url)
@@ -3810,31 +3949,31 @@ with tab_enrich:
                 # Debug info
                 with st.expander("Debug: Enrichment check", expanded=False):
                     st.write(f"URLs in loaded data: {len(urls)}")
-                    st.write(f"Enriched URLs in DB: {len(already_enriched)}")
-                    st.write(f"New (not enriched): {len(new_urls)}")
-                    st.write(f"Already enriched: {len(skipped_urls)}")
+                    st.write(f"Recently enriched (< {refresh_months} months): {len(recently_enriched)}")
+                    st.write(f"New or stale (need enrichment): {len(new_urls)}")
+                    st.write(f"Skipped (fresh in DB): {len(skipped_urls)}")
                     if db_check_error:
                         st.error(f"DB check error: {db_check_error}")
-                    if already_enriched:
-                        st.write("Sample enriched URLs from DB:", list(already_enriched)[:3])
+                    if recently_enriched:
+                        st.write("Sample recently enriched URLs:", list(recently_enriched)[:3])
                     if urls:
-                        st.write("Sample URLs from loaded data (normalized):", [normalize_linkedin_url(u) for u in urls[:3]])
+                        st.write("Sample URLs from loaded data:", [normalize_linkedin_url(u) for u in urls[:3]])
 
-                # Show stats - always skip already enriched by default
+                # Show stats - skip recently enriched by default
                 if skipped_urls:
-                    st.info(f"**{len(new_urls)}** new profiles to enrich | **{len(skipped_urls)}** already enriched (skipped)")
+                    st.info(f"**{len(new_urls)}** profiles to enrich | **{len(skipped_urls)}** skipped (enriched < {refresh_months} months ago)")
                     urls_for_enrichment = new_urls
                     # Only show re-enrich option in expander if user really wants it
                     with st.expander("Re-enrich options", expanded=False):
-                        if st.checkbox("Re-enrich already-enriched profiles", value=False, key="reenrich_cb"):
+                        if st.checkbox("Re-enrich recently-enriched profiles", value=False, key="reenrich_cb"):
                             urls_for_enrichment = urls
-                            st.warning(f"Will re-enrich all {len(urls)} profiles including {len(skipped_urls)} already enriched")
+                            st.warning(f"Will re-enrich all {len(urls)} profiles including {len(skipped_urls)} recently enriched")
                 else:
-                    st.info(f"**{len(urls)}** profiles ready for enrichment")
+                    st.info(f"**{len(urls)}** profiles ready for enrichment (none found in DB < {refresh_months} months)")
                     urls_for_enrichment = urls
 
                 if not urls_for_enrichment:
-                    st.warning("All profiles have already been enriched.")
+                    st.warning(f"All profiles were enriched within the last {refresh_months} months.")
                 else:
                     col1, col2 = st.columns(2)
                     with col1:
@@ -3883,10 +4022,19 @@ with tab_enrich:
                         errors = [r for r in results if 'error' in r]
                         successful = [r for r in results if 'error' not in r]
 
+                        # Debug info
+                        st.write(f"**Debug:** Total results: {len(results)}, Successful: {len(successful)}, Errors: {len(errors)}")
+                        if errors:
+                            st.warning(f"Errors: {[e.get('error', 'unknown')[:100] for e in errors[:3]]}")
+
                         if successful:
                             # Save enriched data separately - don't overwrite original loaded data
                             st.session_state['enriched_results'] = successful
-                            st.session_state['enriched_df'] = flatten_for_csv(successful)
+                            enriched_df = flatten_for_csv(successful)
+                            st.session_state['enriched_df'] = enriched_df
+
+                            # Debug: show what was created
+                            st.write(f"**Debug:** Created enriched_df with {len(enriched_df)} rows, columns: {list(enriched_df.columns)[:10]}")
 
                             # Auto-save enrichment to Supabase database
                             db_saved = 0
@@ -3905,11 +4053,14 @@ with tab_enrich:
 
                             # Store message to show after rerun
                             db_msg = f" (DB: {db_saved} saved)" if db_saved > 0 else ""
-                            if errors:
+                            if len(enriched_df) == 0:
+                                st.error("Enrichment returned empty DataFrame. Check if profiles have valid data.")
+                            elif errors:
                                 st.session_state['enrichment_message'] = f"warning:Enriched {len(successful)} profiles{db_msg}. {len(errors)} failed: {errors[0].get('error', 'Unknown')[:150]}"
+                                st.rerun()
                             else:
                                 st.session_state['enrichment_message'] = f"success:Enriched {len(successful)} profiles successfully!{db_msg}"
-                            st.rerun()
+                                st.rerun()
                         elif errors:
                             # All failed - show error, original data stays intact
                             st.error(f"Enrichment failed for all profiles. Error: {errors[0].get('error', 'Unknown')[:200]}")
@@ -3936,11 +4087,27 @@ with tab_filter2:
     else:
         st.success(f"**{len(enriched_df)}** enriched profiles ready for filtering")
 
-        # Show available enriched columns
-        enriched_cols = [c for c in enriched_df.columns if c.startswith('job_') or c.startswith('education_') or 'skill' in c.lower()]
-        if enriched_cols:
-            with st.expander("Available enriched fields"):
-                st.write(enriched_cols[:20])
+        # Show available enriched columns and sample data for debugging
+        with st.expander("Debug: Searchable columns & sample data"):
+            search_cols = ['skills', 'all_titles', 'all_employers', 'past_positions', 'summary', 'headline']
+            available = [c for c in search_cols if c in enriched_df.columns]
+            st.write(f"**Searchable columns:** {available}")
+
+            # Show sample data from first non-empty row
+            if len(enriched_df) > 0:
+                sample_row = enriched_df.iloc[0]
+                for col in available:
+                    val = sample_row.get(col, '')
+                    if pd.notna(val) and str(val).strip():
+                        st.write(f"**{col}:** {str(val)[:200]}{'...' if len(str(val)) > 200 else ''}")
+                    else:
+                        st.write(f"**{col}:** *(empty)*")
+
+            # Count non-empty values
+            st.write("**Non-empty counts:**")
+            for col in available:
+                non_empty = (enriched_df[col].notna() & (enriched_df[col] != '')).sum()
+                st.write(f"  - {col}: {non_empty}/{len(enriched_df)} profiles")
 
         # Google Sheets filtering (same as Filter tab)
         filter_sheets = get_filter_sheets_config().copy()
@@ -4004,14 +4171,17 @@ with tab_filter2:
                                             placeholder="e.g., intern, student, freelance",
                                             help="Exclude profiles with these in job titles")
 
-        # Required skills
-        skill_col1, skill_col2 = st.columns([3, 1])
+        # Required skills/keywords
+        skill_col1, skill_col2, skill_col3 = st.columns([3, 1, 2])
         with skill_col1:
-            required_skills = st.text_input("Required skills (comma-separated)", key="f2_required_skills",
+            required_skills = st.text_input("Required keywords (comma-separated)", key="f2_required_skills",
                                            placeholder="e.g., Python, AWS, Kubernetes")
         with skill_col2:
             skills_logic = st.radio("Logic:", ["AND", "OR"], key="f2_skills_logic", horizontal=True,
-                                   help="AND = must have ALL skills, OR = must have at least ONE")
+                                   help="AND = must have ALL keywords, OR = must have at least ONE")
+        with skill_col3:
+            search_scope = st.radio("Search in:", ["Skills only", "Full experience"], key="f2_search_scope", horizontal=True,
+                                   help="Full experience = skills + titles + employers + positions")
 
         if st.button("Apply Filters", type="primary", key="apply_filters_enriched"):
             with st.spinner("Applying filters..."):
@@ -4050,10 +4220,37 @@ with tab_filter2:
                             target_unis.update(uni_df[col].dropna().str.lower().str.strip().tolist())
                         if 'all_schools' in df.columns:
                             def has_target_university(schools_str):
+                                """Check if profile attended a target university.
+                                Uses stricter matching: target must match start of school name
+                                or be a significant portion (>60%) to avoid false positives like
+                                'Tel Aviv University' matching 'Afeka Tel Aviv College'.
+                                """
                                 if pd.isna(schools_str) or not schools_str:
                                     return False
                                 schools = [s.strip().lower() for s in str(schools_str).split(',')]
-                                return any(any(target in school for target in target_unis) for school in schools)
+                                for school in schools:
+                                    for target in target_unis:
+                                        if not target:
+                                            continue
+                                        # Exact match
+                                        if school == target:
+                                            return True
+                                        # School starts with target (e.g., "technion" matches "technion - israel institute of technology")
+                                        if school.startswith(target):
+                                            return True
+                                        # Target starts with school (e.g., "tel aviv university" in target, "tel aviv uni" in school)
+                                        if target.startswith(school) and len(school) > 10:
+                                            return True
+                                        # Target is >70% of school name length and appears at start
+                                        # This catches "hebrew university" matching "hebrew university of jerusalem"
+                                        if len(target) > 8 and school.startswith(target.split()[0]) and len(target) / len(school) > 0.5:
+                                            # Check if key words match
+                                            target_words = set(target.split())
+                                            school_words = set(school.split())
+                                            common = target_words & school_words
+                                            if len(common) >= len(target_words) * 0.7:
+                                                return True
+                                return False
                             df['_target_uni'] = df['all_schools'].apply(has_target_university)
                             priority_matches = df[df['_target_uni']].index.tolist()
 
@@ -4095,23 +4292,44 @@ with tab_filter2:
                         removed['Excluded Title Keywords'] = mask.sum()
                         df = df[~mask]
 
-                # Required skills filter
+                # Required keywords filter (skills or full experience)
                 if required_skills and required_skills.strip():
                     skills_list = [s.strip().lower() for s in required_skills.split(',') if s.strip()]
-                    if skills_list and 'skills' in df.columns:
-                        def has_required_skills(skills_str):
-                            if pd.isna(skills_str) or not skills_str:
-                                return False
-                            profile_skills = str(skills_str).lower()
-                            if skills_logic == "AND":
-                                return all(skill in profile_skills for skill in skills_list)
-                            else:  # OR
-                                return any(skill in profile_skills for skill in skills_list)
-                        mask = df['skills'].apply(has_required_skills)
-                        logic_label = "all" if skills_logic == "AND" else "any"
-                        filtered_out[f'Missing Skills ({logic_label})'] = df[~mask].to_dict('records')
-                        removed[f'Missing Skills ({logic_label})'] = (~mask).sum()
-                        df = df[mask]
+                    if skills_list:
+                        # Determine which columns to search
+                        if search_scope == "Full experience":
+                            search_cols = ['skills', 'all_titles', 'all_employers', 'past_positions', 'summary', 'headline']
+                            scope_label = "experience"
+                        else:
+                            search_cols = ['skills']
+                            scope_label = "skills"
+
+                        available_search_cols = [c for c in search_cols if c in df.columns]
+
+                        if available_search_cols:
+                            def has_required_keywords(row):
+                                # Combine text from all search columns
+                                combined_text = ' '.join(
+                                    str(row[c]) for c in available_search_cols
+                                    if c in row and pd.notna(row[c])
+                                ).lower()
+
+                                if not combined_text.strip():
+                                    return False
+
+                                if skills_logic == "AND":
+                                    return all(kw in combined_text for kw in skills_list)
+                                else:  # OR
+                                    return any(kw in combined_text for kw in skills_list)
+
+                            mask = df.apply(has_required_keywords, axis=1)
+                            logic_label = "all" if skills_logic == "AND" else "any"
+                            filter_name = f'Missing Keywords in {scope_label} ({logic_label})'
+                            filtered_out[filter_name] = df[~mask].to_dict('records')
+                            removed[filter_name] = (~mask).sum()
+                            df = df[mask]
+                        else:
+                            st.warning(f"No searchable columns found. Available: {list(df.columns)}")
 
                 # Store results
                 st.session_state['passed_candidates_df'] = df.reset_index(drop=True)
@@ -4149,11 +4367,17 @@ with tab_filter2:
                 st.metric("Keep Rate", f"{pct}%")
 
             removed_by = stats.get('removed_by', {})
-            if removed_by:
-                with st.expander("Detailed Breakdown"):
-                    for reason, count in removed_by.items():
-                        if count > 0:
-                            st.text(f"  ✗ {reason}: {count} removed")
+            with st.expander("Detailed Breakdown"):
+                shown_any = False
+                for reason, count in removed_by.items():
+                    if count > 0:
+                        st.text(f"  ✗ {reason}: {count} removed")
+                        shown_any = True
+                if not shown_any:
+                    if stats.get('total_removed', 0) > 0:
+                        st.caption("No individual filter breakdown available.")
+                    else:
+                        st.caption("No profiles were filtered out.")
 
         # Show passed candidates
         st.divider()
@@ -4198,15 +4422,28 @@ with tab_filter2:
                 selected_filter = st.selectbox("Select filter to review:", filter_names, key="f2_review_filter")
                 if selected_filter:
                     filtered_profiles = filtered_out[selected_filter]
-                    st.warning(f"**{len(filtered_profiles)}** profiles removed by: {selected_filter}")
+
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.warning(f"**{len(filtered_profiles)}** profiles removed by: {selected_filter}")
+                    with col2:
+                        show_all_cols = st.checkbox("Show all columns", value=False, key="f2_filtered_show_all")
 
                     review_df = pd.DataFrame(filtered_profiles)
-                    display_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'all_employers', 'all_schools', 'skills', 'linkedin_url']
-                    available_cols = [c for c in display_cols if c in review_df.columns]
-                    st.dataframe(review_df[available_cols].head(50), use_container_width=True, hide_index=True,
-                                column_config={
-                                    "linkedin_url": st.column_config.LinkColumn("LinkedIn")
-                                })
+                    if show_all_cols:
+                        st.dataframe(review_df.head(50), use_container_width=True, hide_index=True,
+                                    column_config={
+                                        "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
+                                        "public_url": st.column_config.LinkColumn("LinkedIn")
+                                    })
+                        st.caption(f"Showing {min(50, len(review_df))} of {len(review_df)} profiles | {len(review_df.columns)} columns")
+                    else:
+                        display_cols = ['first_name', 'last_name', 'current_title', 'current_company', 'all_employers', 'all_schools', 'skills', 'linkedin_url']
+                        available_cols = [c for c in display_cols if c in review_df.columns]
+                        st.dataframe(review_df[available_cols].head(50), use_container_width=True, hide_index=True,
+                                    column_config={
+                                        "linkedin_url": st.column_config.LinkColumn("LinkedIn")
+                                    })
 
         # ===== SalesQL Email Enrichment =====
         st.divider()
@@ -4300,22 +4537,39 @@ with tab_screening:
         # Screening Configuration
         st.markdown("### Screening Configuration")
 
-        screen_count = st.number_input(
-            "Number of profiles to screen",
-            min_value=1,
-            max_value=len(profiles),
-            value=min(100, len(profiles)),
-            step=10,
-            key="screen_count"
-        )
+        col_count, col_mode = st.columns([1, 1])
+        with col_count:
+            screen_count = st.number_input(
+                "Number of profiles to screen",
+                min_value=1,
+                max_value=len(profiles),
+                value=min(100, len(profiles)),
+                step=10,
+                key="screen_count"
+            )
+        with col_mode:
+            screening_mode = st.radio(
+                "Screening mode",
+                options=["Quick (cheaper)", "Detailed"],
+                index=0,
+                key="screening_mode",
+                help="Quick: score + fit + short summary | Detailed: adds reasoning, strengths, concerns"
+            )
 
         # Fixed concurrent workers (optimal for Tier 3)
         max_workers = 50
 
-        # Cost estimate
-        est_cost = (screen_count * 2500 * 0.15 / 1_000_000) + (screen_count * 400 * 0.60 / 1_000_000)
-        est_time = (screen_count / max_workers) * 2  # ~2 seconds per batch
-        st.caption(f"Estimated: ~${est_cost:.2f} cost, ~{est_time:.0f} seconds")
+        # Cost estimate based on mode
+        if screening_mode == "Quick (cheaper)":
+            output_tokens = 50  # ~50 tokens for quick response
+            st.caption("Quick mode: Returns score, fit level, and brief summary only")
+        else:
+            output_tokens = 200  # ~200 tokens for detailed response
+            st.caption("Detailed mode: Returns full analysis with reasoning, strengths, and concerns")
+
+        est_cost = (screen_count * 2500 * 0.15 / 1_000_000) + (screen_count * output_tokens * 0.60 / 1_000_000)
+        est_time = (screen_count / 10) * 2  # ~2 seconds per batch of 10
+        st.info(f"💰 Estimated cost: **${est_cost:.3f}** | ⏱️ Time: ~{est_time:.0f}s")
 
         # Debug: Show available fields and test single profile
         with st.expander("Debug: Profile Fields & Test"):
@@ -4326,8 +4580,9 @@ with tab_screening:
                 if job_description and st.button("Test Single Profile", key="test_single"):
                     try:
                         client = OpenAI(api_key=openai_key)
-                        st.write("Testing with first profile...")
-                        result = screen_profile(profiles[0], job_description, client, extra_requirements)
+                        test_mode = 'quick' if screening_mode == "Quick (cheaper)" else 'detailed'
+                        st.write(f"Testing with first profile ({test_mode} mode)...")
+                        result = screen_profile(profiles[0], job_description, client, extra_requirements, mode=test_mode)
                         st.write("Result:", result)
                     except Exception as e:
                         import traceback
@@ -4336,57 +4591,188 @@ with tab_screening:
 
         # Screen Button
         if job_description:
-            if st.button("Start Screening", type="primary", key="start_screening", disabled='screening_in_progress' in st.session_state and st.session_state['screening_in_progress']):
-                st.session_state['screening_in_progress'] = True
+            # Initialize cancel flag in session state
+            if 'screening_cancel_flag' not in st.session_state:
+                st.session_state['screening_cancel_flag'] = {'cancelled': False}
 
+            # Check if screening is in progress (batch mode)
+            screening_in_progress = st.session_state.get('screening_batch_mode', False)
+
+            if screening_in_progress:
+                # Show cancel button and progress
+                batch_progress = st.session_state.get('screening_batch_progress', {})
+                completed = batch_progress.get('completed', 0)
+                total = batch_progress.get('total', 0)
+                pct = (completed / total * 100) if total > 0 else 0
+
+                # Progress bar
+                st.progress(completed / total if total > 0 else 0, text=f"Screening: {completed}/{total} ({pct:.0f}%)")
+
+                # Live stats from completed results
+                all_results = st.session_state.get('screening_batch_state', {}).get('results', [])
+                if all_results:
+                    strong = sum(1 for r in all_results if r.get('fit') == 'Strong Fit')
+                    good = sum(1 for r in all_results if r.get('fit') == 'Good Fit')
+                    partial = sum(1 for r in all_results if r.get('fit') == 'Partial Fit')
+                    not_fit = sum(1 for r in all_results if r.get('fit') == 'Not a Fit')
+                    st.markdown(f"🟢 Strong: **{strong}** | 🔵 Good: **{good}** | 🟡 Partial: **{partial}** | ⚪ Not Fit: **{not_fit}**")
+
+                    # Show top candidates so far
+                    with st.expander("Top candidates so far", expanded=True):
+                        top5 = sorted(all_results, key=lambda x: x.get('score', 0), reverse=True)[:5]
+                        for r in top5:
+                            score = r.get('score', 0)
+                            fit = r.get('fit', '')
+                            name = r.get('name', 'Unknown')
+                            title = r.get('current_title', '')[:40]
+                            emoji = '🟢' if fit == 'Strong Fit' else '🔵' if fit == 'Good Fit' else '🟡' if fit == 'Partial Fit' else '⚪'
+                            st.markdown(f"{emoji} **{score}/10** - {name} | {title}")
+
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    current_batch = st.session_state.get('screening_batch_state', {}).get('current_batch', 0) + 1
+                    st.caption(f"Processing batch {current_batch}... Click Cancel to stop and keep completed results.")
+                with col2:
+                    if st.button("⏹ Cancel", type="secondary", key="cancel_screening"):
+                        # Save partial results before cancelling
+                        partial_results = st.session_state.get('screening_batch_state', {}).get('results', [])
+                        if partial_results:
+                            st.session_state['screening_results'] = partial_results
+                            # Save partial results to DB
+                            if HAS_DATABASE:
+                                try:
+                                    db_client = get_supabase_client()
+                                    if db_client and check_connection(db_client):
+                                        for result in partial_results:
+                                            linkedin_url = result.get('linkedin_url') or result.get('public_url')
+                                            if linkedin_url and result.get('fit') != 'Error':
+                                                update_profile_screening(
+                                                    db_client, linkedin_url,
+                                                    score=result.get('score', 0),
+                                                    fit_level=result.get('fit', ''),
+                                                    summary=result.get('summary', ''),
+                                                    reasoning=result.get('reasoning', '')
+                                                )
+                                except:
+                                    pass
+                        st.session_state['screening_cancelled'] = True
+                        st.session_state['screening_batch_mode'] = False
+                        st.warning(f"Screening cancelled! {len(partial_results)} profiles were completed and saved.")
+                        st.rerun()
+
+            # Show existing results warning and clear option
+            existing_results = st.session_state.get('screening_results', [])
+            if existing_results and not screening_in_progress:
+                st.warning(f"⚠️ You have **{len(existing_results)}** previously screened profiles. Starting new screening will replace these results.")
+                col_start, col_clear = st.columns([2, 1])
+                with col_start:
+                    start_button = st.button("🔄 Start New Screening", type="primary", key="start_screening")
+                with col_clear:
+                    if st.button("🗑️ Clear Results", key="clear_screening_results"):
+                        st.session_state['screening_results'] = []
+                        st.session_state['screening_batch_state'] = {}
+                        st.success("Results cleared!")
+                        st.rerun()
+            else:
+                start_disabled = screening_in_progress
+                start_button = st.button("Start Screening", type="primary", key="start_screening", disabled=start_disabled)
+
+            # Continue batch processing if in progress
+            if screening_in_progress and not st.session_state.get('screening_cancelled', False):
+                # Get batch state
+                batch_state = st.session_state.get('screening_batch_state', {})
+                profiles_to_screen = batch_state.get('profiles', [])
+                job_desc = batch_state.get('job_description', '')
+                extra_req = batch_state.get('extra_requirements', '')
+                screen_mode = batch_state.get('mode', 'detailed')
+                batch_size = 10  # Process 10 at a time for responsive cancellation
+                current_batch = batch_state.get('current_batch', 0)
+                all_results = batch_state.get('results', [])
+
+                start_idx = current_batch * batch_size
+                end_idx = min(start_idx + batch_size, len(profiles_to_screen))
+                batch_profiles = profiles_to_screen[start_idx:end_idx]
+
+                if batch_profiles:
+                    with st.status(f"Processing batch {current_batch + 1} ({screen_mode} mode)...", expanded=True) as status:
+                        # Screen this batch
+                        batch_results = screen_profiles_batch(
+                            batch_profiles,
+                            job_desc,
+                            openai_key,
+                            extra_requirements=extra_req,
+                            max_workers=min(10, len(batch_profiles)),
+                            mode=screen_mode
+                        )
+                        all_results.extend(batch_results)
+
+                        # Update progress
+                        st.session_state['screening_batch_state']['results'] = all_results
+                        st.session_state['screening_batch_state']['current_batch'] = current_batch + 1
+                        st.session_state['screening_batch_progress'] = {
+                            'completed': len(all_results),
+                            'total': len(profiles_to_screen)
+                        }
+
+                        # Show batch stats
+                        strong = sum(1 for r in batch_results if r.get('fit') == 'Strong Fit')
+                        good = sum(1 for r in batch_results if r.get('fit') == 'Good Fit')
+                        status.update(label=f"Batch {current_batch + 1}: +{strong} strong, +{good} good", state="complete")
+
+                    # Check if more batches
+                    if end_idx < len(profiles_to_screen):
+                        time.sleep(0.5)  # Brief pause
+                        st.rerun()  # Continue with next batch
+                    else:
+                        # All done - finalize
+                        st.session_state['screening_batch_mode'] = False
+                        st.session_state['screening_results'] = all_results
+
+                        # Save to DB
+                        db_saved = 0
+                        if HAS_DATABASE:
+                            try:
+                                db_client = get_supabase_client()
+                                if db_client and check_connection(db_client):
+                                    for result in all_results:
+                                        linkedin_url = result.get('linkedin_url') or result.get('public_url')
+                                        if linkedin_url and result.get('fit') != 'Error':
+                                            update_profile_screening(
+                                                db_client, linkedin_url,
+                                                score=result.get('score', 0),
+                                                fit_level=result.get('fit', ''),
+                                                summary=result.get('summary', ''),
+                                                reasoning=result.get('reasoning', '')
+                                            )
+                                            db_saved += 1
+                            except:
+                                pass
+
+                        db_msg = f" ({db_saved} saved to DB)" if db_saved > 0 else ""
+                        st.success(f"✅ Screening complete! {len(all_results)} profiles{db_msg}")
+                        send_notification("Screening Complete", f"Screened {len(all_results)} profiles")
+                        st.rerun()
+
+            if start_button:
+                # Initialize batch screening mode
                 profiles_to_screen = profiles[:screen_count]
 
-                # Progress tracking
-                status_text = st.empty()
-                status_text.info(f"Screening {len(profiles_to_screen)} profiles... This may take a minute.")
-                start_time = time.time()
+                st.session_state['screening_batch_mode'] = True
+                st.session_state['screening_cancelled'] = False
+                st.session_state['screening_batch_state'] = {
+                    'profiles': profiles_to_screen,
+                    'job_description': job_description,
+                    'extra_requirements': extra_requirements if extra_requirements else "",
+                    'mode': 'quick' if screening_mode == "Quick (cheaper)" else 'detailed',
+                    'current_batch': 0,
+                    'results': []
+                }
+                st.session_state['screening_batch_progress'] = {
+                    'completed': 0,
+                    'total': len(profiles_to_screen)
+                }
 
-                # Run batch screening (pass API key, not client)
-                screening_results = screen_profiles_batch(
-                    profiles_to_screen,
-                    job_description,
-                    openai_key,
-                    extra_requirements=extra_requirements if extra_requirements else "",
-                    max_workers=max_workers
-                )
-
-                # Complete
-                elapsed = time.time() - start_time
-
-                # Auto-save screening results to Supabase database
-                db_saved = 0
-                if HAS_DATABASE:
-                    try:
-                        db_client = get_supabase_client()
-                        if db_client and check_connection(db_client):
-                            for result in screening_results:
-                                linkedin_url = result.get('linkedin_url') or result.get('public_url')
-                                if linkedin_url and 'error' not in result:
-                                    update_profile_screening(
-                                        db_client,
-                                        linkedin_url,
-                                        score=result.get('score', 0),
-                                        fit_level=result.get('fit', ''),
-                                        summary=result.get('summary', ''),
-                                        reasoning=result.get('reasoning', '')
-                                    )
-                                    db_saved += 1
-                    except Exception as e:
-                        pass  # Don't interrupt flow for DB errors
-
-                db_msg = f" (DB: {db_saved} saved)" if db_saved > 0 else ""
-                status_text.success(f"Completed {len(screening_results)} profiles in {elapsed:.1f}s{db_msg}")
-
-                st.session_state['screening_results'] = screening_results
-                st.session_state['screening_in_progress'] = False
-
-                # Send notification
-                send_notification("Screening Complete", f"Screened {len(screening_results)} profiles")
+                st.info(f"Starting screening of {len(profiles_to_screen)} profiles in batches of 10...")
                 st.rerun()
         else:
             st.warning("Please paste a job description to start screening")
@@ -4422,38 +4808,62 @@ with tab_screening:
             filtered_results = [r for r in screening_results if r.get('fit') in fit_filter]
             sorted_results = sorted(filtered_results, key=lambda x: x.get('score', 0), reverse=True)
 
-            st.info(f"Showing **{len(sorted_results)}** of {len(screening_results)} screened profiles")
+            col_info, col_toggle = st.columns([3, 1])
+            with col_info:
+                st.info(f"Showing **{len(sorted_results)}** of {len(screening_results)} screened profiles")
+            with col_toggle:
+                show_all_cols = st.checkbox("Show all columns", value=False, key="screening_show_all_cols")
 
             # Create display dataframe
-            display_data = []
-            for r in sorted_results:
-                display_data.append({
-                    'Score': r.get('score', 0),
-                    'Fit': r.get('fit', ''),
-                    'Name': r.get('name', ''),
-                    'Title': r.get('current_title', '')[:40],
-                    'Company': r.get('current_company', '')[:30],
-                    'Summary': r.get('summary', '')[:100],
-                    'LinkedIn': r.get('linkedin_url', '')
-                })
+            if show_all_cols:
+                # Show all available data
+                df_display = pd.DataFrame(sorted_results)
+                # Reorder columns to put important ones first
+                priority_cols = ['score', 'fit', 'name', 'current_title', 'current_company', 'summary', 'why', 'strengths', 'concerns', 'linkedin_url']
+                ordered_cols = [c for c in priority_cols if c in df_display.columns]
+                other_cols = [c for c in df_display.columns if c not in priority_cols]
+                df_display = df_display[ordered_cols + other_cols]
 
-            df_display = pd.DataFrame(display_data)
+                st.dataframe(
+                    df_display,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "score": st.column_config.NumberColumn("Score", format="%d/10"),
+                        "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
+                    }
+                )
+                st.caption(f"Showing {len(df_display.columns)} columns")
+            else:
+                # Show summary view
+                display_data = []
+                for r in sorted_results:
+                    display_data.append({
+                        'Score': r.get('score', 0),
+                        'Fit': r.get('fit', ''),
+                        'Name': r.get('name', ''),
+                        'Title': r.get('current_title', '')[:40],
+                        'Company': r.get('current_company', '')[:30],
+                        'Summary': r.get('summary', '')[:100],
+                        'LinkedIn': r.get('linkedin_url', '')
+                    })
 
-            # Display table
-            st.dataframe(
-                df_display,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Score": st.column_config.NumberColumn("Score", format="%d/10", width="small"),
-                    "Fit": st.column_config.TextColumn("Fit", width="medium"),
-                    "Name": st.column_config.TextColumn("Name", width="medium"),
-                    "Title": st.column_config.TextColumn("Title", width="medium"),
-                    "Company": st.column_config.TextColumn("Company", width="medium"),
-                    "Summary": st.column_config.TextColumn("Summary", width="large"),
-                    "LinkedIn": st.column_config.LinkColumn("LinkedIn", width="small")
-                }
-            )
+                df_display = pd.DataFrame(display_data)
+
+                st.dataframe(
+                    df_display,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Score": st.column_config.NumberColumn("Score", format="%d/10", width="small"),
+                        "Fit": st.column_config.TextColumn("Fit", width="medium"),
+                        "Name": st.column_config.TextColumn("Name", width="medium"),
+                        "Title": st.column_config.TextColumn("Title", width="medium"),
+                        "Company": st.column_config.TextColumn("Company", width="medium"),
+                        "Summary": st.column_config.TextColumn("Summary", width="large"),
+                        "LinkedIn": st.column_config.LinkColumn("LinkedIn", width="small")
+                    }
+                )
 
             # ===== SalesQL Email Enrichment =====
             st.markdown("### Email Enrichment (SalesQL)")
