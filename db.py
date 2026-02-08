@@ -572,7 +572,7 @@ def save_setting(client: SupabaseClient, key: str, value: str) -> bool:
 # ============================================================================
 
 def get_search_history(client: SupabaseClient, agent_id: str = None) -> list:
-    """Get search history from database.
+    """Get search history from the search_history table.
 
     Args:
         client: SupabaseClient instance
@@ -582,20 +582,13 @@ def get_search_history(client: SupabaseClient, agent_id: str = None) -> list:
         List of search history entries, most recent first
     """
     try:
-        history_json = get_setting(client, 'search_history')
-        if not history_json:
-            return []
-
-        history = json.loads(history_json)
-
-        # Filter by agent_id if provided (convert to string for comparison)
+        params = {'select': '*', 'order': 'launched_at.desc'}
         if agent_id:
-            agent_id_str = str(agent_id)
-            history = [h for h in history if str(h.get('agent_id', '')) == agent_id_str]
-
-        # Sort by launched_at descending (most recent first)
-        history.sort(key=lambda x: x.get('launched_at', ''), reverse=True)
-        return history
+            params['agent_id'] = f'eq.{agent_id}'
+        url = f"{client.url}/rest/v1/search_history"
+        response = requests.get(url, headers=client.headers, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json() if response.text else []
     except Exception as e:
         print(f"[DB] Failed to get search history: {e}")
         return []
@@ -604,7 +597,7 @@ def get_search_history(client: SupabaseClient, agent_id: str = None) -> list:
 def save_search_history_entry(client: SupabaseClient, agent_id: str, csv_name: str,
                                search_url: str = None, profiles_requested: int = None,
                                search_name: str = None) -> bool:
-    """Save a search entry to database history.
+    """Save a search entry to the search_history table.
 
     Args:
         client: SupabaseClient instance
@@ -618,33 +611,24 @@ def save_search_history_entry(client: SupabaseClient, agent_id: str, csv_name: s
         True if saved successfully
     """
     try:
-        # Load existing history
-        history_json = get_setting(client, 'search_history')
-        history = json.loads(history_json) if history_json else []
-
-        # Add new entry (skip search_url - it's too long and not needed for UI)
-        entry = {
+        data = {
             'agent_id': str(agent_id),
             'csv_name': csv_name,
             'launched_at': datetime.utcnow().strftime('%Y-%m-%d %H:%M'),
             'profiles_requested': profiles_requested,
             'search_name': search_name,
         }
-        history.append(entry)
-
-        # Keep only last 50 entries to avoid bloat
-        if len(history) > 50:
-            history = history[-50:]
-
-        # Save back
-        return save_setting(client, 'search_history', json.dumps(history))
+        # Remove None values
+        data = {k: v for k, v in data.items() if v is not None}
+        client.insert('search_history', data)
+        return True
     except Exception as e:
         print(f"[DB] Failed to save search history: {e}")
         return False
 
 
 def delete_search_history_entry(client: SupabaseClient, agent_id: str, csv_name: str) -> bool:
-    """Delete a search entry from database history.
+    """Delete a search entry from the search_history table.
 
     Args:
         client: SupabaseClient instance
@@ -655,22 +639,8 @@ def delete_search_history_entry(client: SupabaseClient, agent_id: str, csv_name:
         True if deleted successfully
     """
     try:
-        history_json = get_setting(client, 'search_history')
-        if not history_json:
-            return False
-
-        history = json.loads(history_json)
-        agent_id_str = str(agent_id)
-
-        # Filter out the entry to delete
-        original_len = len(history)
-        history = [h for h in history if not (str(h.get('agent_id', '')) == agent_id_str and h.get('csv_name') == csv_name)]
-
-        if len(history) == original_len:
-            return False  # Entry not found
-
-        # Save back
-        return save_setting(client, 'search_history', json.dumps(history))
+        client.delete('search_history', {'agent_id': str(agent_id), 'csv_name': csv_name})
+        return True
     except Exception as e:
         print(f"[DB] Failed to delete search history entry: {e}")
         return False
