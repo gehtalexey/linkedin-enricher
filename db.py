@@ -539,6 +539,35 @@ def get_usage_by_date(client: SupabaseClient, days: int = 30) -> list:
 
 
 # ============================================================================
+# SETTINGS (key-value store for shared config like system prompts)
+# ============================================================================
+
+def get_setting(client: SupabaseClient, key: str) -> Optional[str]:
+    """Get a setting value by key from the settings table."""
+    try:
+        result = client.select('settings', 'value', {'key': f'eq.{key}'}, limit=1)
+        if result:
+            return result[0].get('value')
+    except Exception as e:
+        print(f"[DB] Failed to get setting '{key}': {e}")
+    return None
+
+
+def save_setting(client: SupabaseClient, key: str, value: str) -> bool:
+    """Save a setting value. Creates or updates."""
+    try:
+        client.upsert('settings', {
+            'key': key,
+            'value': value,
+            'updated_at': datetime.utcnow().isoformat(),
+        }, on_conflict='key')
+        return True
+    except Exception as e:
+        print(f"[DB] Failed to save setting '{key}': {e}")
+        return False
+
+
+# ============================================================================
 # BACKWARDS COMPATIBILITY - Deprecated functions
 # ============================================================================
 

@@ -53,6 +53,7 @@ try:
         get_pipeline_stats, get_profiles_by_fit_level, get_all_linkedin_urls,
         get_dedup_stats, profiles_to_dataframe, get_usage_summary, get_usage_logs,
         get_usage_by_date, get_enriched_urls, get_recently_enriched_urls,
+        get_setting, save_setting,
         ENRICHMENT_REFRESH_MONTHS,
     )
     from pb_dedup import filter_results_against_database, update_phantombuster_with_skip_list, get_skip_list_from_database
@@ -2339,8 +2340,8 @@ def apply_pre_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, di
     return df, stats, filtered_out
 
 
-# Screening system prompt based on the /screen skill
-SCREENING_SYSTEM_PROMPT = """You are an expert senior technical recruiter with 15+ years of experience hiring for top tech companies.
+# Default screening system prompt (used as fallback if Supabase setting is missing)
+DEFAULT_SCREENING_PROMPT = """You are an expert senior technical recruiter with 15+ years of experience hiring for top tech companies.
 
 ## Scoring Rubric
 - **9-10**: Exceptional match. Meets all requirements with bonus qualifications. Rare.
@@ -2377,6 +2378,20 @@ Give higher scores when candidate has:
 2. **Use Evidence**: Reference specific profile data (years, skills, companies).
 3. **Be Calibrated**: A 10/10 should be rare. Most good candidates are 6-8.
 4. **Company > Skills**: Strong company pedigree compensates for skill list gaps."""
+
+
+def get_screening_prompt() -> str:
+    """Load screening system prompt from Supabase. Falls back to default."""
+    if HAS_DATABASE:
+        try:
+            db_client = get_supabase_client()
+            if db_client:
+                prompt = get_setting(db_client, 'screening_system_prompt')
+                if prompt:
+                    return prompt
+        except Exception:
+            pass
+    return DEFAULT_SCREENING_PROMPT
 
 
 def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_requirements: str = "", tracker: 'UsageTracker' = None, mode: str = "detailed") -> dict:
@@ -2445,7 +2460,7 @@ Respond with ONLY valid JSON in this exact format:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": SCREENING_SYSTEM_PROMPT},
+                {"role": "system", "content": get_screening_prompt()},
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.3,
@@ -4662,6 +4677,39 @@ with tab_screening:
                 key="extra_requirements",
                 placeholder="e.g., Must have AWS experience, Hebrew speaker preferred, etc."
             )
+
+        # System Prompt Editor
+        with st.expander("System Prompt (shared across all users)"):
+            current_prompt = get_screening_prompt()
+            edited_prompt = st.text_area(
+                "Edit the AI screening instructions",
+                value=current_prompt,
+                height=300,
+                key="screening_prompt_editor",
+            )
+            col_save_prompt, col_reset_prompt = st.columns(2)
+            with col_save_prompt:
+                if st.button("Save Prompt", key="save_prompt_btn"):
+                    if HAS_DATABASE:
+                        db_client = get_supabase_client()
+                        if db_client and save_setting(db_client, 'screening_system_prompt', edited_prompt):
+                            st.success("Prompt saved to database")
+                            st.rerun()
+                        else:
+                            st.error("Failed to save — check Supabase connection")
+                    else:
+                        st.error("Supabase not connected")
+            with col_reset_prompt:
+                if st.button("Reset to Default", key="reset_prompt_btn"):
+                    if HAS_DATABASE:
+                        db_client = get_supabase_client()
+                        if db_client and save_setting(db_client, 'screening_system_prompt', DEFAULT_SCREENING_PROMPT):
+                            st.success("Prompt reset to default")
+                            st.rerun()
+                        else:
+                            st.error("Failed to reset — check Supabase connection")
+                    else:
+                        st.error("Supabase not connected")
 
         # Screening Configuration
         st.markdown("### Screening Configuration")
