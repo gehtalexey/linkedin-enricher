@@ -1,5 +1,5 @@
 """
-LinkedIn Profile Enricher Dashboard
+SourcingX Dashboard
 Run with: streamlit run dashboard.py
 """
 
@@ -115,7 +115,7 @@ def get_auth_config():
 
 # Page config
 st.set_page_config(
-    page_title="LinkedIn Enricher",
+    page_title="SourcingX",
     page_icon="🔍",
     layout="wide"
 )
@@ -230,6 +230,28 @@ def load_config():
     if config_path.exists():
         with open(config_path, 'r') as f:
             config = json.load(f)
+
+    # Local: if google_credentials_file is specified, load the JSON file into google_credentials
+    if config.get('google_credentials_file') and not config.get('google_credentials'):
+        gc_path = Path(__file__).parent / config['google_credentials_file']
+        if gc_path.exists():
+            with open(gc_path, 'r') as f:
+                config['google_credentials'] = json.load(f)
+
+    # Local: map google_sheets URLs to filter_sheets config if filter_sheets not set
+    if config.get('google_sheets') and not config.get('filter_sheets'):
+        gs = config['google_sheets']
+        # All sheets share the same spreadsheet URL - extract from any entry
+        first_url = next(iter(gs.values()), '')
+        config['filter_sheets'] = {
+            'url': first_url,
+            'target_companies': 'Target Companies',
+            'not_relevant': 'NotRelevant Companies',
+            'blacklist': 'Blacklist',
+            'past_candidates': 'Past Candidates',
+            'layoff_companies': 'Layoff Companies',
+            'universities': 'Universities',
+        }
 
     # Override with Streamlit secrets if available (cloud deployment)
     try:
@@ -739,10 +761,14 @@ def fetch_phantombuster_result_csv(api_key: str, agent_id: str, debug: bool = Fa
 
         # Method 0: Try direct PhantomBuster cache URL (most reliable for files)
         if s3_folder and org_s3_folder:
-            # If specific filename provided, try it first
+            # If specific filename provided, try it and common PB variants (e.g. database- prefix)
             files_to_try = []
             if filename:
-                files_to_try = [f'{filename}.csv', f'{filename}.json']
+                files_to_try = [
+                    f'{filename}.csv', f'{filename}.json',
+                    f'database-{filename}.csv', f'database-{filename}.json',
+                    'result.csv', 'result.json',
+                ]
             else:
                 files_to_try = ['result.csv', 'result.json']
 
@@ -825,9 +851,13 @@ def fetch_phantombuster_result_csv(api_key: str, agent_id: str, debug: bool = Fa
         # Try common file patterns - Sales Navigator Export uses these
         possible_files = []
 
-        # If specific filename provided, ONLY try that file (strict mode)
+        # If specific filename provided, try it first with common PB variants, then fallbacks
         if filename:
-            possible_files = [f'{filename}.csv', f'{filename}.json']
+            possible_files = [
+                f'{filename}.csv', f'{filename}.json',
+                f'database-{filename}.csv', f'database-{filename}.json',
+                'result.csv', 'result.json',
+            ]
         else:
             # Add agent name-based files (Sales Navigator Export pattern)
             if agent_name and agent_name != 'Unknown':
@@ -1238,72 +1268,122 @@ def list_phantombuster_files(api_key: str, agent_id: str) -> list[dict]:
         agent_data = agent_response.json()
         s3_folder = agent_data.get('s3Folder')
         org_s3_folder = agent_data.get('orgS3Folder')
+        agent_name = agent_data.get('name', '')
 
         files = []
+        seen_names = set()
+
+        def add_file(name, size=0, last_modified=''):
+            if name not in seen_names:
+                seen_names.add(name)
+                files.append({
+                    'name': name,
+                    'size': size,
+                    'lastModified': last_modified,
+                })
 
         # Try to list files from agent's fileMgmt if available
         file_mgmt = agent_data.get('fileMgmt', {})
         if file_mgmt:
             for filename, info in file_mgmt.items():
-                files.append({
-                    'name': filename,
-                    'size': info.get('size', 0),
-                    'lastModified': info.get('lastModified', ''),
-                })
+                if isinstance(info, dict):
+                    add_file(filename, info.get('size', 0), info.get('lastModified', ''))
+                else:
+                    add_file(filename)
 
-        # Also try common file patterns via store API
-        common_files = [
-            'result.csv', 'result.json',
+        # Check lastSaveFolder for output files
+        last_save = agent_data.get('lastSaveFolder')
+        if last_save:
+            add_file(f'{last_save}.csv')
+            add_file(f'{last_save}.json')
+
+        # Build list of files to check via cache URL (fastest method)
+        files_to_check = ['result.csv', 'result.json']
+
+        # Add agent name patterns
+        if agent_name:
+            files_to_check.extend([
+                f'{agent_name}.csv',
+                f'{agent_name}.json',
+                f'database-{agent_name}.csv',
+            ])
+
+        # Add common Sales Navigator patterns
+        files_to_check.extend([
             'database-linkedin-sales-navigator-search-export.csv',
             'database-sales-navigator-search-export.csv',
-        ]
+            'database-Sales Navigator Search Export.csv',
+        ])
 
-        # Add timestamped patterns (recent dates)
-        from datetime import datetime, timedelta
-        for i in range(30):  # Check last 30 days
-            date = datetime.now() - timedelta(days=i)
-            date_str = date.strftime('%Y-%m-%d')
-            common_files.append(f'result_{date_str}.csv')
-            common_files.append(f'search_{date_str}.csv')
-
-        for fname in common_files:
-            try:
-                check_response = requests.head(
-                    'https://api.phantombuster.com/api/v2/store/fetch',
-                    params={'id': agent_id, 'name': fname},
-                    headers={'X-Phantombuster-Key': api_key},
-                    timeout=5
-                )
-                if check_response.status_code == 200:
-                    # File exists, add if not already in list
-                    if not any(f['name'] == fname for f in files):
-                        files.append({
-                            'name': fname,
-                            'size': int(check_response.headers.get('content-length', 0)),
-                            'lastModified': check_response.headers.get('last-modified', ''),
-                        })
-            except:
-                pass
-
-        # Try cache URL listing if we have S3 info
+        # Check via cache URL (Store API doesn't work for these files)
         if s3_folder and org_s3_folder:
-            try:
-                cache_base = f'https://cache1.phantombooster.com/{org_s3_folder}/{s3_folder}/'
-                # Check for result files
-                for fname in ['result.csv', 'result.json']:
-                    try:
-                        check = requests.head(cache_base + fname, timeout=5)
-                        if check.status_code == 200:
-                            if not any(f['name'] == fname for f in files):
-                                files.append({
-                                    'name': fname,
-                                    'size': int(check.headers.get('content-length', 0)),
-                                    'lastModified': check.headers.get('last-modified', ''),
-                                })
-                    except:
-                        pass
-            except:
-                pass
+            cache_base = f'https://cache1.phantombooster.com/{org_s3_folder}/{s3_folder}/'
+            for fname in files_to_check:
+                if fname in seen_names:
+                    continue
+                try:
+                    cache_response = requests.head(cache_base + fname, timeout=5)
+                    if cache_response.status_code == 200:
+                        add_file(
+                            fname,
+                            int(cache_response.headers.get('content-length', 0)),
+                            cache_response.headers.get('last-modified', '')
+                        )
+                except:
+                    pass
+
+        # Also add files from local search history for this agent
+        try:
+            local_history = load_search_history(agent_id=agent_id)
+            for h in local_history:
+                csv_name = h.get('csv_name')
+                if csv_name:
+                    fname = f'{csv_name}.csv'
+                    if fname not in seen_names and s3_folder and org_s3_folder:
+                        # Verify file exists via cache URL (use GET, not HEAD - HEAD returns 403)
+                        try:
+                            cache_url = f'https://cache1.phantombooster.com/{org_s3_folder}/{s3_folder}/{fname}'
+                            check = requests.get(cache_url, timeout=5, stream=True)
+                            if check.status_code == 200:
+                                add_file(
+                                    fname,
+                                    int(check.headers.get('content-length', 0)),
+                                    h.get('launched_at', '')
+                                )
+                            check.close()
+                        except:
+                            pass
+        except:
+            pass
+
+
+        # Get recent container outputs (shows files from recent runs)
+        try:
+            containers_response = requests.get(
+                'https://api.phantombuster.com/api/v2/containers/fetch-all',
+                params={'agentId': agent_id},
+                headers={'X-Phantombuster-Key': api_key},
+                timeout=15
+            )
+            if containers_response.status_code == 200:
+                containers = containers_response.json()
+                for container in containers[:10]:  # Check last 10 runs
+                    # Check for output files in container
+                    output_files = container.get('outputFiles', [])
+                    for of in output_files:
+                        if isinstance(of, str) and of.endswith('.csv'):
+                            add_file(of)
+                    # Also check resultObject filename
+                    result_obj = container.get('resultObject')
+                    if result_obj and isinstance(result_obj, str):
+                        try:
+                            # Sometimes resultObject contains the filename
+                            if result_obj.endswith('.csv') or result_obj.endswith('.json'):
+                                add_file(result_obj)
+                        except:
+                            pass
+        except:
+            pass
 
         return files
     except Exception as e:
@@ -1702,7 +1782,7 @@ def get_gspread_client():
         'https://www.googleapis.com/auth/drive.readonly'
     ]
 
-    # Try using credentials from Streamlit secrets (cloud deployment)
+    # Try using credentials dict (from Streamlit secrets, config.json, or loaded from credentials file)
     if config.get('google_credentials'):
         from google.oauth2.service_account import Credentials as SACredentials
         creds = SACredentials.from_service_account_info(config['google_credentials'], scopes=scopes)
@@ -1756,7 +1836,7 @@ def send_notification(title, message):
             notification.notify(
                 title=title,
                 message=message,
-                app_name="LinkedIn Enricher",
+                app_name="SourcingX",
                 timeout=10
             )
     except Exception:
@@ -2303,6 +2383,22 @@ def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_re
     Args:
         mode: "quick" for cheaper/faster (score + fit + summary) or "detailed" for full analysis
     """
+    # Validate profile has minimum useful data before calling OpenAI
+    name = f"{profile.get('first_name', '')} {profile.get('last_name', '')}".strip()
+    title = profile.get('current_title', '') or profile.get('headline', '')
+    company = profile.get('current_company', '')
+    has_useful_data = bool(name and (title or company or profile.get('skills') or profile.get('past_positions') or profile.get('summary')))
+
+    if not has_useful_data:
+        return {
+            "score": 0,
+            "fit": "Skipped",
+            "summary": "Insufficient profile data - skipped to save API credits",
+            "why": f"Profile missing key fields. Available: {[k for k, v in profile.items() if v]}",
+            "strengths": [],
+            "concerns": []
+        }
+
     start_time = time.time()
 
     # Build concise profile summary for the prompt (with safe string conversion)
@@ -2317,7 +2413,7 @@ def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_re
 Title: {safe_str(profile.get('current_title', profile.get('headline', 'N/A')))}
 Company: {safe_str(profile.get('current_company', 'N/A'))}
 Location: {safe_str(profile.get('location', 'N/A'))}
-Education: {safe_str(profile.get('education', 'N/A'))}
+Education: {safe_str(profile.get('education', profile.get('all_schools', 'N/A')))}
 Skills: {safe_str(profile.get('skills', 'N/A'))}
 Summary: {safe_str(profile.get('summary', 'N/A'))}
 Past Positions: {safe_str(profile.get('past_positions', 'N/A'))}"""
@@ -2518,8 +2614,29 @@ def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: 
     return results
 
 
+# ===== Sidebar: API Connection Status =====
+with st.sidebar:
+    config = load_config()
+    _api_status = {
+        'Crustdata': bool(config.get('api_key')),
+        'OpenAI': bool(config.get('openai_api_key')),
+        'PhantomBuster': bool(config.get('phantombuster_api_key')),
+        'SalesQL': bool(config.get('salesql_api_key')),
+        'Google Sheets': bool(config.get('google_credentials')),
+        'Supabase': bool(HAS_DATABASE and (config.get('supabase_url') or (hasattr(st, 'secrets') and 'supabase_url' in st.secrets))),
+    }
+    _missing = [name for name, ok in _api_status.items() if not ok]
+    if _missing:
+        st.warning(f"Missing keys: {', '.join(_missing)}")
+    else:
+        st.success("All APIs connected")
+    with st.expander("API Status", expanded=bool(_missing)):
+        for name, ok in _api_status.items():
+            st.markdown(f"{'🟢' if ok else '🔴'} **{name}**")
+    st.divider()
+
 # Main UI
-st.title("LinkedIn Profile Enricher")
+st.title("SourcingX")
 
 # Check API keys
 api_key = load_api_key()
@@ -2922,8 +3039,6 @@ with tab_upload:
                                         st.rerun()
                                     else:
                                         st.error("No results found. File may have been deleted from PhantomBuster.")
-                else:
-                    st.info("No search history found. Launch a search below to get started.")
         else:
             st.warning("No phantoms found in your PhantomBuster account")
 
@@ -3013,7 +3128,7 @@ with tab_upload:
                             notification.notify(
                                 title="PhantomBuster Finished",
                                 message=msg,
-                                app_name="LinkedIn Enricher",
+                                app_name="SourcingX",
                                 timeout=10
                             )
                         # Windows sound
@@ -3034,7 +3149,7 @@ with tab_upload:
                             notification.notify(
                                 title="PhantomBuster Error",
                                 message=status_result.get('exitMessage', 'Phantom failed'),
-                                app_name="LinkedIn Enricher",
+                                app_name="SourcingX",
                                 timeout=10
                             )
                         if HAS_WINSOUND:
@@ -3260,12 +3375,22 @@ with tab_filter:
             key="user_sheet_input"
         )
 
-        # Save to session state
+        # Save to session state and set default tab names
         if user_sheet_url:
             st.session_state['user_sheet_url'] = user_sheet_url
             filter_sheets['url'] = user_sheet_url
+            # Set default tab names if not already configured
+            if not filter_sheets.get('past_candidates'):
+                filter_sheets['past_candidates'] = 'Past Candidates'
+            if not filter_sheets.get('blacklist'):
+                filter_sheets['blacklist'] = 'Blacklist'
+            if not filter_sheets.get('not_relevant'):
+                filter_sheets['not_relevant'] = 'NotRelevant Companies'
 
         has_sheets = bool(filter_sheets.get('url')) and gspread_client is not None
+
+        if filter_sheets.get('url') and gspread_client is None:
+            st.error("Google credentials not configured. Cannot connect to Google Sheets.")
 
         if has_sheets:
             # Try to fetch and display sheet name
@@ -3842,7 +3967,9 @@ with tab_enrich:
         else:
             st.info(msg)
 
-    if not has_crust_key:
+    if not HAS_DATABASE:
+        st.error("Supabase is not connected. Enrichment is disabled because results won't be saved. Check your supabase_url and supabase_key in secrets.")
+    elif not has_crust_key:
         st.warning("Crust Data API key not configured. Add 'api_key' to config.json")
     elif 'results' not in st.session_state or not st.session_state['results']:
         st.info("Load profiles first (tab 1). Filtering (tab 2) is optional.")
@@ -3987,7 +4114,7 @@ with tab_enrich:
                     with col2:
                         batch_size = st.slider("Batch size", min_value=1, max_value=25, value=10, key="enrich_batch")
 
-                    st.caption("Each profile costs 1 Crust Data credit")
+                    st.caption("Each profile costs 3 Crustdata credits")
 
                     if st.button("Start Enrichment", type="primary", key="start_enrich_tab"):
                         urls_to_process = urls_for_enrichment[:max_profiles]
@@ -4717,7 +4844,16 @@ with tab_screening:
                         # Show batch stats
                         strong = sum(1 for r in batch_results if r.get('fit') == 'Strong Fit')
                         good = sum(1 for r in batch_results if r.get('fit') == 'Good Fit')
+                        errors_in_batch = sum(1 for r in batch_results if r.get('fit') in ('Error', 'Skipped'))
                         status.update(label=f"Batch {current_batch + 1}: +{strong} strong, +{good} good", state="complete")
+
+                    # Abort early if entire batch failed (API key issue, quota, etc.)
+                    if errors_in_batch == len(batch_results) and current_batch == 0:
+                        st.session_state['screening_batch_mode'] = False
+                        st.session_state['screening_results'] = all_results
+                        error_sample = batch_results[0].get('summary', '') if batch_results else 'Unknown'
+                        st.error(f"All profiles in first batch failed. Stopping to save credits.\n\nError: {error_sample}")
+                        st.rerun()
 
                     # Check if more batches
                     if end_idx < len(profiles_to_screen):
@@ -4754,6 +4890,24 @@ with tab_screening:
                         st.rerun()
 
             if start_button:
+                # Validate OpenAI API key before starting
+                try:
+                    test_client = OpenAI(api_key=openai_key)
+                    test_response = test_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": "Say OK"}],
+                        max_tokens=3
+                    )
+                except Exception as e:
+                    error_msg = str(e)
+                    if '401' in error_msg or 'Incorrect API key' in error_msg:
+                        st.error(f"Invalid OpenAI API key. Please check your key in config.json or Streamlit secrets.\n\nError: {error_msg[:200]}")
+                    elif '429' in error_msg:
+                        st.error(f"OpenAI rate limit or quota exceeded. Check your billing at platform.openai.com.\n\nError: {error_msg[:200]}")
+                    else:
+                        st.error(f"OpenAI connection failed: {error_msg[:200]}")
+                    st.stop()
+
                 # Initialize batch screening mode
                 profiles_to_screen = profiles[:screen_count]
 
@@ -4816,12 +4970,23 @@ with tab_screening:
 
             # Create display dataframe
             if show_all_cols:
-                # Show all available data
+                # Show all screening + enriched data merged
                 df_display = pd.DataFrame(sorted_results)
+
+                # Merge with enriched profile data if available
+                enriched_df_merge = st.session_state.get('enriched_df')
+                if enriched_df_merge is not None and not enriched_df_merge.empty and 'linkedin_url' in df_display.columns:
+                    merge_cols = [c for c in enriched_df_merge.columns if c not in df_display.columns]
+                    if merge_cols and 'linkedin_url' in enriched_df_merge.columns:
+                        df_display = df_display.merge(
+                            enriched_df_merge[['linkedin_url'] + merge_cols],
+                            on='linkedin_url', how='left'
+                        )
+
                 # Reorder columns to put important ones first
-                priority_cols = ['score', 'fit', 'name', 'current_title', 'current_company', 'summary', 'why', 'strengths', 'concerns', 'linkedin_url']
+                priority_cols = ['score', 'fit', 'name', 'current_title', 'current_company', 'summary', 'why', 'strengths', 'concerns', 'skills', 'all_employers', 'all_titles', 'all_schools', 'location', 'linkedin_url']
                 ordered_cols = [c for c in priority_cols if c in df_display.columns]
-                other_cols = [c for c in df_display.columns if c not in priority_cols]
+                other_cols = [c for c in df_display.columns if c not in priority_cols and c != 'index']
                 df_display = df_display[ordered_cols + other_cols]
 
                 st.dataframe(
@@ -4879,7 +5044,7 @@ with tab_screening:
                     horizontal=True
                 )
 
-                if candidate_source == "Priority (Strong Fit + Good Fit)":
+                if candidate_source == "Priority (Strong Fit + Good Fit)" and 'fit' in screening_df.columns:
                     enrich_df = screening_df[screening_df['fit'].isin(['Strong Fit', 'Good Fit'])].copy()
                     st.caption(f"Priority candidates: {len(enrich_df)} (Strong Fit + Good Fit)")
                 else:
@@ -4997,8 +5162,15 @@ with tab_database:
                 # Connection successful - show stats
                 st.success("Connected to Supabase")
 
-                # Pipeline stats
-                stats = get_pipeline_stats(db_client)
+                # Pipeline stats - count directly from profiles table
+                stats = {}
+                try:
+                    total = db_client.count('profiles')
+                    enriched = db_client.count('profiles', {'enriched_at': 'not.is.null'})
+                    screened = db_client.count('profiles', {'screening_score': 'not.is.null'})
+                    stats = {'total': total, 'enriched': enriched, 'screened': screened, 'scraped': total, 'contacted': 0, 'stale_profiles': 0}
+                except Exception as e:
+                    st.warning(f"Could not load stats: {e}")
                 if stats:
                     st.markdown("#### Pipeline Overview")
                     stat_cols = st.columns(6)
@@ -5155,7 +5327,7 @@ with tab_usage:
                     st.metric(
                         "Crustdata",
                         f"{int(crustdata.get('credits', 0)):,} credits",
-                        help="1 credit per profile enriched"
+                        help="3 credits per profile enriched"
                     )
                     st.caption(f"{crustdata.get('requests', 0)} requests")
 

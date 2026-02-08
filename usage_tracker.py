@@ -108,13 +108,13 @@ class UsageTracker:
     ) -> Optional[dict]:
         """Log Crustdata enrichment usage.
 
-        Crustdata charges 1 credit per profile enriched.
+        Crustdata charges 3 credits per profile enriched.
         """
         return self.log_usage(
             provider='crustdata',
             operation='enrich',
             request_count=1,
-            credits_used=profiles_enriched,  # 1 credit per profile
+            credits_used=profiles_enriched * 3,  # 3 credits per profile
             status=status,
             error_message=error_message,
             response_time_ms=response_time_ms,

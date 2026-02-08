@@ -1,6 +1,7 @@
 # API keys - DO NOT COMMIT
 config.json
 google_credentials.json
+google-service-account.json
 *.json.backup
 .streamlit/secrets.toml
 
