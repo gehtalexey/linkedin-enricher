@@ -224,6 +224,7 @@ with st.sidebar:
     st.divider()
 
 # Load API keys
+@st.cache_data(ttl=60)
 def load_config():
     """Load config from config.json or Streamlit secrets (for cloud deployment)."""
     config = {}
@@ -370,16 +371,27 @@ def clear_session_file():
     return False
 
 
-def get_usage_tracker():
-    """Get a UsageTracker instance with database connection."""
-    if not HAS_USAGE_TRACKER or not HAS_DATABASE:
+@st.cache_resource(ttl=300)
+def _get_db_client():
+    """Cached Supabase client (reused across reruns)."""
+    if not HAS_DATABASE:
         return None
     try:
-        db_client = get_supabase_client()
-        if db_client and check_connection(db_client):
-            return UsageTracker(db_client)
+        client = get_supabase_client()
+        if client and check_connection(client):
+            return client
     except Exception:
         pass
+    return None
+
+
+def get_usage_tracker():
+    """Get a UsageTracker instance with database connection."""
+    if not HAS_USAGE_TRACKER:
+        return None
+    client = _get_db_client()
+    if client:
+        return UsageTracker(client)
     return None
 
 
@@ -1776,6 +1788,7 @@ def extract_urls_from_phantombuster(df: pd.DataFrame) -> list[str]:
     return normalized
 
 
+@st.cache_resource(ttl=300)
 def get_gspread_client():
     """Get authenticated gspread client using service account."""
     config = load_config()
@@ -2384,7 +2397,7 @@ def get_screening_prompt() -> str:
     """Load screening system prompt from Supabase. Falls back to default."""
     if HAS_DATABASE:
         try:
-            db_client = get_supabase_client()
+            db_client = _get_db_client()
             if db_client:
                 prompt = get_setting(db_client, 'screening_system_prompt')
                 if prompt:
@@ -2697,8 +2710,8 @@ with tab_upload:
             # Database restore
             if HAS_DATABASE:
                 try:
-                    db_client = get_supabase_client()
-                    if db_client and check_connection(db_client):
+                    db_client = _get_db_client()
+                    if db_client:
                         from db import get_profiles_by_status
                         enriched_count = db_client.count('profiles', {'status': 'eq.enriched'})
                         screened_count = db_client.count('profiles', {'status': 'eq.screened'})
@@ -3290,8 +3303,8 @@ with tab_upload:
             # Database deduplication info
             if HAS_DATABASE:
                 try:
-                    db_client = get_supabase_client()
-                    if db_client and check_connection(db_client):
+                    db_client = _get_db_client()
+                    if db_client:
                         dedup_stats = get_dedup_stats(db_client)
                         if dedup_stats.get('total_profiles', 0) > 0:
                             st.info(f"Database: **{dedup_stats.get('total_profiles', 0)}** profiles stored, **{dedup_stats.get('recently_enriched', 0)}** recently enriched")
@@ -4072,8 +4085,8 @@ with tab_enrich:
                 if HAS_DATABASE:
                     try:
                         refresh_months = ENRICHMENT_REFRESH_MONTHS
-                        db_client = get_supabase_client()
-                        if db_client and check_connection(db_client):
+                        db_client = _get_db_client()
+                        if db_client:
                             # Only skip profiles enriched within the refresh period
                             recently_enriched_list = get_recently_enriched_urls(db_client, months=refresh_months)
                             recently_enriched = set(normalize_linkedin_url(u) for u in recently_enriched_list)
@@ -4184,8 +4197,8 @@ with tab_enrich:
                             db_saved = 0
                             if HAS_DATABASE:
                                 try:
-                                    db_client = get_supabase_client()
-                                    if db_client and check_connection(db_client):
+                                    db_client = _get_db_client()
+                                    if db_client:
                                         for profile in successful:
                                             # Use linkedin_flagship_url (clean format) from Crustdata
                                             linkedin_url = profile.get('linkedin_flagship_url') or profile.get('linkedin_profile_url') or profile.get('linkedin_url')
@@ -4703,7 +4716,7 @@ with tab_screening:
                 with col_save_prompt:
                     if st.button("Save Prompt", key="save_prompt_btn"):
                         if HAS_DATABASE:
-                            db_client = get_supabase_client()
+                            db_client = _get_db_client()
                             if db_client and save_setting(db_client, 'screening_system_prompt', edited_prompt):
                                 st.success("Prompt saved to database")
                                 st.rerun()
@@ -4714,7 +4727,7 @@ with tab_screening:
                 with col_reset_prompt:
                     if st.button("Reset to Default", key="reset_prompt_btn"):
                         if HAS_DATABASE:
-                            db_client = get_supabase_client()
+                            db_client = _get_db_client()
                             if db_client and save_setting(db_client, 'screening_system_prompt', DEFAULT_SCREENING_PROMPT):
                                 st.success("Prompt reset to default")
                                 st.rerun()
@@ -4830,8 +4843,8 @@ with tab_screening:
                             # Save partial results to DB
                             if HAS_DATABASE:
                                 try:
-                                    db_client = get_supabase_client()
-                                    if db_client and check_connection(db_client):
+                                    db_client = _get_db_client()
+                                    if db_client:
                                         for result in partial_results:
                                             linkedin_url = result.get('linkedin_url') or result.get('public_url')
                                             if linkedin_url and result.get('fit') != 'Error':
@@ -4930,8 +4943,8 @@ with tab_screening:
                         db_saved = 0
                         if HAS_DATABASE:
                             try:
-                                db_client = get_supabase_client()
-                                if db_client and check_connection(db_client):
+                                db_client = _get_db_client()
+                                if db_client:
                                     for result in all_results:
                                         linkedin_url = result.get('linkedin_url') or result.get('public_url')
                                         if linkedin_url and result.get('fit') != 'Error':
@@ -5215,7 +5228,7 @@ with tab_database:
         st.warning("Database module not available. Check db.py import.")
     else:
         try:
-            db_client = get_supabase_client()
+            db_client = _get_db_client()
             if not db_client:
                 st.warning("Supabase not configured. Add 'supabase_url' and 'supabase_key' to secrets.")
             elif not check_connection(db_client):
@@ -5359,7 +5372,7 @@ with tab_usage:
         st.warning("Database module not available. Usage tracking requires Supabase.")
     else:
         try:
-            db_client = get_supabase_client()
+            db_client = _get_db_client()
             if not db_client:
                 st.warning("Supabase not configured. Add 'supabase_url' and 'supabase_key' to secrets.")
             elif not check_connection(db_client):
