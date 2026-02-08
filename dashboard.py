@@ -2747,8 +2747,16 @@ with tab_upload:
                     db_client = _get_db_client()
                     if db_client:
                         from db import get_profiles_by_status
-                        enriched_count = db_client.count('profiles', {'status': 'eq.enriched'})
-                        screened_count = db_client.count('profiles', {'status': 'eq.screened'})
+
+                        @st.cache_data(ttl=120)
+                        def _get_db_restore_counts():
+                            c = _get_db_client()
+                            return (
+                                c.count('profiles', {'status': 'eq.enriched'}),
+                                c.count('profiles', {'status': 'eq.screened'}),
+                            )
+
+                        enriched_count, screened_count = _get_db_restore_counts()
 
                         if enriched_count > 0 or screened_count > 0:
                             st.markdown("**From Database**")
@@ -2967,8 +2975,12 @@ with tab_upload:
             selected_agent = next((a for a in agents if a['name'] == selected_agent_name), None)
 
             if selected_agent:
-                # Load search history for this agent
-                search_history = load_search_history(agent_id=selected_agent['id'])
+                # Load search history for this agent (cached to avoid DB call on every rerun)
+                @st.cache_data(ttl=60)
+                def _load_search_history_cached(agent_id):
+                    return load_search_history(agent_id=agent_id)
+
+                search_history = _load_search_history_cached(agent_id=selected_agent['id'])
 
                 if search_history:
                     # Build dropdown options from history (most recent first)
@@ -3026,6 +3038,7 @@ with tab_upload:
                                     )
                                     st.session_state['pb_confirm_delete'] = None
                                     if success:
+                                        _load_search_history_cached.clear()
                                         st.success(f"Deleted {csv_to_delete}")
                                         st.rerun()
                                     else:
@@ -3394,6 +3407,8 @@ with tab_upload:
                                 profiles_requested=2500,
                                 search_name=search_name if search_name else None
                             )
+                            # Clear cached search history so new entry shows up
+                            _load_search_history_cached.clear()
                     else:
                         st.session_state['pb_launch_status'] = 'error'
                         st.session_state['pb_launch_error'] = result.get('error', 'Unknown error')
