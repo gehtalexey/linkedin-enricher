@@ -622,20 +622,19 @@ def save_search_history_entry(client: SupabaseClient, agent_id: str, csv_name: s
         history_json = get_setting(client, 'search_history')
         history = json.loads(history_json) if history_json else []
 
-        # Add new entry
+        # Add new entry (skip search_url - it's too long and not needed for UI)
         entry = {
             'agent_id': str(agent_id),
             'csv_name': csv_name,
             'launched_at': datetime.utcnow().strftime('%Y-%m-%d %H:%M'),
-            'search_url': search_url,
             'profiles_requested': profiles_requested,
             'search_name': search_name,
         }
         history.append(entry)
 
-        # Keep only last 100 entries to avoid bloat
-        if len(history) > 100:
-            history = history[-100:]
+        # Keep only last 50 entries to avoid bloat
+        if len(history) > 50:
+            history = history[-50:]
 
         # Save back
         return save_setting(client, 'search_history', json.dumps(history))
