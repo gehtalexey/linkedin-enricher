@@ -144,42 +144,44 @@ if auth_config and HAS_AUTHENTICATOR:
             st.write(f"Welcome, **{st.session_state.get('name', 'User')}**")
             authenticator.logout("Logout", "sidebar")
 
-# Professional UI styling
+# Dark theme UI styling (StockPeers-inspired)
 st.markdown("""
 <style>
-    /* Professional tab styling */
+    /* Tab styling */
     .stTabs [data-baseweb="tab-list"] {
         gap: 8px;
-        background-color: #F0F2F5;
+        background-color: #0f172b;
         padding: 0.5rem;
         border-radius: 8px;
     }
     .stTabs [data-baseweb="tab"] {
-        background-color: white;
+        background-color: #1d293d;
         border-radius: 6px;
         padding: 0.5rem 1rem;
-        font-weight: 500;
+        font-weight: 400;
+        border: 1px solid #314158;
     }
     .stTabs [aria-selected="true"] {
-        background-color: #0077B5 !important;
-        color: white !important;
+        background-color: #615fff !important;
+        color: #e2e8f0 !important;
+        border-color: #615fff !important;
     }
 
     /* Title styling */
-    h1 { color: #0077B5; border-bottom: 3px solid #0077B5; padding-bottom: 0.5rem; }
+    h1 { color: #615fff; border-bottom: 2px solid #314158; padding-bottom: 0.5rem; }
 
     /* Metric cards */
-    [data-testid="stMetricValue"] { font-size: 2rem; color: #0077B5; }
+    [data-testid="stMetricValue"] { font-size: 2rem; color: #615fff; }
 
     /* Buttons */
     .stButton > button[kind="primary"] {
-        background-color: #0077B5;
+        background-color: #615fff;
         border-radius: 24px;
         font-weight: 600;
     }
 
     /* Sidebar */
-    [data-testid="stSidebar"] { background-color: #F8F9FA; }
+    [data-testid="stSidebar"] { background-color: #0f172b; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -5381,7 +5383,7 @@ with tab_usage:
                             y=df_daily['crustdata'],
                             mode='lines+markers',
                             name='Crustdata (credits)',
-                            line=dict(color='#0077B5')
+                            line=dict(color='#615fff')
                         ))
 
                         fig_line.add_trace(go.Scatter(
@@ -5389,7 +5391,7 @@ with tab_usage:
                             y=df_daily['salesql'],
                             mode='lines+markers',
                             name='SalesQL (lookups)',
-                            line=dict(color='#00A0DC')
+                            line=dict(color='#38bdf8')
                         ))
 
                         fig_line.add_trace(go.Scatter(
@@ -5397,7 +5399,7 @@ with tab_usage:
                             y=df_daily['phantombuster'],
                             mode='lines+markers',
                             name='PhantomBuster (runs)',
-                            line=dict(color='#6B5B95')
+                            line=dict(color='#a78bfa')
                         ))
 
                         fig_line.update_layout(
@@ -5406,7 +5408,10 @@ with tab_usage:
                             yaxis_title='Count',
                             hovermode='x unified',
                             legend=dict(orientation='h', yanchor='bottom', y=1.02),
-                            height=350
+                            height=350,
+                            paper_bgcolor='rgba(0,0,0,0)',
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            font=dict(color='#e2e8f0'),
                         )
 
                         st.plotly_chart(fig_line, use_container_width=True)
@@ -5420,8 +5425,8 @@ with tab_usage:
                                 title='OpenAI Cost by Day ($)',
                                 labels={'openai': 'Cost (USD)', 'date': 'Date'}
                             )
-                            fig_cost.update_traces(fill='tozeroy', line_color='#10A37F')
-                            fig_cost.update_layout(height=250)
+                            fig_cost.update_traces(fill='tozeroy', line_color='#34d399')
+                            fig_cost.update_layout(height=250, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='#e2e8f0'))
                             st.plotly_chart(fig_cost, use_container_width=True)
 
                     else:
@@ -5441,9 +5446,9 @@ with tab_usage:
                             values='Cost',
                             names='Provider',
                             title='Cost Distribution (USD)',
-                            color_discrete_sequence=['#10A37F', '#0077B5', '#00A0DC', '#6B5B95']
+                            color_discrete_sequence=['#34d399', '#615fff', '#38bdf8', '#a78bfa']
                         )
-                        fig_pie.update_layout(height=300)
+                        fig_pie.update_layout(height=300, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='#e2e8f0'))
                         st.plotly_chart(fig_pie, use_container_width=True)
                     else:
                         st.info("No cost data to display")
