@@ -197,6 +197,9 @@ def normalize_linkedin_url(url: str) -> Optional[str]:
     if '?' in url:
         url = url.split('?')[0]
 
+    # Normalize www prefix - always use www.linkedin.com
+    url = url.replace('://linkedin.com', '://www.linkedin.com')
+
     # Remove trailing slashes
     url = url.rstrip('/')
 
