@@ -4745,7 +4745,7 @@ with tab_screening:
             )
 
         # System Prompt Editor (admin only — also shown when auth is off for local dev)
-        ADMIN_NAMES = {'alexey', 'dana'}
+        ADMIN_NAMES = {'alexey', 'dana', 'admin'}
         current_user = st.session_state.get('username', '').lower()
         is_admin = (
             not authenticator  # no auth = local dev, always show
