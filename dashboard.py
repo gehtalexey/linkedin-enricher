@@ -4678,38 +4678,41 @@ with tab_screening:
                 placeholder="e.g., Must have AWS experience, Hebrew speaker preferred, etc."
             )
 
-        # System Prompt Editor
-        with st.expander("System Prompt (shared across all users)"):
-            current_prompt = get_screening_prompt()
-            edited_prompt = st.text_area(
-                "Edit the AI screening instructions",
-                value=current_prompt,
-                height=300,
-                key="screening_prompt_editor",
-            )
-            col_save_prompt, col_reset_prompt = st.columns(2)
-            with col_save_prompt:
-                if st.button("Save Prompt", key="save_prompt_btn"):
-                    if HAS_DATABASE:
-                        db_client = get_supabase_client()
-                        if db_client and save_setting(db_client, 'screening_system_prompt', edited_prompt):
-                            st.success("Prompt saved to database")
-                            st.rerun()
+        # System Prompt Editor (admin only)
+        ADMIN_USERS = {'alexey', 'dana'}
+        current_user = st.session_state.get('username', '').lower()
+        if current_user in ADMIN_USERS:
+            with st.expander("System Prompt (admin only)"):
+                current_prompt = get_screening_prompt()
+                edited_prompt = st.text_area(
+                    "Edit the AI screening instructions",
+                    value=current_prompt,
+                    height=300,
+                    key="screening_prompt_editor",
+                )
+                col_save_prompt, col_reset_prompt = st.columns(2)
+                with col_save_prompt:
+                    if st.button("Save Prompt", key="save_prompt_btn"):
+                        if HAS_DATABASE:
+                            db_client = get_supabase_client()
+                            if db_client and save_setting(db_client, 'screening_system_prompt', edited_prompt):
+                                st.success("Prompt saved to database")
+                                st.rerun()
+                            else:
+                                st.error("Failed to save — check Supabase connection")
                         else:
-                            st.error("Failed to save — check Supabase connection")
-                    else:
-                        st.error("Supabase not connected")
-            with col_reset_prompt:
-                if st.button("Reset to Default", key="reset_prompt_btn"):
-                    if HAS_DATABASE:
-                        db_client = get_supabase_client()
-                        if db_client and save_setting(db_client, 'screening_system_prompt', DEFAULT_SCREENING_PROMPT):
-                            st.success("Prompt reset to default")
-                            st.rerun()
+                            st.error("Supabase not connected")
+                with col_reset_prompt:
+                    if st.button("Reset to Default", key="reset_prompt_btn"):
+                        if HAS_DATABASE:
+                            db_client = get_supabase_client()
+                            if db_client and save_setting(db_client, 'screening_system_prompt', DEFAULT_SCREENING_PROMPT):
+                                st.success("Prompt reset to default")
+                                st.rerun()
+                            else:
+                                st.error("Failed to reset — check Supabase connection")
                         else:
-                            st.error("Failed to reset — check Supabase connection")
-                    else:
-                        st.error("Supabase not connected")
+                            st.error("Supabase not connected")
 
         # Screening Configuration
         st.markdown("### Screening Configuration")
