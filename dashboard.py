@@ -55,6 +55,8 @@ try:
         get_usage_by_date, get_enriched_urls, get_recently_enriched_urls,
         get_setting, save_setting,
         get_search_history, save_search_history_entry, delete_search_history_entry,
+        get_screening_prompts, get_screening_prompt_by_role, get_default_screening_prompt,
+        save_screening_prompt, delete_screening_prompt, match_prompt_by_keywords,
         ENRICHMENT_REFRESH_MONTHS,
     )
     from pb_dedup import filter_results_against_database, update_phantombuster_with_skip_list, get_skip_list_from_database
@@ -195,29 +197,20 @@ with st.sidebar:
         if st.button("Save", key="sidebar_save_session", help="Save session to restore after refresh"):
             from pathlib import Path
             SESSION_FILE = Path(__file__).parent / '.last_session.json'
-            # Quick inline save
-            try:
-                session_data = {}
-                for key in ['results', 'results_df', 'enriched_results', 'enriched_df', 'screening_results', 'passed_candidates_df']:
-                    if key in st.session_state and st.session_state[key] is not None:
-                        value = st.session_state[key]
-                        if isinstance(value, pd.DataFrame):
-                            session_data[key] = {'_type': 'dataframe', 'data': value.to_dict('records')}
-                        else:
-                            session_data[key] = {'_type': 'list', 'data': value}
-                if session_data:
-                    with open(SESSION_FILE, 'w') as f:
-                        json.dump(session_data, f)
-                    st.success("Saved!")
-            except Exception as e:
-                st.error(f"Failed: {e}")
+            # Quick inline save - use the full save function
+            if save_session_state():
+                st.success("Saved!")
+            else:
+                st.error("Failed to save")
     with col_clear:
         if st.button("Clear", key="sidebar_clear_session", help="Clear saved session"):
             from pathlib import Path
             SESSION_FILE = Path(__file__).parent / '.last_session.json'
             if SESSION_FILE.exists():
                 SESSION_FILE.unlink()
-            for key in ['results', 'results_df', 'enriched_results', 'enriched_df', 'screening_results', 'passed_candidates_df']:
+            for key in ['results', 'results_df', 'enriched_results', 'enriched_df', 'screening_results',
+                        'passed_candidates_df', 'filter_stats', 'f2_filter_stats', 'original_results_df',
+                        'active_screening_prompt', 'active_screening_role', 'jd_screening', 'extra_requirements']:
                 if key in st.session_state:
                     del st.session_state[key]
             st.success("Cleared!")
@@ -308,6 +301,30 @@ def load_salesql_key():
 # ===== Session Persistence =====
 SESSION_FILE = Path(__file__).parent / '.last_session.json'
 
+def _clean_for_json(obj):
+    """Recursively clean data for JSON serialization (handle NaN, numpy types, etc.)."""
+    import math
+    import numpy as np
+    if isinstance(obj, dict):
+        return {str(k): _clean_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_clean_for_json(v) for v in obj]
+    elif isinstance(obj, (np.integer,)):
+        return int(obj)
+    elif isinstance(obj, (np.floating,)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return _clean_for_json(obj.tolist())
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif pd.isna(obj):
+        return None
+    return obj
+
 def save_session_state():
     """Save current session state to a local file for persistence across refreshes."""
     try:
@@ -315,20 +332,26 @@ def save_session_state():
         keys_to_save = [
             'results', 'results_df', 'enriched_results', 'enriched_df',
             'screening_results', 'filtered_results', 'passed_candidates_df',
-            'filter_stats', 'last_load_count', 'last_load_file'
+            'filter_stats', 'f2_filter_stats', 'last_load_count', 'last_load_file',
+            'user_sheet_url', 'original_results_df',
+            'active_screening_prompt', 'active_screening_role',
+            'jd_screening', 'extra_requirements'
         ]
         for key in keys_to_save:
             if key in st.session_state and st.session_state[key] is not None:
                 value = st.session_state[key]
                 # Convert DataFrames to dict for JSON serialization
                 if isinstance(value, pd.DataFrame):
-                    session_data[key] = {'_type': 'dataframe', 'data': value.to_dict('records')}
+                    # Replace NaN with None for JSON compatibility
+                    clean_df = value.where(pd.notnull(value), None)
+                    data = _clean_for_json(clean_df.to_dict('records'))
+                    session_data[key] = {'_type': 'dataframe', 'data': data}
                 elif isinstance(value, list):
-                    session_data[key] = {'_type': 'list', 'data': value}
+                    session_data[key] = {'_type': 'list', 'data': _clean_for_json(value)}
                 elif isinstance(value, dict):
-                    session_data[key] = {'_type': 'dict', 'data': value}
+                    session_data[key] = {'_type': 'dict', 'data': _clean_for_json(value)}
                 else:
-                    session_data[key] = {'_type': 'value', 'data': value}
+                    session_data[key] = {'_type': 'value', 'data': _clean_for_json(value)}
 
         if session_data:
             with open(SESSION_FILE, 'w') as f:
@@ -1789,6 +1812,10 @@ def normalize_uploaded_csv(df: pd.DataFrame) -> pd.DataFrame:
             if 'linkedin.com' in url and '/in/' in url:
                 # Remove query params
                 url = url.split('?')[0].rstrip('/')
+                # Filter out encoded URLs (ACwAAA... format - internal LinkedIn IDs)
+                username_part = url.split('/in/')[-1]
+                if username_part.startswith('ACw') or username_part.startswith('Acw'):
+                    return None  # Encoded URL, not usable
                 return url
             return None
         df['linkedin_url'] = df['linkedin_url'].apply(clean_linkedin_url)
@@ -1796,6 +1823,19 @@ def normalize_uploaded_csv(df: pd.DataFrame) -> pd.DataFrame:
     # Create public_url as alias for linkedin_url (for display compatibility)
     if 'linkedin_url' in df.columns and 'public_url' not in df.columns:
         df['public_url'] = df['linkedin_url']
+
+    # Filter out profiles without valid LinkedIn URLs
+    original_count = len(df)
+    skipped_no_url = 0
+    skipped_encoded = 0
+    if 'linkedin_url' in df.columns:
+        # Count encoded URLs before filtering (they were set to None by clean_linkedin_url)
+        # We need to re-check the original data to count encoded vs no URL
+        df = df[df['linkedin_url'].notna()].reset_index(drop=True)
+    skipped_count = original_count - len(df)
+
+    # Store skipped count for display
+    df.attrs['_skipped_no_url'] = skipped_count
 
     return df
 
@@ -1941,6 +1981,79 @@ def enrich_batch(urls: list[str], api_key: str, tracker: 'UsageTracker' = None) 
     batch_str = ','.join(urls)
     start_time = time.time()
 
+    # Build mapping from username to original URL for matching results back
+    def extract_username(url):
+        """Extract username from LinkedIn URL (part after /in/)"""
+        if '/in/' in str(url).lower():
+            username = str(url).lower().split('/in/')[-1].rstrip('/').split('?')[0]
+            return username
+        return None
+
+    def get_base_username(username):
+        """Remove numeric ID suffix from username (e.g., john-doe-12345 -> john-doe)"""
+        if '-' in username:
+            parts = username.rsplit('-', 1)
+            suffix = parts[-1]
+            # Only strip if it's clearly an ID:
+            # - All digits (12345)
+            # - Mostly digits with a few letters (a1234, 1234a, but not regular names)
+            if suffix.isdigit():
+                return parts[0]
+            # Check if it's alphanumeric with majority digits (likely an ID like "a12345")
+            if len(suffix) >= 5 and suffix.isalnum():
+                digit_count = sum(1 for c in suffix if c.isdigit())
+                if digit_count >= len(suffix) * 0.5:  # At least 50% digits
+                    return parts[0]
+        return username
+
+    def get_reversed_name(username):
+        """Reverse name order (first-last -> last-first) for matching different formats."""
+        base = get_base_username(username)
+        if '-' in base:
+            parts = base.split('-')
+            if len(parts) == 2:
+                return f"{parts[1]}-{parts[0]}"
+        return None
+
+    def get_normalized_name(username):
+        """Remove all hyphens to create a normalized version for fuzzy matching."""
+        base = get_base_username(username)
+        return base.replace('-', '') if base else None
+
+    original_url_map = {}
+    normalized_url_map = {}  # Hyphen-free versions for fuzzy matching
+    failed_extracts = []
+    for url in urls:
+        username = extract_username(url)
+        if username:
+            # Map full username
+            original_url_map[username] = url
+            # Also map base username (without ID suffix)
+            base = get_base_username(username)
+            if base != username:
+                original_url_map[base] = url
+            # Also map reversed name order (first-last -> last-first)
+            reversed_name = get_reversed_name(username)
+            if reversed_name and reversed_name not in original_url_map:
+                original_url_map[reversed_name] = url
+            # Also map hyphen-free version for fuzzy matching (adaya-o-neill -> adayaoneill)
+            normalized = get_normalized_name(username)
+            if normalized:
+                normalized_url_map[normalized] = url
+        else:
+            failed_extracts.append(url[:80] if len(str(url)) > 80 else url)
+
+    # Debug: store mapping info in session state for UI display
+    import streamlit as st
+    st.session_state['_enrich_debug'] = {
+        'input_urls': len(urls),
+        'map_keys': len(original_url_map),
+        'failed_extract': len(failed_extracts),
+        'sample_inputs': [str(u)[:60] for u in urls],  # Show all inputs
+        'all_map_keys': list(original_url_map.keys()),  # Show all keys
+        'failed_samples': failed_extracts[:3] if failed_extracts else []
+    }
+
     try:
         response = requests.get(
             'https://api.crustdata.com/screener/person/enrich',
@@ -1953,6 +2066,63 @@ def enrich_batch(urls: list[str], api_key: str, tracker: 'UsageTracker' = None) 
         if response.status_code == 200:
             data = response.json()
             result = data if isinstance(data, list) else [data]
+
+            # Inject original_url into each result by matching username
+            # Use linkedin_flagship_url (canonical) for matching, not linkedin_url (encoded)
+            unmatched = []
+            for item in result:
+                if isinstance(item, dict) and 'error' not in item:
+                    result_url = item.get('linkedin_flagship_url') or item.get('linkedin_url', '')
+                    result_username = extract_username(result_url)
+                    matched = False
+                    if result_username:
+                        # Try exact match first
+                        if result_username in original_url_map:
+                            item['_original_url'] = original_url_map[result_username]
+                            matched = True
+                        else:
+                            # Try base username (without suffix) - handles input URLs with ID suffixes
+                            base = get_base_username(result_username)
+                            if base in original_url_map:
+                                item['_original_url'] = original_url_map[base]
+                                matched = True
+                            else:
+                                # Try hyphen-free matching (handles o-neill vs oneill)
+                                normalized = get_normalized_name(result_username)
+                                if normalized and normalized in normalized_url_map:
+                                    item['_original_url'] = normalized_url_map[normalized]
+                                    matched = True
+                                else:
+                                    # Also try matching result username against base versions in the map
+                                    for map_key, map_url in original_url_map.items():
+                                        if get_base_username(map_key) == result_username:
+                                            item['_original_url'] = map_url
+                                            matched = True
+                                            break
+
+                    if not matched:
+                        unmatched.append(result_username or 'NO_USERNAME')
+
+            # Debug: show matching stats
+            matched_count = sum(1 for item in result if isinstance(item, dict) and item.get('_original_url'))
+
+            # Store matching debug in session state
+            match_debug = {
+                'results': len(result),
+                'matched': matched_count,
+                'unmatched_count': len(unmatched),
+                'unmatched_samples': unmatched[:5],
+                'map_keys_sample': list(original_url_map.keys())[:10],
+                'result_samples': []
+            }
+            for i, item in enumerate(result[:5]):
+                if isinstance(item, dict):
+                    match_debug['result_samples'].append({
+                        'flagship': (item.get('linkedin_flagship_url') or 'N/A')[:50],
+                        'matched': '_original_url' in item,
+                        'original_url': (item.get('_original_url') or 'N/A')[:50] if item.get('_original_url') else None
+                    })
+            st.session_state['_enrich_match_debug'] = match_debug
 
             # Log successful usage
             if tracker:
@@ -2387,65 +2557,675 @@ def apply_pre_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, di
     return df, stats, filtered_out
 
 
-# Default screening system prompt (used as fallback if Supabase setting is missing)
-DEFAULT_SCREENING_PROMPT = """You are an expert senior technical recruiter with 15+ years of experience hiring for top tech companies.
+# Default screening prompts for different roles
+# Structure: Israel Engineering, Global GTM, Global Engineering (generic)
+DEFAULT_PROMPTS = {
+    # ==================== ISRAEL ENGINEERING ====================
+    'backend_israel': {
+        'name': 'Backend - Israel',
+        'keywords': ['backend', 'node', 'python', 'java', 'golang', 'go', 'api', 'microservices', 'distributed', 'server-side', 'software engineer', 'israel', 'tel aviv', 'herzliya', 'raanana', 'petah tikva'],
+        'prompt': """You are an expert technical recruiter for top Israeli startups. You screen backend engineers.
 
 ## Scoring Rubric
-- **9-10**: Exceptional match. Meets all requirements with bonus qualifications. Rare.
-- **7-8**: Strong match. Meets all core requirements. Top 20% of candidates.
-- **5-6**: Partial match. Missing 1-2 requirements but has potential.
-- **3-4**: Weak match. Missing multiple requirements.
-- **1-2**: Not a fit. Don't waste time.
+- **9-10**: Top-tier company + elite army/top university + modern stack + 4-10 years. Rare.
+- **7-8**: Strong company background + good signals. Top 20% candidate.
+- **5-6**: Decent background but missing 1-2 signals.
+- **3-4**: Weak company background or red flags.
+- **1-2**: Not a fit. Multiple disqualifiers.
 
-## Score Boosters (+1 to +2 points)
-Give higher scores when candidate has:
+## Score Boosters (+2 points each)
+1. **Top Tier Companies**: Wiz, Monday, Snyk, Wix, AppsFlyer, Fiverr, BigID, Cyera, Finout, AI21, Armis, Run:AI
+2. **Elite Army Unit**: 8200, Mamram, Talpiot (only if engineering role - count as ~half years of experience)
+3. **Top Universities**: Technion, Tel Aviv University, Hebrew University, Ben-Gurion, Weizmann
 
-1. **Strong Company Background**: Currently or recently at well-known tech companies:
-   - Top Israeli startups: Wiz, Snyk, Monday, Gong, AppsFlyer, Fireblocks, Rapyd, etc.
-   - Award winners: RSA Innovation Sandbox, Y Combinator, top-tier VC backed
-   - Big tech: Google, Meta, Amazon, Microsoft (in engineering roles)
-   - Acquired startups at good valuations
-
-2. **Relevant Education**: CS/Software Engineering degree from strong universities:
-   - Israel: Technion, Tel Aviv University, Hebrew University, Ben-Gurion, Bar-Ilan, Weizmann
-   - Global: MIT, Stanford, CMU, Berkeley, etc.
-   - MSc/PhD in CS is a plus
-
-**Important**: If candidate is from a strong company with relevant education, skills/description matter less - the company already vetted them.
+## Score Boosters (+1 point each)
+1. **Good Companies**: Microsoft Israel, Palo Alto, Tenable, D-ID, DoiT, Earnix, Env0, Fireblocks, LakeFS, Logz.io, Check Point, CyberArk, SentinelOne, Aqua Security
+2. **Modern Stack**: Node.js, Go, TypeScript, Python, Java (modern), Kubernetes, Terraform, AWS/GCP/Azure
+3. **Systems/Security Stack**: C, C++, Rust, Linux kernel, low-level networking (valuable for security companies)
+4. **Stable Tenure**: 2-4 years per company average
 
 ## Auto-Disqualifiers (Score 3 or below)
-- **Only .NET/C#**: No Node, Python, or modern backend stack
-- **Group Manager/Director+**: Not hands-on (Team Lead is OK)
-- **Embedded/Systems engineer**: Wrong domain (C++, firmware, kernel)
-- **QA/Automation background**: Limited backend development depth
-- **Consulting/project companies**: Tikal, Matrix, Ness, Sela, etc.
+- **Agencies/IT/Consulting**: Tikal, Matrix, Ness, Sela, Malam Team, Bynet, SQLink, etc.
+- **Non-tech industries**: Telecom, banks, government, insurance, retail, food, manufacturing
+- **Old Stack Only**: Legacy .NET/C#, PHP, legacy Java without modern experience (Note: C/C++ at security companies is NOT old stack)
+- **Job Hopper**: Multiple companies with <1.5 years each (internal moves OK)
+- **Too Long at One Company**: 7+ years at single company (may be stagnant)
+- **Too Junior**: <3 years experience
+- **Too Senior**: 50+ years old or 20+ years experience (overqualified, expensive)
+- **Freelancer/Contractor**: No stable employment history
+- **QA/Automation Only**: Limited backend development depth
+- **Pure Hardware/Firmware Only**: Only disqualify if no software/backend work (C/C++ at software companies is valid backend experience)
+
+## Experience Guidelines
+- Ideal: 4-10 years total experience
+- Army experience counts as ~half (2 years army = 1 year work experience)
+- Company brand matters more than skill list for Israeli startups
+
+## Sparse Profile Handling
+IMPORTANT: This is a LinkedIn profile, NOT a CV. Many strong engineers have minimal profiles.
+- If profile shows strong signals (top company, elite army, top university) but lacks details → DO NOT disqualify
+- A Wiz/Monday/8200 engineer with sparse skills list is still a strong candidate
+- Score based on available signals, not on profile completeness
+- Only disqualify if you see NEGATIVE signals, not missing information
+
+## Output
+Be direct and calibrated. Reference specific companies, years, and signals from the profile."""
+    },
+    'frontend_israel': {
+        'name': 'Frontend - Israel',
+        'keywords': ['frontend', 'front-end', 'react', 'vue', 'angular', 'javascript', 'typescript', 'ui', 'ux', 'web developer', 'israel', 'tel aviv'],
+        'prompt': """You are an expert technical recruiter for top Israeli startups. You screen frontend engineers.
+
+## Scoring Rubric
+- **9-10**: Top-tier company + elite army/top university + modern stack + 4-10 years. Rare.
+- **7-8**: Strong company background + good signals. Top 20% candidate.
+- **5-6**: Decent background but missing 1-2 signals.
+- **3-4**: Weak company background or red flags.
+- **1-2**: Not a fit. Multiple disqualifiers.
+
+## Score Boosters (+2 points each)
+1. **Top Tier Companies**: Wiz, Monday, Snyk, Wix, AppsFlyer, Fiverr, BigID, Cyera, AI21, Armis
+2. **Elite Army Unit**: 8200, Mamram (only if engineering role)
+3. **Top Universities**: Technion, Tel Aviv University, Hebrew University
+
+## Score Boosters (+1 point each)
+1. **Good Companies**: Microsoft Israel, Palo Alto, Env0, Fireblocks, Check Point
+2. **Modern Stack**: React, TypeScript, Vue 3, Next.js, design systems, testing
+3. **Full Product Ownership**: Not just component work
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Agencies/IT/Consulting**: Tikal, Matrix, Ness, Sela, etc.
+- **Non-tech industries**: Telecom, banks, government, insurance
+- **Old Stack Only**: jQuery only, no modern frameworks, no TypeScript
+- **Job Hopper**: Multiple companies with <1.5 years each
+- **Too Long at One Company**: 7+ years (may be stagnant)
+- **WordPress/Wix Sites Only**: Not real frontend engineering
+- **Designer Only**: No coding experience
+
+## Experience Guidelines
+- Ideal: 4-10 years total experience
+- Look for React/TypeScript depth, not just usage
+- Company brand matters significantly
+
+## Sparse Profile Handling
+IMPORTANT: This is a LinkedIn profile, NOT a CV. Many strong engineers have minimal profiles.
+- If profile shows strong signals (top company, elite army, top university) but lacks details → DO NOT disqualify
+- A Wiz/Monday/8200 engineer with sparse skills list is still a strong candidate
+- Score based on available signals, not on profile completeness
+- Only disqualify if you see NEGATIVE signals, not missing information"""
+    },
+    'fullstack_israel': {
+        'name': 'Fullstack - Israel',
+        'keywords': ['fullstack', 'full-stack', 'full stack', 'israel', 'tel aviv'],
+        'prompt': """You are an expert technical recruiter for top Israeli startups. You screen fullstack engineers.
+
+## Scoring Rubric
+- **9-10**: Top-tier company + elite army/top university + modern stack both FE & BE + 4-10 years.
+- **7-8**: Strong company background + solid skills both sides.
+- **5-6**: Decent background but stronger on one side.
+- **3-4**: Weak company or clearly FE-only or BE-only.
+- **1-2**: Not a fit.
+
+## Score Boosters (+2 points each)
+1. **Top Tier Companies**: Wiz, Monday, Snyk, Wix, AppsFlyer, Fiverr, BigID, Cyera, AI21, Armis
+2. **Elite Army Unit**: 8200, Mamram (only if engineering role)
+3. **Top Universities**: Technion, Tel Aviv University, Hebrew University
+
+## Score Boosters (+1 point each)
+1. **Good Companies**: Microsoft Israel, Palo Alto, Env0, Fireblocks, Check Point
+2. **Modern Stack Both Sides**: React/TS + Node/Python/Go, cloud experience
+3. **True Fullstack**: Evidence of owning features end-to-end
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Agencies/IT/Consulting**: Tikal, Matrix, Ness, Sela, etc.
+- **Non-tech industries**: Telecom, banks, government
+- **One-sided Only**: Pure FE or pure BE claiming fullstack
+- **Job Hopper**: Multiple companies <1.5 years each
+- **Old Stack**: jQuery + PHP, no modern stack
+
+## Experience Guidelines
+- Ideal: 4-10 years total experience
+- Must show competency on BOTH frontend and backend
+- Startups value true fullstack ownership
+
+## Sparse Profile Handling
+IMPORTANT: This is a LinkedIn profile, NOT a CV. Many strong engineers have minimal profiles.
+- If profile shows strong signals (top company, elite army, top university) but lacks details → DO NOT disqualify
+- A Wiz/Monday/8200 engineer with sparse skills list is still a strong candidate
+- Score based on available signals, not on profile completeness
+- Only disqualify if you see NEGATIVE signals, not missing information"""
+    },
+    'devops_israel': {
+        'name': 'DevOps - Israel',
+        'keywords': ['devops', 'sre', 'platform', 'infrastructure', 'kubernetes', 'k8s', 'terraform', 'aws', 'gcp', 'azure', 'israel', 'tel aviv'],
+        'prompt': """You are an expert technical recruiter for top Israeli startups. You screen DevOps/Platform engineers.
+
+## Scoring Rubric
+- **9-10**: Top-tier company + strong cloud/K8s + 4-10 years + automation mindset.
+- **7-8**: Good company background + solid DevOps skills.
+- **5-6**: Decent experience but gaps in cloud or scale.
+- **3-4**: Limited cloud or mainly IT/operations.
+- **1-2**: Not a fit.
+
+## Score Boosters (+2 points each)
+1. **Top Tier Companies**: Wiz, Monday, AppsFlyer, Fiverr, Armis, or similar scale
+2. **Elite Army Unit**: 8200, Mamram (if infrastructure/ops focused)
+3. **Scale Experience**: Production K8s, multi-region, 100+ services
+
+## Score Boosters (+1 point each)
+1. **Good Companies**: Microsoft Israel, Check Point, Palo Alto, big startups
+2. **Modern Stack**: Kubernetes, Terraform, ArgoCD, cloud-native tools
+3. **Certifications**: CKA, AWS/GCP Professional
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Agencies/IT/Consulting**: Tikal, Matrix, Ness, Sela
+- **Only On-Prem**: No cloud experience
+- **IT Support/Helpdesk**: Not engineering
+- **Windows/IIS Only**: No Linux/containers
+- **Job Hopper**: Multiple companies <1.5 years each
+
+## Experience Guidelines
+- Ideal: 4-10 years total experience
+- Cloud-native is critical
+- Automation mindset > manual operations
+
+## Sparse Profile Handling
+IMPORTANT: This is a LinkedIn profile, NOT a CV. Many strong engineers have minimal profiles.
+- If profile shows strong signals (top company, elite army, top university) but lacks details → DO NOT disqualify
+- A Wiz/Monday/8200 engineer with sparse skills list is still a strong candidate
+- Score based on available signals, not on profile completeness
+- Only disqualify if you see NEGATIVE signals, not missing information"""
+    },
+    'teamlead_israel': {
+        'name': 'Team Lead - Israel',
+        'keywords': ['team lead', 'tech lead', 'engineering lead', 'technical lead', 'lead engineer', 'staff engineer', 'israel', 'tel aviv'],
+        'prompt': """You are an expert technical recruiter for top Israeli startups. You screen Team/Tech Leads.
+
+## Scoring Rubric
+- **9-10**: Led team at top company + strong technical + mentorship evidence + 6-12 years.
+- **7-8**: Good company + led team of 4+ + still hands-on.
+- **5-6**: Senior engineer ready to lead, or lead with gaps.
+- **3-4**: Limited leadership or technical depth.
+- **1-2**: Not a fit.
+
+## Score Boosters (+2 points each)
+1. **Top Tier Companies**: Led team at Wiz, Monday, Snyk, Wix, AppsFlyer, Fiverr, BigID
+2. **Elite Army Unit**: 8200, Mamram (shows leadership early)
+3. **Team Growth**: Hired/grew team, promoted engineers
+
+## Score Boosters (+1 point each)
+1. **Good Companies**: Microsoft Israel, Palo Alto, Check Point, good startups
+2. **Technical Depth**: System design, architecture decisions
+3. **Still Coding**: Hands-on at least 30-50% of time
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Agencies/IT/Consulting**: Tikal, Matrix, Ness, Sela
+- **Manager Only**: No technical depth, pure people management
+- **Only 1-2 Reports**: Not real team lead scope
+- **No Coding 3+ Years**: Too far from technical
+- **Project Lead Only**: Coordination without ownership
+- **Job Hopper**: Multiple companies <1.5 years each
+
+## Experience Guidelines
+- Ideal: 6-12 years total, 2+ years leading
+- Must balance technical + leadership
+- Hands-on coding still expected
+
+## Sparse Profile Handling
+IMPORTANT: This is a LinkedIn profile, NOT a CV. Many strong engineers have minimal profiles.
+- If profile shows strong signals (top company, elite army, top university) but lacks details → DO NOT disqualify
+- A Wiz/Monday/8200 engineer with sparse skills list is still a strong candidate
+- Score based on available signals, not on profile completeness
+- Only disqualify if you see NEGATIVE signals, not missing information"""
+    },
+    'product_israel': {
+        'name': 'Product Manager - Israel',
+        'keywords': ['product manager', 'product owner', 'pm', 'product lead', 'israel', 'tel aviv'],
+        'prompt': """You are an expert recruiter for top Israeli startups. You screen Product Managers.
+
+## Scoring Rubric
+- **9-10**: PM at top company + technical background + shipped products + 5-10 years.
+- **7-8**: Good company + clear ownership + data-driven.
+- **5-6**: PM experience but gaps in ownership or impact.
+- **3-4**: Limited product ownership or mostly process.
+- **1-2**: Not a fit.
+
+## Score Boosters (+2 points each)
+1. **Top Tier Companies**: PM at Wiz, Monday, Snyk, Wix, AppsFlyer, Fiverr
+2. **Technical Background**: CS degree, was engineer before PM
+3. **0-to-1 Products**: Built products from scratch
+
+## Score Boosters (+1 point each)
+1. **Good Companies**: Microsoft Israel, Palo Alto, good startups
+2. **Top Universities**: Technion, TAU, Hebrew U
+3. **Measurable Impact**: Revenue, adoption, retention metrics
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Agencies/Consulting**: No in-house product experience
+- **Scrum Master Only**: Process role, not ownership
+- **Project Manager**: Execution, not strategy
+- **Business Analyst**: Analysis without ownership
+- **Non-tech Products**: Only non-tech industries
+- **Job Hopper**: Multiple companies <1.5 years each
+
+## Experience Guidelines
+- Ideal: 5-10 years, including 3+ as PM
+- Technical depth is valued in Israeli startups
+- Look for ownership and impact evidence
+
+## Sparse Profile Handling
+IMPORTANT: This is a LinkedIn profile, NOT a CV. Many strong candidates have minimal profiles.
+- If profile shows strong signals (top company, elite army, top university) but lacks details → DO NOT disqualify
+- A Wiz/Monday PM with sparse description is still a strong candidate
+- Score based on available signals, not on profile completeness
+- Only disqualify if you see NEGATIVE signals, not missing information"""
+    },
+    # ==================== GLOBAL GTM ====================
+    'sales_global': {
+        'name': 'Sales / AE - Global',
+        'keywords': ['sales', 'account executive', 'ae', 'enterprise sales', 'saas sales', 'b2b sales', 'quota', 'remote', 'us', 'usa', 'emea', 'apac'],
+        'prompt': """You are an expert sales recruiter for high-growth B2B SaaS companies hiring globally.
+
+## Scoring Rubric
+- **9-10**: Top performer at top company + consistent quota achievement + enterprise experience + 4-10 years.
+- **7-8**: Strong track record + met quotas + relevant industry.
+- **5-6**: B2B SaaS experience but gaps in seniority or results.
+- **3-4**: Limited SaaS or mostly SMB experience.
+- **1-2**: Not a fit.
+
+## Score Boosters (+2 points each)
+1. **Top Tier Companies**: Gong, Salesforce, Datadog, HubSpot, ZoomInfo, Outreach, Monday, Snowflake
+2. **Quota Achievement**: 120%+ consistently, President's Club
+3. **Enterprise Deals**: $100K+ ACV, complex sales cycles
+
+## Score Boosters (+1 point each)
+1. **Good Companies**: Established SaaS companies, well-funded startups
+2. **Career Progression**: SDR → AE → Senior AE → Enterprise
+3. **Vertical Expertise**: Security, data, cloud, DevOps
+
+## Auto-Disqualifiers (Score 3 or below)
+- **B2C/Retail Only**: No B2B SaaS experience
+- **No Tech Industry**: Only selling non-tech products
+- **Job Hopper**: Multiple companies <1 year each
+- **No Quota Evidence**: Can't demonstrate achievement
+- **SMB Only for Enterprise Role**: Never sold to enterprise
+- **Inside Sales Only**: For field/enterprise roles
+
+## Experience Guidelines
+- Ideal: 4-10 years in B2B SaaS sales
+- Look for quota achievement numbers
+- Progression from SDR to AE is positive signal
+- Industry knowledge (security, data, cloud) is valuable"""
+    },
+    'sdr_global': {
+        'name': 'SDR/BDR - Global',
+        'keywords': ['sdr', 'bdr', 'sales development', 'business development representative', 'outbound', 'prospecting', 'remote', 'us', 'emea'],
+        'prompt': """You are an expert recruiter for B2B SaaS companies hiring SDR/BDRs globally.
+
+## Scoring Rubric
+- **9-10**: SDR at top company + proven metrics + promotion potential + 1-3 years.
+- **7-8**: Good SDR experience + meets quotas + hungry.
+- **5-6**: Some SDR experience or strong adjacent background.
+- **3-4**: Limited outbound or B2B experience.
+- **1-2**: Not a fit.
+
+## Score Boosters (+2 points each)
+1. **Top Tier Companies**: SDR at Gong, Salesforce, HubSpot, Outreach, top startups
+2. **Strong Metrics**: Meeting/exceeding pipeline targets
+3. **Promoted to AE**: Shows trajectory
+
+## Score Boosters (+1 point each)
+1. **Good Companies**: Established SaaS, well-funded startups
+2. **Relevant Background**: Sales, customer-facing roles
+3. **Tech Savvy**: Uses sales tools effectively
+
+## Auto-Disqualifiers (Score 3 or below)
+- **No B2B Experience**: Only B2C or retail
+- **No Outbound Experience**: Only inbound/support
+- **Too Senior**: 5+ years as SDR without progression
+- **Job Hopper**: <6 months at multiple companies
+
+## Experience Guidelines
+- Ideal: 1-3 years SDR/sales experience
+- Entry-level OK if strong potential signals
+- Look for hunger and coachability"""
+    },
+    'marketing_global': {
+        'name': 'Marketing - Global',
+        'keywords': ['marketing', 'growth', 'demand gen', 'product marketing', 'content marketing', 'digital marketing', 'plg', 'abm', 'remote', 'us', 'emea'],
+        'prompt': """You are an expert marketing recruiter for high-growth B2B SaaS companies hiring globally.
+
+## Scoring Rubric
+- **9-10**: Top company + measurable pipeline impact + strategic + 4-10 years.
+- **7-8**: Strong B2B SaaS track record + data-driven.
+- **5-6**: Marketing experience but gaps in B2B or metrics.
+- **3-4**: Limited B2B tech marketing.
+- **1-2**: Not a fit.
+
+## Score Boosters (+2 points each)
+1. **Top Tier Companies**: HubSpot, Gong, Datadog, Salesforce, Monday, Fiverr
+2. **Measurable Impact**: Pipeline generation, conversion improvements, CAC/LTV
+3. **PLG Experience**: Product-led growth, self-serve funnels
+
+## Score Boosters (+1 point each)
+1. **Good Companies**: Established SaaS, well-funded startups
+2. **Technical Background**: Can work with product/engineering
+3. **Full Funnel**: Demand gen + content + product marketing
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Agency Only**: No in-house B2B experience
+- **B2C Only**: Consumer marketing doesn't transfer
+- **No Metrics Focus**: "Creative" without data
+- **Traditional Only**: Print, events, no digital
+- **Job Hopper**: Multiple companies <1.5 years each
+
+## Experience Guidelines
+- Ideal: 4-10 years, mostly B2B SaaS
+- Look for pipeline/revenue impact numbers
+- Growth/demand gen valued over brand for startups"""
+    },
+    'customer_success_global': {
+        'name': 'Customer Success - Global',
+        'keywords': ['customer success', 'csm', 'cs manager', 'account manager', 'client success', 'renewals', 'expansion', 'remote', 'us', 'emea'],
+        'prompt': """You are an expert recruiter for B2B SaaS companies hiring Customer Success globally.
+
+## Scoring Rubric
+- **9-10**: Top company + strong retention/expansion metrics + strategic + 4-10 years.
+- **7-8**: Good CS experience + enterprise accounts + metrics-driven.
+- **5-6**: CS experience but gaps in enterprise or expansion.
+- **3-4**: Limited SaaS or mostly support.
+- **1-2**: Not a fit.
+
+## Score Boosters (+2 points each)
+1. **Top Tier Companies**: Salesforce, Gainsight, HubSpot, Gong, top SaaS
+2. **Strong Metrics**: NRR, retention, expansion revenue
+3. **Enterprise Experience**: Managed $100K+ ARR accounts
+
+## Score Boosters (+1 point each)
+1. **Good Companies**: Established SaaS, well-funded startups
+2. **Technical Aptitude**: Can understand product deeply
+3. **Upsell/Expansion**: Proven revenue expansion
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Support Only**: No strategic account management
+- **No SaaS Experience**: Only non-tech CS
+- **No Metrics**: Can't demonstrate retention/expansion impact
+- **SMB Only for Enterprise Role**: No large account experience
+- **Job Hopper**: Multiple companies <1.5 years each
+
+## Experience Guidelines
+- Ideal: 4-10 years in CS/account management
+- Look for retention and expansion numbers
+- Enterprise experience for enterprise roles"""
+    },
+    'solutions_engineer_global': {
+        'name': 'Solutions Engineer - Global',
+        'keywords': ['solutions engineer', 'se', 'sales engineer', 'presales', 'technical sales', 'demo', 'poc', 'remote', 'us', 'emea'],
+        'prompt': """You are an expert recruiter for B2B SaaS companies hiring Solutions Engineers globally.
+
+## Scoring Rubric
+- **9-10**: Top company + technical depth + sales acumen + 4-10 years.
+- **7-8**: Good SE experience + strong demos + complex POCs.
+- **5-6**: SE experience but gaps in technical or sales.
+- **3-4**: Limited SE or mostly support.
+- **1-2**: Not a fit.
+
+## Score Boosters (+2 points each)
+1. **Top Tier Companies**: Datadog, Snowflake, HashiCorp, Salesforce, top SaaS
+2. **Technical Background**: Engineering before SE
+3. **Complex POCs**: Led technical evaluations for enterprise
+
+## Score Boosters (+1 point each)
+1. **Good Companies**: Established SaaS, well-funded startups
+2. **Quota Involvement**: Tied to sales quota
+3. **Industry Expertise**: Security, data, cloud, DevOps
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Support Only**: No sales involvement
+- **No Technical Depth**: Can't go deep on product
+- **No SaaS Experience**: Only hardware/on-prem
+- **Job Hopper**: Multiple companies <1.5 years each
+
+## Experience Guidelines
+- Ideal: 4-10 years, mix of technical + customer-facing
+- Engineering background is strong signal
+- Look for enterprise deal involvement"""
+    },
+    # ==================== GLOBAL ENGINEERING (Generic) ====================
+    'engineering_global': {
+        'name': 'Engineering - Global',
+        'keywords': ['software engineer', 'developer', 'engineering', 'remote', 'us', 'usa', 'europe', 'global', 'san francisco', 'new york', 'london'],
+        'prompt': """You are an expert technical recruiter for high-growth tech companies hiring globally.
+
+## Scoring Rubric
+- **9-10**: FAANG/top startup + modern stack + 4-10 years + strong impact.
+- **7-8**: Good company background + solid skills + stable tenure.
+- **5-6**: Decent experience but gaps in company or stack.
+- **3-4**: Weak company background or old stack.
+- **1-2**: Not a fit.
+
+## Score Boosters (+2 points each)
+1. **Top Tier Companies**: Google, Meta, Amazon, Apple, Netflix, Stripe, Datadog, Snowflake
+2. **Top Universities**: MIT, Stanford, CMU, Berkeley, top CS programs
+3. **Strong Impact**: Led major projects, scaled systems
+
+## Score Boosters (+1 point each)
+1. **Good Companies**: Microsoft, well-funded startups, public tech companies
+2. **Modern Stack**: Cloud-native, modern languages, distributed systems
+3. **Open Source**: Contributions to major projects
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Agencies/Consulting**: Accenture, Deloitte, Infosys, Wipro, TCS for engineering
+- **Old Stack Only**: Legacy systems without modern experience
+- **Job Hopper**: Multiple companies <1.5 years each
+- **Too Long at One Company**: 7+ years (may be stagnant)
+- **Non-tech Industries**: Banks, government, insurance, telecom (unless tech role)
+
+## Experience Guidelines
+- Ideal: 4-10 years total experience
+- Company brand matters
+- Modern stack and cloud experience important"""
+    },
+    # ==================== OTHER ROLES (Generic) ====================
+    'manager': {
+        'name': 'Engineering Manager',
+        'keywords': ['engineering manager', 'em', 'dev manager', 'development manager', 'r&d manager', 'software manager'],
+        'prompt': """You are an expert recruiter specializing in engineering management roles.
+
+## Scoring Rubric
+- **9-10**: Proven EM. Multiple team building cycles. Technical credibility. Strong delivery.
+- **7-8**: Good EM experience. Built teams. Delivered projects.
+- **5-6**: New manager or manager with gaps in team size/impact.
+- **3-4**: Limited management experience.
+- **1-2**: No management background.
+
+## Score Boosters (+1 to +2 points)
+1. **Strong Companies**: EM at Wiz, Monday, Google, Meta, scaled startups
+2. **Team Size**: Managed 8+ engineers
+3. **Hiring Track Record**: Built team from scratch
+4. **Technical Background**: Was a strong engineer first
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Only project management**: No people management
+- **No technical background**: Can't evaluate engineers
+- **Only offshore/outsource management**: Different skill set
+- **HR/admin focus**: Not engineering management
 
 ## Guidelines
-1. **Be Direct**: Don't sugarcoat. Give honest evaluations.
-2. **Use Evidence**: Reference specific profile data (years, skills, companies).
-3. **Be Calibrated**: A 10/10 should be rare. Most good candidates are 6-8.
-4. **Company > Skills**: Strong company pedigree compensates for skill list gaps."""
+1. People skills + technical credibility both matter
+2. Look for hiring and team growth
+3. Delivery track record is key"""
+    },
+    'vp': {
+        'name': 'VP / Director Engineering',
+        'keywords': ['vp engineering', 'vp r&d', 'director engineering', 'head of engineering', 'cto', 'chief technology', 'vp product'],
+        'prompt': """You are an expert executive recruiter specializing in VP/Director level engineering roles.
+
+## Scoring Rubric
+- **9-10**: Proven VP/Director. Built orgs of 30+. Strategic impact. Board/exec presence.
+- **7-8**: Strong director. Multiple teams. Good strategic thinking.
+- **5-6**: Senior manager ready to step up, or director with limited scope.
+- **3-4**: Limited org building experience.
+- **1-2**: No executive experience.
+
+## Score Boosters (+1 to +2 points)
+1. **Strong Companies**: VP at unicorn, FAANG director, successful startup CTO
+2. **Org Scale**: Built 50+ person engineering org
+3. **Business Impact**: Revenue/product outcomes, not just delivery
+4. **Board Exposure**: M&A, fundraising, exec team experience
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Only managed managers**: No org building
+- **Only 1 team**: Not real VP scope
+- **No strategic work**: Pure execution role
+- **Outdated tech context**: >5 years since hands-on
+
+## Guidelines
+1. Strategy and org building are key
+2. Business acumen matters at this level
+3. Look for scale and complexity"""
+    },
+    'datascience': {
+        'name': 'Data Science / ML',
+        'keywords': ['data science', 'data scientist', 'machine learning', 'ml engineer', 'ai', 'deep learning', 'nlp', 'computer vision', 'mlops'],
+        'prompt': """You are an expert technical recruiter specializing in Data Science and Machine Learning roles.
+
+## Scoring Rubric
+- **9-10**: Strong ML/DS background. Production models. Research publications or real impact.
+- **7-8**: Solid data science skills. End-to-end model development.
+- **5-6**: Some ML experience but gaps in production or depth.
+- **3-4**: Limited ML experience, mostly analytics.
+- **1-2**: No data science background.
+
+## Score Boosters (+1 to +2 points)
+1. **Strong Companies**: Google AI, Meta AI, OpenAI, DeepMind, top ML teams
+2. **Education**: PhD in ML/Stats, top programs (Stanford, CMU, MIT, Technion)
+3. **Publications**: NeurIPS, ICML, top conferences
+4. **Production ML**: Models serving millions of users
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Only BI/Analytics**: No ML modeling experience
+- **Only Kaggle**: No production experience
+- **Data Engineering only**: Not model development
+- **Outdated ML**: Only classical ML, no deep learning
+
+## Guidelines
+1. Production experience > research alone
+2. Look for end-to-end ownership
+3. Strong CS fundamentals matter"""
+    },
+    'automation': {
+        'name': 'QA Automation / SDET',
+        'keywords': ['qa automation', 'sdet', 'test automation', 'quality engineer', 'automation engineer', 'selenium', 'cypress', 'playwright', 'test engineer'],
+        'prompt': """You are an expert technical recruiter specializing in QA Automation and SDET roles.
+
+## Scoring Rubric
+- **9-10**: Strong automation architect. Framework design. CI/CD integration. Performance testing.
+- **7-8**: Solid automation engineer. Good coverage. Multiple frameworks.
+- **5-6**: Some automation but gaps in framework design or coverage.
+- **3-4**: Mostly manual QA with some automation.
+- **1-2**: Manual QA only.
+
+## Score Boosters (+1 to +2 points)
+1. **Strong Companies**: SDET at Google, Microsoft, Wix, Monday, top startups
+2. **Framework Design**: Built automation frameworks from scratch
+3. **Full Stack Testing**: UI + API + Performance
+4. **CI/CD**: Deep integration with pipelines
+
+## Auto-Disqualifiers (Score 3 or below)
+- **Manual QA only**: No automation experience
+- **Only record/playback**: No real coding
+- **Only mobile/only web**: Too narrow for full stack
+- **No programming**: Can't write maintainable tests
+
+## Guidelines
+1. Coding skills matter - treat as engineer
+2. Framework design > just writing tests
+3. Look for CI/CD and DevOps mindset"""
+    },
+    'general': {
+        'name': 'General',
+        'keywords': [],
+        'prompt': """You are an expert recruiter evaluating candidates for a role.
+
+## Scoring Rubric
+- **9-10**: Exceptional match. Meets all requirements with bonus qualifications.
+- **7-8**: Strong match. Meets all core requirements.
+- **5-6**: Partial match. Missing 1-2 requirements but has potential.
+- **3-4**: Weak match. Missing multiple requirements.
+- **1-2**: Not a fit.
+
+## Guidelines
+1. Match skills and experience to job requirements
+2. Consider company background and career progression
+3. Look for evidence of impact and achievements
+4. Be calibrated - 10/10 is rare"""
+    }
+}
+
+# Legacy default (for backwards compatibility)
+DEFAULT_SCREENING_PROMPT = DEFAULT_PROMPTS['backend_israel']['prompt']
+
+
+def get_screening_prompt_for_role(role_type: str = None, job_description: str = None) -> tuple:
+    """Get screening prompt, either by role or auto-detected from JD.
+
+    Returns: (prompt_text, role_type, role_name)
+    """
+    db_client = _get_db_client() if HAS_DATABASE else None
+
+    # If role specified, get that prompt
+    if role_type and role_type != 'auto':
+        if db_client:
+            prompt_data = get_screening_prompt_by_role(db_client, role_type)
+            if prompt_data:
+                return prompt_data['prompt_text'], role_type, prompt_data.get('name', role_type.title())
+        # Fall back to defaults
+        if role_type in DEFAULT_PROMPTS:
+            return DEFAULT_PROMPTS[role_type]['prompt'], role_type, DEFAULT_PROMPTS[role_type]['name']
+
+    # Auto-detect from job description
+    if job_description and db_client:
+        matched = match_prompt_by_keywords(db_client, job_description)
+        if matched:
+            return matched['prompt_text'], matched['role_type'], matched.get('name', matched['role_type'].title())
+
+    # Auto-detect using default prompts (no DB)
+    if job_description:
+        jd_lower = job_description.lower()
+        best_match = None
+        best_score = 0
+        for role_key, role_data in DEFAULT_PROMPTS.items():
+            if role_key == 'general':
+                continue
+            score = sum(1 for kw in role_data['keywords'] if kw in jd_lower)
+            if score > best_score:
+                best_score = score
+                best_match = role_key
+        if best_score >= 2 and best_match:
+            return DEFAULT_PROMPTS[best_match]['prompt'], best_match, DEFAULT_PROMPTS[best_match]['name']
+
+    # Fall back to general/default
+    if db_client:
+        default_prompt = get_default_screening_prompt(db_client)
+        if default_prompt:
+            return default_prompt['prompt_text'], default_prompt['role_type'], default_prompt.get('name', 'Default')
+
+    return DEFAULT_SCREENING_PROMPT, 'backend', 'Backend Engineering'
 
 
 def get_screening_prompt() -> str:
-    """Load screening system prompt from Supabase. Falls back to default."""
-    if HAS_DATABASE:
-        try:
-            db_client = _get_db_client()
-            if db_client:
-                prompt = get_setting(db_client, 'screening_system_prompt')
-                if prompt:
-                    return prompt
-        except Exception:
-            pass
-    return DEFAULT_SCREENING_PROMPT
+    """Legacy function for backwards compatibility."""
+    prompt, _, _ = get_screening_prompt_for_role()
+    return prompt
 
 
-def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_requirements: str = "", tracker: 'UsageTracker' = None, mode: str = "detailed") -> dict:
+def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_requirements: str = "", tracker: 'UsageTracker' = None, mode: str = "detailed", system_prompt: str = None) -> dict:
     """Screen a profile against a job description using OpenAI.
 
     Args:
         mode: "quick" for cheaper/faster (score + fit + summary) or "detailed" for full analysis
+        system_prompt: Custom system prompt (if None, uses default)
     """
     # Validate profile has minimum useful data before calling OpenAI
     name = f"{profile.get('first_name', '')} {profile.get('last_name', '')}".strip()
@@ -2458,7 +3238,6 @@ def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_re
             "score": 0,
             "fit": "Skipped",
             "summary": "Insufficient profile data - skipped to save API credits",
-            "why": f"Profile missing key fields. Available: {[k for k, v in profile.items() if v]}",
             "strengths": [],
             "concerns": []
         }
@@ -2487,8 +3266,8 @@ Past Positions: {safe_str(profile.get('past_positions', 'N/A'))}"""
         response_format = '{"score": <1-10>, "fit": "<Strong Fit|Good Fit|Partial Fit|Not a Fit>", "summary": "<one sentence>"}'
         max_tokens = 100
     else:
-        response_format = '{"score": <1-10>, "fit": "<Strong Fit|Good Fit|Partial Fit|Not a Fit>", "summary": "<2-3 sentences about the candidate>", "why": "<2-3 sentences explaining the score>", "strengths": ["<strength1>", "<strength2>"], "concerns": ["<concern1>", "<concern2>"]}'
-        max_tokens = 500
+        response_format = '{"score": <1-10>, "fit": "<Strong Fit|Good Fit|Partial Fit|Not a Fit>", "summary": "<2-3 sentences about the candidate>", "strengths": ["<strength1>", "<strength2>"], "concerns": ["<concern1>", "<concern2>"]}'
+        max_tokens = 400
 
     user_prompt = f"""Evaluate this candidate against the job description.
 
@@ -2504,10 +3283,12 @@ Respond with ONLY valid JSON in this exact format:
 {response_format}"""
 
     try:
+        # Use provided prompt or fall back to default
+        prompt_to_use = system_prompt if system_prompt else get_screening_prompt()
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": get_screening_prompt()},
+                {"role": "system", "content": prompt_to_use},
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.3,
@@ -2540,8 +3321,7 @@ Respond with ONLY valid JSON in this exact format:
         return {
             "score": 0,
             "fit": "Error",
-            "summary": f"JSON parse error",
-            "why": str(e)[:100],
+            "summary": f"JSON parse error: {str(e)[:80]}",
             "strengths": [],
             "concerns": []
         }
@@ -2560,8 +3340,7 @@ Respond with ONLY valid JSON in this exact format:
         return {
             "score": 0,
             "fit": "Error",
-            "summary": f"API error: {str(e)[:50]}",
-            "why": str(e)[:100],
+            "summary": f"API error: {str(e)[:80]}",
             "strengths": [],
             "concerns": []
         }
@@ -2569,7 +3348,8 @@ Respond with ONLY valid JSON in this exact format:
 
 def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: str,
                           extra_requirements: str = "", max_workers: int = 50,
-                          progress_callback=None, cancel_flag=None, mode: str = "detailed") -> list:
+                          progress_callback=None, cancel_flag=None, mode: str = "detailed",
+                          system_prompt: str = None) -> list:
     """Screen multiple profiles in parallel using ThreadPoolExecutor.
 
     Args:
@@ -2580,6 +3360,7 @@ def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: 
         max_workers: Number of concurrent threads (default 50 for Tier 3)
         progress_callback: Function(completed, total, result) called after each profile
         cancel_flag: Dict with 'cancelled' key to check for cancellation
+        system_prompt: Custom system prompt for screening
 
     Returns:
         List of screening results with profile info included
@@ -2600,7 +3381,7 @@ def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: 
         # Create client per thread to avoid thread-safety issues
         client = OpenAI(api_key=openai_api_key)
         try:
-            result = screen_profile(profile, job_description, client, extra_requirements, tracker=tracker, mode=mode)
+            result = screen_profile(profile, job_description, client, extra_requirements, tracker=tracker, mode=mode, system_prompt=system_prompt)
             # Add profile info to result
             name = f"{profile.get('first_name', '')} {profile.get('last_name', '')}".strip()
             if not name:
@@ -2616,7 +3397,6 @@ def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: 
                 "score": 0,
                 "fit": "Error",
                 "summary": f"Screen error: {str(e)[:80]}",
-                "why": traceback.format_exc()[:200],
                 "strengths": [],
                 "concerns": [],
                 "name": profile.get('first_name', '') or profile.get('fullName', '') or f"Profile {index}",
@@ -2660,7 +3440,6 @@ def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: 
                     "score": 0,
                     "fit": "Error",
                     "summary": f"Thread error: {error_msg[:80]}",
-                    "why": traceback.format_exc()[:200],
                     "strengths": [],
                     "concerns": [],
                     "name": f"Profile {idx}",
@@ -2838,18 +3617,19 @@ with tab_upload:
                 # Normalize columns (handles GEM and other CSV formats)
                 df_uploaded = normalize_uploaded_csv(df_uploaded)
 
-                # Count valid LinkedIn URLs
-                valid_urls = df_uploaded['linkedin_url'].notna().sum() if 'linkedin_url' in df_uploaded.columns else 0
+                # Get count of skipped profiles (no LinkedIn URL)
+                skipped_no_url = df_uploaded.attrs.get('_skipped_no_url', 0)
 
                 # PhantomBuster/CSV data stays in session state only (not saved to DB)
                 # DB save happens after Crustdata enrichment
                 st.session_state['results'] = df_uploaded.to_dict('records')
                 st.session_state['results_df'] = df_uploaded
+                save_session_state()  # Save for restore
 
                 # Show success message with details
                 msg = f"Loaded **{len(df_uploaded)}** profiles"
-                if valid_urls > 0:
-                    msg += f" ({valid_urls} with LinkedIn URLs ready for enrichment)"
+                if skipped_no_url > 0:
+                    msg += f" ({skipped_no_url} skipped - no LinkedIn URL)"
                 st.success(msg)
 
         except Exception as e:
@@ -3072,6 +3852,7 @@ with tab_upload:
                                         st.session_state['preview_page'] = 0  # Reset pagination
                                         st.session_state['last_load_count'] = len(pb_df)
                                         st.session_state['last_load_file'] = filename
+                                        save_session_state()  # Save for restore
                                         st.rerun()
                                     else:
                                         st.error("No results found. File may have been deleted from PhantomBuster.")
@@ -3113,6 +3894,7 @@ with tab_upload:
                                             st.session_state['last_load_mode'] = 'loaded'
 
                                         st.session_state['preview_page'] = 0
+                                        save_session_state()  # Save for restore
                                         st.rerun()
                                     else:
                                         st.error("No results found. File may have been deleted from PhantomBuster.")
@@ -3252,11 +4034,7 @@ with tab_upload:
             progress_pct = progress_info.get('progress_pct', 0)
 
             # Progress display
-            skip_count = st.session_state.get('pb_launch_skip_count', 0)
-            if skip_count > 0:
-                st.info(f"**Running** - {elapsed} (auto-refreshing every 10s)\n\n⏭️ Skipping **{skip_count}** profiles already in database")
-            else:
-                st.info(f"**Running** - {elapsed} (auto-refreshing every 10s)")
+            st.info(f"**Running** - {elapsed} (auto-refreshing every 10s)")
             if profiles_count > 0 or progress_pct > 0:
                 col_prog1, col_prog2 = st.columns(2)
                 with col_prog1:
@@ -3332,6 +4110,7 @@ with tab_upload:
                         st.session_state['pb_launch_skip_count'] = 0
                         st.session_state['last_load_count'] = len(pb_df)
                         st.session_state['last_load_file'] = f"{csv_name}.csv" if csv_name else "results"
+                        save_session_state()  # Save for restore
                         st.rerun()
                     else:
                         st.error("Could not load results.")
@@ -3431,6 +4210,9 @@ with tab_filter:
         st.info("Upload data in the Upload tab first.")
     else:
         df = st.session_state['results_df']
+        # Store original data if not already stored (for reset functionality)
+        if 'original_results_df' not in st.session_state or st.session_state.get('original_results_df') is None:
+            st.session_state['original_results_df'] = df.copy()
         needs_filtering = 'job_1_job_title' in df.columns and 'current_title' not in df.columns
 
         if needs_filtering:
@@ -3438,6 +4220,7 @@ with tab_filter:
                 filtered_df = filter_csv_columns(df)
                 st.session_state['results_df'] = filtered_df
                 st.session_state['results'] = filtered_df.to_dict('records')
+                save_session_state()  # Save for restore
                 st.rerun()
 
         # Check for Google Sheets config
@@ -3601,7 +4384,31 @@ with tab_filter:
                 max_role_months = st.number_input("Max months in role", min_value=0, max_value=240, value=0, help="0 = no limit", key="max_role_months")
                 max_company_months = st.number_input("Max months at company", min_value=0, max_value=240, value=0, help="0 = no limit", key="max_company_months")
 
-        if st.button("Apply Filters", type="primary"):
+        btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
+        with btn_col1:
+            apply_clicked = st.button("Apply Filters", type="primary", key="apply_filters_main")
+        with btn_col2:
+            if st.button("Reset Filters", key="reset_filters_main"):
+                # Reset to original unfiltered data
+                original_df = st.session_state.get('original_results_df')
+                if original_df is not None and not original_df.empty:
+                    st.session_state['results_df'] = original_df.copy()
+                    st.session_state['results'] = original_df.to_dict('records')
+                    st.session_state['passed_candidates_df'] = original_df.copy()
+                    if 'filter_stats' in st.session_state:
+                        del st.session_state['filter_stats']
+                    if 'filtered_out' in st.session_state:
+                        del st.session_state['filtered_out']
+                    st.success(f"Reset to {len(original_df)} profiles")
+                    save_session_state()
+                    st.rerun()
+                else:
+                    st.warning("No original data to restore. Try reloading your CSV/data.")
+
+        if apply_clicked:
+            # Store original data before first filter (only if not already stored)
+            if 'original_results_df' not in st.session_state or st.session_state.get('original_results_df') is None:
+                st.session_state['original_results_df'] = st.session_state.get('results_df').copy()
             filters = {}
 
             # Load filter data from Google Sheets or files
@@ -3681,6 +4488,7 @@ with tab_filter:
                 st.session_state['results'] = filtered_df.to_dict('records')
                 st.session_state['filter_stats'] = stats
                 st.session_state['filtered_out'] = filtered_out
+                save_session_state()  # Save for restore
 
             st.success(f"Filtering complete! {stats['final']} candidates remaining")
             st.rerun()
@@ -4053,14 +4861,50 @@ with tab_enrich:
     elif 'results' not in st.session_state or not st.session_state['results']:
         st.info("Load profiles first (tab 1). Filtering (tab 2) is optional.")
     else:
-        results_df = st.session_state.get('results_df')
+        # Use filtered data if available (from Filter+ tab), otherwise use loaded data
+        passed_df = st.session_state.get('passed_candidates_df')
+        using_filtered = passed_df is not None and not passed_df.empty
+        results_df = passed_df if using_filtered else st.session_state.get('results_df')
         enriched_df = st.session_state.get('enriched_df')
+
+        # Show data source indicator
+        if using_filtered:
+            st.caption(f"Using filtered data ({len(results_df) if results_df is not None else 0} profiles from Filter+ tab)")
+        else:
+            st.caption(f"Using all loaded data ({len(results_df) if results_df is not None else 0} profiles)")
 
         # Check if already enriched (enriched_df exists)
         is_enriched = enriched_df is not None and not enriched_df.empty
 
         if is_enriched:
             st.success(f"**{len(enriched_df)}** profiles enriched! Proceed to Filter+ or AI Screen tab.")
+
+            # Show URL matching debug info (persisted from last enrichment)
+            if '_enrich_debug' in st.session_state or '_enrich_match_debug' in st.session_state:
+                with st.expander("Debug: Last Enrichment URL Matching", expanded=True):
+                    enrich_debug = st.session_state.get('_enrich_debug', {})
+                    match_debug = st.session_state.get('_enrich_match_debug', {})
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write("**Input URL Mapping:**")
+                        st.write(f"- Input URLs: {enrich_debug.get('input_urls', 'N/A')}")
+                        st.write(f"- Map keys created: {enrich_debug.get('map_keys', 'N/A')}")
+                        st.write(f"- Failed to extract: {enrich_debug.get('failed_extract', 'N/A')}")
+                        st.write(f"- Sample inputs: {enrich_debug.get('sample_inputs', [])}")
+                        st.write(f"- ALL map keys: {enrich_debug.get('all_map_keys', enrich_debug.get('sample_map_keys', []))}")
+
+                    with col2:
+                        st.write("**Result Matching:**")
+                        st.write(f"- Results: {match_debug.get('results', 'N/A')}")
+                        st.write(f"- Matched: {match_debug.get('matched', 'N/A')}")
+                        st.write(f"- Unmatched: {match_debug.get('unmatched_count', 'N/A')}")
+                        st.write(f"- Unmatched samples: {match_debug.get('unmatched_samples', [])}")
+
+                    if match_debug.get('result_samples'):
+                        st.write("**Result samples:**")
+                        for sample in match_debug.get('result_samples', []):
+                            st.write(f"  - flagship: {sample.get('flagship')}, matched: {sample.get('matched')}")
 
             # Show enriched data preview
             st.markdown("### Enriched Profiles Preview")
@@ -4127,8 +4971,37 @@ with tab_enrich:
             urls = extract_urls_from_phantombuster(results_df)
 
             if urls:
+                # Helper function for username extraction
+                def get_base_username_from_url(url):
+                    """Extract base username from URL, removing ID suffix"""
+                    if not url or '/in/' not in str(url).lower():
+                        return None
+                    username = str(url).lower().split('/in/')[-1].rstrip('/').split('?')[0]
+                    # Remove numeric ID suffix (e.g., john-doe-12345 -> john-doe)
+                    if '-' in username:
+                        parts = username.rsplit('-', 1)
+                        suffix = parts[-1]
+                        # Only strip if it's clearly an ID (all digits or mostly digits)
+                        if suffix.isdigit():
+                            return parts[0]
+                        if len(suffix) >= 5 and suffix.isalnum():
+                            digit_count = sum(1 for c in suffix if c.isdigit())
+                            if digit_count >= len(suffix) * 0.5:  # At least 50% digits
+                                return parts[0]
+                    return username
+
+                def get_reversed_username(base):
+                    """Reverse name order (first-last -> last-first) for matching."""
+                    if base and '-' in base:
+                        parts = base.split('-')
+                        if len(parts) == 2:
+                            return f"{parts[1]}-{parts[0]}"
+                    return None
+
                 # Check for recently enriched profiles in database (within ENRICHMENT_REFRESH_MONTHS)
                 recently_enriched = set()
+                recently_enriched_usernames = set()
+                recently_enriched_list = []
                 db_check_error = None
                 refresh_months = 3  # Default fallback
                 if HAS_DATABASE:
@@ -4138,7 +5011,17 @@ with tab_enrich:
                         if db_client:
                             # Only skip profiles enriched within the refresh period
                             recently_enriched_list = get_recently_enriched_urls(db_client, months=refresh_months)
-                            recently_enriched = set(normalize_linkedin_url(u) for u in recently_enriched_list)
+                            recently_enriched = set(normalize_linkedin_url(u) for u in recently_enriched_list if u)
+
+                            # Also build set of base usernames (without ID suffix) for fuzzy matching
+                            for u in recently_enriched_list:
+                                base = get_base_username_from_url(u)
+                                if base:
+                                    recently_enriched_usernames.add(base)
+                                    # Also add reversed name order
+                                    reversed_name = get_reversed_username(base)
+                                    if reversed_name:
+                                        recently_enriched_usernames.add(reversed_name)
                     except Exception as e:
                         db_check_error = str(e)
 
@@ -4147,28 +5030,166 @@ with tab_enrich:
                 skipped_urls = []
                 for url in urls:
                     normalized = normalize_linkedin_url(url) if HAS_DATABASE else url
+                    # Try exact URL match first
                     if normalized in recently_enriched:
                         skipped_urls.append(url)
                     else:
-                        new_urls.append(url)
+                        # Try base username match (handles ID suffix differences)
+                        base_username = get_base_username_from_url(url) if HAS_DATABASE else None
+                        if base_username and base_username in recently_enriched_usernames:
+                            skipped_urls.append(url)
+                        else:
+                            # Try reversed name order (first-last vs last-first)
+                            reversed_username = get_reversed_username(base_username) if base_username else None
+                            if reversed_username and reversed_username in recently_enriched_usernames:
+                                skipped_urls.append(url)
+                            else:
+                                new_urls.append(url)
 
                 # Debug info
                 with st.expander("Debug: Enrichment check", expanded=False):
                     st.write(f"URLs in loaded data: {len(urls)}")
-                    st.write(f"Recently enriched (< {refresh_months} months): {len(recently_enriched)}")
+                    st.write(f"Recently enriched list (raw): {len(recently_enriched_list)}")
+                    st.write(f"Recently enriched set (normalized): {len(recently_enriched)}")
+                    st.write(f"Recently enriched usernames (base): {len(recently_enriched_usernames)}")
+
+                    # Debug: show sample base usernames from DB and loaded
+                    db_usernames_sample = list(recently_enriched_usernames)[:5]
+                    loaded_usernames_sample = [get_base_username_from_url(u) for u in urls[:5]]
+                    st.write(f"Sample DB base usernames: {db_usernames_sample}")
+                    st.write(f"Sample loaded base usernames: {loaded_usernames_sample}")
                     st.write(f"New or stale (need enrichment): {len(new_urls)}")
                     st.write(f"Skipped (fresh in DB): {len(skipped_urls)}")
                     if db_check_error:
                         st.error(f"DB check error: {db_check_error}")
-                    if recently_enriched:
-                        st.write("Sample recently enriched URLs:", list(recently_enriched)[:3])
-                    if urls:
-                        st.write("Sample URLs from loaded data:", [normalize_linkedin_url(u) for u in urls[:3]])
+
+                    # Show normalized comparison
+                    loaded_normalized = [normalize_linkedin_url(u) for u in urls[:5]]
+                    st.write("Sample loaded URLs (normalized):", loaded_normalized)
+
+                    # Show raw DB URLs (before normalization) to see original_urls
+                    if recently_enriched_list:
+                        # Find URLs with ID suffix (likely original_urls)
+                        urls_with_suffix = [u for u in recently_enriched_list[:50] if u and '-' in u.split('/in/')[-1] and any(c.isdigit() for c in u.split('-')[-1])]
+                        st.write(f"Sample DB URLs with ID suffix (original_urls): {urls_with_suffix[:5]}")
+                        st.write("Sample DB URLs (normalized):", list(recently_enriched)[:5])
+
+                        # Check for near-matches (same username, different format)
+                        loaded_usernames = set()
+                        for u in urls[:100]:
+                            norm = normalize_linkedin_url(u)
+                            if norm and '/in/' in norm:
+                                username = norm.split('/in/')[-1].rstrip('/')
+                                loaded_usernames.add(username)
+
+                        db_usernames = set()
+                        for u in list(recently_enriched)[:1000]:
+                            if u and '/in/' in u:
+                                username = u.split('/in/')[-1].rstrip('/')
+                                db_usernames.add(username)
+
+                        overlap = loaded_usernames & db_usernames
+                        st.write(f"Username overlap (first 100 loaded vs DB): {len(overlap)} matches")
+                        if overlap:
+                            st.write("Sample matching usernames:", list(overlap)[:5])
 
                 # Show stats - skip recently enriched by default
                 if skipped_urls:
                     st.info(f"**{len(new_urls)}** profiles to enrich | **{len(skipped_urls)}** skipped (enriched < {refresh_months} months ago)")
                     urls_for_enrichment = new_urls
+
+                    # Option to load enriched profiles from DB for this list
+                    if HAS_DATABASE and len(skipped_urls) > 0:
+                        if st.button(f"Load {len(skipped_urls)} enriched profiles for screening", type="primary", key="load_enriched_for_list"):
+                            with st.spinner("Loading profiles from database..."):
+                                try:
+                                    db_client = _get_db_client()
+                                    if not db_client:
+                                        st.error("Database connection failed")
+                                    else:
+                                        # Get all recently enriched profiles with pagination (Supabase 1000 row limit)
+                                        import datetime as dt
+                                        cutoff_date = (dt.datetime.utcnow() - dt.timedelta(days=refresh_months * 30)).isoformat()
+
+                                        # Paginate to get all profiles
+                                        all_db_profiles = []
+                                        offset = 0
+                                        page_size = 1000
+                                        while True:
+                                            filters = {'enriched_at': f'gte.{cutoff_date}', 'offset': str(offset)}
+                                            batch = db_client.select('profiles', '*', filters, limit=page_size)
+                                            if not batch:
+                                                break
+                                            all_db_profiles.extend(batch)
+                                            if len(batch) < page_size:
+                                                break
+                                            offset += page_size
+
+                                        st.write(f"Debug: Got {len(all_db_profiles)} profiles from DB (with pagination)")
+                                        all_profiles = all_db_profiles  # Already filtered by date in query
+
+                                        # Build comprehensive set of variations from skipped URLs for matching
+                                        skipped_variations = set()
+                                        for u in skipped_urls:
+                                            # Add normalized URL
+                                            normalized = normalize_linkedin_url(u)
+                                            if normalized:
+                                                skipped_variations.add(normalized)
+
+                                            # Add base username and variations
+                                            base = get_base_username_from_url(u)
+                                            if base:
+                                                skipped_variations.add(base)
+                                                # Reversed name
+                                                reversed_name = get_reversed_username(base)
+                                                if reversed_name:
+                                                    skipped_variations.add(reversed_name)
+                                                # Hyphen-free version
+                                                skipped_variations.add(base.replace('-', ''))
+
+                                        # Filter to matching profiles
+                                        matched_profiles = []
+                                        seen_urls = set()  # Avoid duplicates
+                                        for p in all_profiles:
+                                            p_url = p.get('linkedin_url') or ''
+                                            if p_url in seen_urls:
+                                                continue
+
+                                            matched = False
+                                            # Check normalized URL
+                                            p_normalized = normalize_linkedin_url(p_url)
+                                            if p_normalized and p_normalized in skipped_variations:
+                                                matched = True
+
+                                            # Check base username and variations
+                                            if not matched:
+                                                p_base = get_base_username_from_url(p_url)
+                                                if p_base:
+                                                    if p_base in skipped_variations:
+                                                        matched = True
+                                                    elif p_base.replace('-', '') in skipped_variations:
+                                                        matched = True
+                                                    else:
+                                                        p_reversed = get_reversed_username(p_base)
+                                                        if p_reversed and p_reversed in skipped_variations:
+                                                            matched = True
+
+                                            if matched:
+                                                matched_profiles.append(p)
+                                                seen_urls.add(p_url)
+
+                                        if matched_profiles:
+                                            enriched_df = profiles_to_dataframe(matched_profiles)
+                                            st.session_state['enriched_results'] = matched_profiles
+                                            st.session_state['enriched_df'] = enriched_df
+                                            save_session_state()
+                                            st.success(f"Loaded **{len(matched_profiles)}** enriched profiles for screening! (from {len(all_profiles)} in DB, {len(skipped_variations)} variations)")
+                                            st.balloons()
+                                        else:
+                                            st.warning(f"No matching profiles found. DB has {len(all_profiles)} profiles, tried {len(skipped_variations)} variations.")
+                                except Exception as e:
+                                    st.error(f"Error loading profiles: {e}")
+
                     # Only show re-enrich option in expander if user really wants it
                     with st.expander("Re-enrich options", expanded=False):
                         if st.checkbox("Re-enrich recently-enriched profiles", value=False, key="reenrich_cb"):
@@ -4206,6 +5227,9 @@ with tab_enrich:
                         # Get usage tracker for logging
                         tracker = get_usage_tracker()
 
+                        # Start timer
+                        start_time = time.time()
+
                         for i in range(0, len(urls_to_process), batch_size):
                             batch = urls_to_process[i:i + batch_size]
                             batch_num = i // batch_size + 1
@@ -4218,8 +5242,15 @@ with tab_enrich:
                                 time.sleep(2)
 
                         progress_bar.progress(1.0)
-                        status_text.text("Enrichment complete!")
-                        send_notification("Enrichment Complete", f"Processed {len(results)} profiles")
+
+                        # Calculate elapsed time
+                        elapsed_time = time.time() - start_time
+                        minutes = int(elapsed_time // 60)
+                        seconds = int(elapsed_time % 60)
+                        time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+
+                        status_text.text(f"Enrichment complete! Time: {time_str}")
+                        send_notification("Enrichment Complete", f"Processed {len(results)} profiles in {time_str}")
 
                         # Use Crustdata's response directly - no URL matching needed
                         # Crustdata's linkedin_profile_url is the source of truth
@@ -4233,11 +5264,33 @@ with tab_enrich:
                         if errors:
                             st.warning(f"Errors: {[e.get('error', 'unknown')[:100] for e in errors[:3]]}")
 
+                        # Show URL mapping debug info
+                        with st.expander("Debug: URL Matching Details", expanded=True):
+                            enrich_debug = st.session_state.get('_enrich_debug', {})
+                            match_debug = st.session_state.get('_enrich_match_debug', {})
+
+                            st.write("**Input URL Mapping:**")
+                            st.write(f"- Input URLs: {enrich_debug.get('input_urls', 'N/A')}")
+                            st.write(f"- Map keys created: {enrich_debug.get('map_keys', 'N/A')}")
+                            st.write(f"- Failed to extract: {enrich_debug.get('failed_extract', 'N/A')}")
+                            st.write(f"- Sample inputs: {enrich_debug.get('sample_inputs', [])}")
+                            st.write(f"- Sample map keys: {enrich_debug.get('sample_map_keys', [])}")
+                            if enrich_debug.get('failed_samples'):
+                                st.write(f"- Failed samples: {enrich_debug.get('failed_samples', [])}")
+
+                            st.write("**Result Matching:**")
+                            st.write(f"- Results: {match_debug.get('results', 'N/A')}")
+                            st.write(f"- Matched: {match_debug.get('matched', 'N/A')}")
+                            st.write(f"- Unmatched: {match_debug.get('unmatched_count', 'N/A')}")
+                            st.write(f"- Unmatched samples: {match_debug.get('unmatched_samples', [])}")
+                            st.write(f"- Result samples: {match_debug.get('result_samples', [])}")
+
                         if successful:
                             # Save enriched data separately - don't overwrite original loaded data
                             st.session_state['enriched_results'] = successful
                             enriched_df = flatten_for_csv(successful)
                             st.session_state['enriched_df'] = enriched_df
+                            save_session_state()  # Save for restore
 
                             # Debug: show what was created
                             st.write(f"**Debug:** Created enriched_df with {len(enriched_df)} rows, columns: {list(enriched_df.columns)[:10]}")
@@ -4248,11 +5301,21 @@ with tab_enrich:
                                 try:
                                     db_client = _get_db_client()
                                     if db_client:
+                                        # Debug: show URL fields and matching stats
+                                        if successful:
+                                            sample = successful[0]
+                                            st.write(f"**Debug URLs:** flagship={sample.get('linkedin_flagship_url')}, _original_url={sample.get('_original_url')}")
+                                            # Count matched vs unmatched
+                                            matched = sum(1 for p in successful if p.get('_original_url'))
+                                            st.write(f"**Matching:** {matched}/{len(successful)} profiles matched to original URLs")
+
                                         for profile in successful:
-                                            # Use linkedin_flagship_url (clean format) from Crustdata
-                                            linkedin_url = profile.get('linkedin_flagship_url') or profile.get('linkedin_profile_url') or profile.get('linkedin_url')
+                                            # Use linkedin_flagship_url (canonical) as primary, not encoded linkedin_url
+                                            linkedin_url = profile.get('linkedin_flagship_url') or profile.get('linkedin_url')
+                                            # Use tracked original URL for matching with loaded data
+                                            original_url = profile.get('_original_url')
                                             if linkedin_url:
-                                                update_profile_enrichment(db_client, linkedin_url, profile)
+                                                update_profile_enrichment(db_client, linkedin_url, profile, original_url=original_url)
                                                 db_saved += 1
                                 except Exception as e:
                                     st.warning(f"Database save failed: {e}")
@@ -4262,10 +5325,10 @@ with tab_enrich:
                             if len(enriched_df) == 0:
                                 st.error("Enrichment returned empty DataFrame. Check if profiles have valid data.")
                             elif errors:
-                                st.session_state['enrichment_message'] = f"warning:Enriched {len(successful)} profiles{db_msg}. {len(errors)} failed: {errors[0].get('error', 'Unknown')[:150]}"
+                                st.session_state['enrichment_message'] = f"warning:Enriched {len(successful)} profiles in {time_str}{db_msg}. {len(errors)} failed: {errors[0].get('error', 'Unknown')[:150]}"
                                 st.rerun()
                             else:
-                                st.session_state['enrichment_message'] = f"success:Enriched {len(successful)} profiles successfully!{db_msg}"
+                                st.session_state['enrichment_message'] = f"success:Enriched {len(successful)} profiles in {time_str}{db_msg}"
                                 st.rerun()
                         elif errors:
                             # All failed - show error, original data stays intact
@@ -4390,10 +5453,25 @@ with tab_filter2:
             skills_logic = st.radio("Logic:", ["AND", "OR"], key="f2_skills_logic", horizontal=True,
                                    help="AND = must have ALL keywords, OR = must have at least ONE")
         with skill_col3:
-            search_scope = st.radio("Search in:", ["Skills only", "Full experience"], key="f2_search_scope", horizontal=True,
-                                   help="Full experience = skills + titles + employers + positions")
+            search_scope = st.radio("Search in:", ["Skills only", "Full profile"], key="f2_search_scope", horizontal=True,
+                                   help="Skills = skills column only | Full profile = everything including job descriptions")
 
-        if st.button("Apply Filters", type="primary", key="apply_filters_enriched"):
+        btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
+        with btn_col1:
+            apply_clicked = st.button("Apply Filters", type="primary", key="apply_filters_enriched")
+        with btn_col2:
+            if st.button("Reset Filters", key="reset_filters_enriched"):
+                # Reset to original enriched_df
+                st.session_state['passed_candidates_df'] = enriched_df.copy()
+                if 'f2_filter_stats' in st.session_state:
+                    del st.session_state['f2_filter_stats']
+                if 'f2_filtered_out' in st.session_state:
+                    del st.session_state['f2_filtered_out']
+                st.success(f"Reset to {len(enriched_df)} profiles")
+                save_session_state()
+                st.rerun()
+
+        if apply_clicked:
             with st.spinner("Applying filters..."):
                 df = enriched_df.copy()
                 original_count = len(df)
@@ -4411,10 +5489,22 @@ with tab_filter2:
                         for col in nr_df.columns:
                             not_relevant_companies.update(nr_df[col].dropna().str.lower().str.strip().tolist())
                         if 'all_employers' in df.columns:
-                            def has_not_relevant_employer(employers_str):
-                                if pd.isna(employers_str) or not employers_str:
+                            def has_not_relevant_employer(employers_data):
+                                # Handle None, NaN, empty
+                                if employers_data is None:
                                     return False
-                                employers = [e.strip().lower() for e in str(employers_str).split(',')]
+                                try:
+                                    if pd.isna(employers_data):
+                                        return False
+                                except (ValueError, TypeError):
+                                    pass  # Handle arrays that can't be checked with isna
+                                if not employers_data:
+                                    return False
+                                # Handle list/array or comma-separated string
+                                if isinstance(employers_data, (list, tuple)):
+                                    employers = [str(e).strip().lower() for e in employers_data if e]
+                                else:
+                                    employers = [e.strip().lower() for e in str(employers_data).split(',')]
                                 return any(emp in not_relevant_companies for emp in employers)
                             mask = df['all_employers'].apply(has_not_relevant_employer)
                             filtered_out['Not Relevant Companies'] = df[mask].to_dict('records')
@@ -4429,15 +5519,27 @@ with tab_filter2:
                         for col in uni_df.columns:
                             target_unis.update(uni_df[col].dropna().str.lower().str.strip().tolist())
                         if 'all_schools' in df.columns:
-                            def has_target_university(schools_str):
+                            def has_target_university(schools_data):
                                 """Check if profile attended a target university.
                                 Uses stricter matching: target must match start of school name
                                 or be a significant portion (>60%) to avoid false positives like
                                 'Tel Aviv University' matching 'Afeka Tel Aviv College'.
                                 """
-                                if pd.isna(schools_str) or not schools_str:
+                                # Handle None, NaN, empty
+                                if schools_data is None:
                                     return False
-                                schools = [s.strip().lower() for s in str(schools_str).split(',')]
+                                try:
+                                    if pd.isna(schools_data):
+                                        return False
+                                except (ValueError, TypeError):
+                                    pass  # Handle arrays that can't be checked with isna
+                                if not schools_data:
+                                    return False
+                                # Handle list/array or comma-separated string
+                                if isinstance(schools_data, (list, tuple)):
+                                    schools = [str(s).strip().lower() for s in schools_data if s]
+                                else:
+                                    schools = [s.strip().lower() for s in str(schools_data).split(',')]
                                 for school in schools:
                                     for target in target_unis:
                                         if not target:
@@ -4506,10 +5608,10 @@ with tab_filter2:
                 if required_skills and required_skills.strip():
                     skills_list = [s.strip().lower() for s in required_skills.split(',') if s.strip()]
                     if skills_list:
-                        # Determine which columns to search
-                        if search_scope == "Full experience":
-                            search_cols = ['skills', 'all_titles', 'all_employers', 'past_positions', 'summary', 'headline']
-                            scope_label = "experience"
+                        # Determine which columns to search based on scope
+                        if search_scope == "Full profile":
+                            search_cols = ['skills', 'all_titles', 'all_employers', 'past_positions', 'summary', 'headline', 'raw_crustdata']
+                            scope_label = "profile"
                         else:
                             search_cols = ['skills']
                             scope_label = "skills"
@@ -4517,12 +5619,20 @@ with tab_filter2:
                         available_search_cols = [c for c in search_cols if c in df.columns]
 
                         if available_search_cols:
+                            import json as json_module
                             def has_required_keywords(row):
                                 # Combine text from all search columns
-                                combined_text = ' '.join(
-                                    str(row[c]) for c in available_search_cols
-                                    if c in row and row.get(c) is not None
-                                ).lower()
+                                text_parts = []
+                                for c in available_search_cols:
+                                    if c not in row or row.get(c) is None:
+                                        continue
+                                    val = row[c]
+                                    # Handle raw_crustdata dict/JSON
+                                    if c == 'raw_crustdata' and isinstance(val, dict):
+                                        text_parts.append(json_module.dumps(val, ensure_ascii=False))
+                                    else:
+                                        text_parts.append(str(val))
+                                combined_text = ' '.join(text_parts).lower()
 
                                 if not combined_text.strip():
                                     return False
@@ -4558,6 +5668,7 @@ with tab_filter2:
                         st.caption(f"  - {reason}: {count} removed")
                 if priority_matches and uni_filter_mode == "Prioritize (move to top)":
                     st.info(f"🎓 {len(priority_matches)} candidates from target universities (shown first)")
+                save_session_state()  # Save for restore
                 st.rerun()
 
         # Show filter stats if available
@@ -4744,46 +5855,177 @@ with tab_screening:
                 placeholder="e.g., Must have AWS experience, Hebrew speaker preferred, etc."
             )
 
-        # System Prompt Editor (admin only — also shown when auth is off for local dev)
+        # Role Detection and Prompt Selection
+        st.markdown("### Screening Prompt")
+
+        # Auto-detect role from JD
+        detected_prompt, detected_role, detected_name = get_screening_prompt_for_role(job_description=job_description)
+
+        # Build role options
+        role_options = ['Auto-detect']
+        role_options.extend([f"{v['name']}" for k, v in DEFAULT_PROMPTS.items()])
+
+        # Load custom prompts from DB
+        db_prompts = []
+        if HAS_DATABASE:
+            db_client = _get_db_client()
+            if db_client:
+                db_prompts = get_screening_prompts(db_client)
+                for p in db_prompts:
+                    name = p.get('name', p['role_type'].title())
+                    if name not in role_options:
+                        role_options.append(name)
+
+        col_role, col_detected = st.columns([2, 3])
+        with col_role:
+            selected_role = st.selectbox(
+                "Prompt type",
+                options=role_options,
+                index=0,
+                key="screening_role_select",
+                help="Auto-detect picks the best prompt based on job description keywords"
+            )
+
+        with col_detected:
+            if selected_role == 'Auto-detect':
+                if job_description:
+                    st.success(f"Detected: **{detected_name}**")
+                else:
+                    st.info("Paste job description to auto-detect role")
+
+        # Get the actual prompt to use
+        if selected_role == 'Auto-detect':
+            active_prompt = detected_prompt
+            active_role = detected_role
+            active_name = detected_name
+        else:
+            # Find the selected prompt
+            active_prompt = None
+            active_role = None
+            active_name = selected_role
+
+            # Check defaults first
+            for role_key, role_data in DEFAULT_PROMPTS.items():
+                if role_data['name'] == selected_role:
+                    active_prompt = role_data['prompt']
+                    active_role = role_key
+                    break
+
+            # Check DB prompts
+            if not active_prompt:
+                for p in db_prompts:
+                    if p.get('name', p['role_type'].title()) == selected_role:
+                        active_prompt = p['prompt_text']
+                        active_role = p['role_type']
+                        break
+
+            if not active_prompt:
+                active_prompt = DEFAULT_SCREENING_PROMPT
+                active_role = 'backend'
+
+        # Store active prompt in session state for screening
+        st.session_state['active_screening_prompt'] = active_prompt
+        st.session_state['active_screening_role'] = active_role
+
+        # Admin section for managing prompts
         ADMIN_NAMES = {'alexey', 'dana', 'admin'}
         current_user = st.session_state.get('username', '').lower()
         is_admin = (
             not authenticator  # no auth = local dev, always show
             or current_user in ADMIN_NAMES
-            or any(name in current_user for name in ADMIN_NAMES)  # match email like alexey@...
+            or any(name in current_user for name in ADMIN_NAMES)
         )
+
         if is_admin:
-            with st.expander("System Prompt (admin only)"):
-                current_prompt = get_screening_prompt()
-                edited_prompt = st.text_area(
-                    "Edit the AI screening instructions",
-                    value=current_prompt,
-                    height=300,
-                    key="screening_prompt_editor",
-                )
-                col_save_prompt, col_reset_prompt = st.columns(2)
-                with col_save_prompt:
-                    if st.button("Save Prompt", key="save_prompt_btn"):
-                        if HAS_DATABASE:
+            with st.expander("Manage Prompts (admin)"):
+                prompt_tabs = st.tabs(["View/Edit Current", "Add New", "Manage All"])
+
+                with prompt_tabs[0]:
+                    st.markdown(f"**Currently selected:** {active_name}")
+                    edited_prompt = st.text_area(
+                        "Edit prompt",
+                        value=active_prompt,
+                        height=250,
+                        key="edit_current_prompt"
+                    )
+                    if st.button("Save Changes", key="save_current_prompt"):
+                        if HAS_DATABASE and active_role:
                             db_client = _get_db_client()
-                            if db_client and save_setting(db_client, 'screening_system_prompt', edited_prompt):
-                                st.success("Prompt saved to database")
+                            # Get keywords for this role
+                            keywords = DEFAULT_PROMPTS.get(active_role, {}).get('keywords', [])
+                            if save_screening_prompt(db_client, active_role, edited_prompt, keywords):
+                                st.success(f"Saved prompt for {active_name}")
                                 st.rerun()
                             else:
-                                st.error("Failed to save — check Supabase connection")
+                                st.error("Failed to save")
                         else:
-                            st.error("Supabase not connected")
-                with col_reset_prompt:
-                    if st.button("Reset to Default", key="reset_prompt_btn"):
-                        if HAS_DATABASE:
-                            db_client = _get_db_client()
-                            if db_client and save_setting(db_client, 'screening_system_prompt', DEFAULT_SCREENING_PROMPT):
-                                st.success("Prompt reset to default")
-                                st.rerun()
+                            st.error("Database not connected")
+
+                with prompt_tabs[1]:
+                    st.markdown("**Create new prompt:**")
+                    new_role_type = st.text_input("Role type (e.g., 'devops', 'qa')", key="new_role_type")
+                    new_role_name = st.text_input("Display name (e.g., 'DevOps Engineer')", key="new_role_name")
+                    new_keywords = st.text_input("Keywords (comma-separated)", key="new_keywords",
+                                                 placeholder="e.g., devops, kubernetes, ci/cd, docker")
+                    new_prompt = st.text_area("Prompt text", height=200, key="new_prompt_text",
+                                              placeholder="Paste or write your screening prompt here...")
+                    new_is_default = st.checkbox("Set as default prompt", key="new_is_default")
+
+                    if st.button("Add Prompt", key="add_new_prompt"):
+                        if new_role_type and new_prompt:
+                            if HAS_DATABASE:
+                                db_client = _get_db_client()
+                                keywords_list = [k.strip().lower() for k in new_keywords.split(',') if k.strip()]
+                                # Save with name in prompt_text metadata (we'll store name separately)
+                                data = {
+                                    'role_type': new_role_type.lower().strip(),
+                                    'prompt_text': new_prompt,
+                                    'keywords': keywords_list,
+                                    'is_default': new_is_default,
+                                    'name': new_role_name or new_role_type.title(),
+                                    'updated_at': datetime.utcnow().isoformat(),
+                                }
+                                try:
+                                    db_client.upsert('screening_prompts', data, on_conflict='role_type')
+                                    st.success(f"Added prompt: {new_role_name or new_role_type}")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed to add: {e}")
                             else:
-                                st.error("Failed to reset — check Supabase connection")
+                                st.error("Database not connected")
                         else:
-                            st.error("Supabase not connected")
+                            st.warning("Role type and prompt text are required")
+
+                with prompt_tabs[2]:
+                    st.markdown("**All saved prompts:**")
+                    if db_prompts:
+                        for p in db_prompts:
+                            col1, col2, col3 = st.columns([3, 1, 1])
+                            with col1:
+                                name = p.get('name', p['role_type'].title())
+                                default_badge = " (default)" if p.get('is_default') else ""
+                                st.write(f"**{name}**{default_badge}")
+                                st.caption(f"Keywords: {', '.join(p.get('keywords', []))}")
+                            with col2:
+                                if st.button("Set Default", key=f"default_{p['role_type']}"):
+                                    if HAS_DATABASE:
+                                        db_client = _get_db_client()
+                                        # Clear other defaults first
+                                        for other in db_prompts:
+                                            if other.get('is_default'):
+                                                save_screening_prompt(db_client, other['role_type'],
+                                                                     other['prompt_text'], other.get('keywords', []), False)
+                                        save_screening_prompt(db_client, p['role_type'],
+                                                             p['prompt_text'], p.get('keywords', []), True)
+                                        st.rerun()
+                            with col3:
+                                if st.button("Delete", key=f"del_{p['role_type']}"):
+                                    if HAS_DATABASE:
+                                        db_client = _get_db_client()
+                                        if delete_screening_prompt(db_client, p['role_type']):
+                                            st.rerun()
+                    else:
+                        st.info("No custom prompts saved yet. Default prompts are built-in.")
 
         # Screening Configuration
         st.markdown("### Screening Configuration")
@@ -4832,8 +6074,9 @@ with tab_screening:
                     try:
                         client = OpenAI(api_key=openai_key)
                         test_mode = 'quick' if screening_mode == "Quick (cheaper)" else 'detailed'
-                        st.write(f"Testing with first profile ({test_mode} mode)...")
-                        result = screen_profile(profiles[0], job_description, client, extra_requirements, mode=test_mode)
+                        test_prompt = st.session_state.get('active_screening_prompt', active_prompt)
+                        st.write(f"Testing with first profile ({test_mode} mode, prompt: {active_name})...")
+                        result = screen_profile(profiles[0], job_description, client, extra_requirements, mode=test_mode, system_prompt=test_prompt)
                         st.write("Result:", result)
                     except Exception as e:
                         import traceback
@@ -4908,18 +6151,32 @@ with tab_screening:
                                     pass
                         st.session_state['screening_cancelled'] = True
                         st.session_state['screening_batch_mode'] = False
+                        save_session_state()  # Save partial results for restore
                         st.warning(f"Screening cancelled! {len(partial_results)} profiles were completed and saved.")
                         st.rerun()
 
-            # Show existing results warning and clear option
+            # Show existing results and options
             existing_results = st.session_state.get('screening_results', [])
+            start_button = False
+            continue_button = False
+
             if existing_results and not screening_in_progress:
-                st.warning(f"⚠️ You have **{len(existing_results)}** previously screened profiles. Starting new screening will replace these results.")
-                col_start, col_clear = st.columns([2, 1])
-                with col_start:
-                    start_button = st.button("🔄 Start New Screening", type="primary", key="start_screening")
-                with col_clear:
-                    if st.button("🗑️ Clear Results", key="clear_screening_results"):
+                # Find profiles not yet screened
+                screened_urls = set(r.get('linkedin_url', '') for r in existing_results if r.get('linkedin_url'))
+                unscreened_profiles = [p for p in profiles if p.get('linkedin_url', '') not in screened_urls]
+
+                st.info(f"📊 **{len(existing_results)}** profiles already screened | **{len(unscreened_profiles)}** remaining")
+
+                col1, col2, col3 = st.columns([2, 2, 1])
+                with col1:
+                    if unscreened_profiles:
+                        continue_button = st.button(f"▶️ Continue ({len(unscreened_profiles)} left)", type="primary", key="continue_screening")
+                    else:
+                        st.success("All profiles screened!")
+                with col2:
+                    start_button = st.button("🔄 Re-screen All", key="start_screening")
+                with col3:
+                    if st.button("🗑️ Clear", key="clear_screening_results"):
                         st.session_state['screening_results'] = []
                         st.session_state['screening_batch_state'] = {}
                         st.success("Results cleared!")
@@ -4936,6 +6193,7 @@ with tab_screening:
                 job_desc = batch_state.get('job_description', '')
                 extra_req = batch_state.get('extra_requirements', '')
                 screen_mode = batch_state.get('mode', 'detailed')
+                system_prompt = batch_state.get('system_prompt')
                 batch_size = 10  # Process 10 at a time for responsive cancellation
                 current_batch = batch_state.get('current_batch', 0)
                 all_results = batch_state.get('results', [])
@@ -4953,7 +6211,8 @@ with tab_screening:
                             openai_key,
                             extra_requirements=extra_req,
                             max_workers=min(10, len(batch_profiles)),
-                            mode=screen_mode
+                            mode=screen_mode,
+                            system_prompt=system_prompt
                         )
                         all_results.extend(batch_results)
 
@@ -5011,9 +6270,10 @@ with tab_screening:
                         db_msg = f" ({db_saved} saved to DB)" if db_saved > 0 else ""
                         st.success(f"✅ Screening complete! {len(all_results)} profiles{db_msg}")
                         send_notification("Screening Complete", f"Screened {len(all_results)} profiles")
+                        save_session_state()  # Save for restore
                         st.rerun()
 
-            if start_button:
+            if start_button or continue_button:
                 # Validate OpenAI API key before starting
                 try:
                     test_client = OpenAI(api_key=openai_key)
@@ -5032,8 +6292,19 @@ with tab_screening:
                         st.error(f"OpenAI connection failed: {error_msg[:200]}")
                     st.stop()
 
-                # Initialize batch screening mode
-                profiles_to_screen = profiles[:screen_count]
+                # Determine which profiles to screen
+                if continue_button:
+                    # Continue: only screen profiles not yet screened
+                    existing_results = st.session_state.get('screening_results', [])
+                    screened_urls = set(r.get('linkedin_url', '') for r in existing_results if r.get('linkedin_url'))
+                    unscreened = [p for p in profiles if p.get('linkedin_url', '') not in screened_urls]
+                    profiles_to_screen = unscreened[:screen_count]
+                    # Keep existing results to append to
+                    initial_results = existing_results.copy()
+                else:
+                    # Start fresh
+                    profiles_to_screen = profiles[:screen_count]
+                    initial_results = []
 
                 st.session_state['screening_batch_mode'] = True
                 st.session_state['screening_cancelled'] = False
@@ -5042,15 +6313,18 @@ with tab_screening:
                     'job_description': job_description,
                     'extra_requirements': extra_requirements if extra_requirements else "",
                     'mode': 'quick' if screening_mode == "Quick (cheaper)" else 'detailed',
+                    'system_prompt': st.session_state.get('active_screening_prompt', active_prompt),
                     'current_batch': 0,
-                    'results': []
+                    'results': initial_results,  # Start with existing results if continuing
+                    'is_continue': continue_button  # Flag to know we're continuing
                 }
                 st.session_state['screening_batch_progress'] = {
-                    'completed': 0,
-                    'total': len(profiles_to_screen)
+                    'completed': len(initial_results),
+                    'total': len(initial_results) + len(profiles_to_screen)
                 }
 
-                st.info(f"Starting screening of {len(profiles_to_screen)} profiles in batches of 10...")
+                action = "Continuing" if continue_button else "Starting"
+                st.info(f"{action} screening of {len(profiles_to_screen)} profiles in batches of 10...")
                 st.rerun()
         else:
             st.warning("Please paste a job description to start screening")
@@ -5131,10 +6405,10 @@ with tab_screening:
                         'Score': r.get('score', 0),
                         'Fit': r.get('fit', ''),
                         'Name': r.get('name', ''),
+                        'LinkedIn': r.get('linkedin_url', ''),
                         'Title': r.get('current_title', '')[:40],
                         'Company': r.get('current_company', '')[:30],
-                        'Summary': r.get('summary', '')[:100],
-                        'LinkedIn': r.get('linkedin_url', '')
+                        'Summary': r.get('summary', '')[:100]
                     })
 
                 df_display = pd.DataFrame(display_data)
@@ -5147,10 +6421,10 @@ with tab_screening:
                         "Score": st.column_config.NumberColumn("Score", format="%d/10", width="small"),
                         "Fit": st.column_config.TextColumn("Fit", width="medium"),
                         "Name": st.column_config.TextColumn("Name", width="medium"),
+                        "LinkedIn": st.column_config.LinkColumn("🔗", width="small", display_text="Open"),
                         "Title": st.column_config.TextColumn("Title", width="medium"),
                         "Company": st.column_config.TextColumn("Company", width="medium"),
-                        "Summary": st.column_config.TextColumn("Summary", width="large"),
-                        "LinkedIn": st.column_config.LinkColumn("LinkedIn", width="small")
+                        "Summary": st.column_config.TextColumn("Summary", width="large")
                     }
                 )
 

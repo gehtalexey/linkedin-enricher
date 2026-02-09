@@ -48,14 +48,14 @@ class SupabaseClient:
             return response.json()
         return {}
 
-    def select(self, table: str, columns: str = '*', filters: dict = None, limit: int = None) -> list:
+    def select(self, table: str, columns: str = '*', filters: dict = None, limit: int = 50000) -> list:
         """Select rows from a table."""
         params = {'select': columns}
         if filters:
             for key, value in filters.items():
                 params[key] = value
-        if limit:
-            params['limit'] = limit
+        # Always set limit to avoid Supabase default of 1000
+        params['limit'] = limit
         return self._request('GET', table, params=params)
 
     def insert(self, table: str, data: dict) -> list:
@@ -156,7 +156,7 @@ def get_supabase_client() -> Optional[SupabaseClient]:
 # PROFILE OPERATIONS (Crustdata Enriched Profiles Only)
 # ============================================================================
 
-def save_enriched_profile(client: SupabaseClient, linkedin_url: str, crustdata_response: dict) -> dict:
+def save_enriched_profile(client: SupabaseClient, linkedin_url: str, crustdata_response: dict, original_url: str = None) -> dict:
     """Save a Crustdata-enriched profile to the database.
 
     Simplified approach: Store raw_data as-is, extract only title/company for indexing.
@@ -164,8 +164,9 @@ def save_enriched_profile(client: SupabaseClient, linkedin_url: str, crustdata_r
 
     Args:
         client: SupabaseClient instance
-        linkedin_url: The LinkedIn URL (used as primary key)
+        linkedin_url: The LinkedIn URL (used as primary key, typically from Crustdata)
         crustdata_response: Raw response from Crustdata API
+        original_url: The original input URL (for matching with loaded data)
 
     Returns:
         The saved profile record
@@ -173,6 +174,9 @@ def save_enriched_profile(client: SupabaseClient, linkedin_url: str, crustdata_r
     linkedin_url = normalize_linkedin_url(linkedin_url)
     if not linkedin_url:
         raise ValueError("Valid linkedin_url is required")
+
+    # Also normalize original_url for matching
+    original_url = normalize_linkedin_url(original_url) if original_url else None
 
     cd = crustdata_response or {}
 
@@ -213,6 +217,7 @@ def save_enriched_profile(client: SupabaseClient, linkedin_url: str, crustdata_r
     # Data to save - indexed fields + raw_data for everything else
     data = {
         'linkedin_url': linkedin_url,
+        'original_url': original_url,  # For matching with loaded data
         'raw_data': crustdata_response,
         'current_title': current_title,
         'current_company': current_company,
@@ -255,9 +260,9 @@ def save_enriched_profiles_batch(client: SupabaseClient, profiles: list[tuple[st
 
 
 # Backwards compatibility alias
-def update_profile_enrichment(client: SupabaseClient, linkedin_url: str, crustdata_response: dict) -> dict:
+def update_profile_enrichment(client: SupabaseClient, linkedin_url: str, crustdata_response: dict, original_url: str = None) -> dict:
     """Alias for save_enriched_profile (backwards compatibility)."""
-    return save_enriched_profile(client, linkedin_url, crustdata_response)
+    return save_enriched_profile(client, linkedin_url, crustdata_response, original_url=original_url)
 
 
 def update_profile_screening(client: SupabaseClient, linkedin_url: str, score: int, fit_level: str,
@@ -362,10 +367,32 @@ def get_all_linkedin_urls(client: SupabaseClient) -> list:
 
 
 def get_recently_enriched_urls(client: SupabaseClient, months: int = 6) -> list:
-    """Get LinkedIn URLs enriched within the last N months."""
+    """Get LinkedIn URLs enriched within the last N months.
+    Returns both linkedin_url and original_url for better matching.
+    Uses pagination to bypass Supabase 1000 row limit."""
     cutoff_date = (datetime.utcnow() - timedelta(days=months * 30)).isoformat()
-    result = client.select('profiles', 'linkedin_url', {'enriched_at': f'gte.{cutoff_date}'}, limit=50000)
-    return [p['linkedin_url'] for p in result if p.get('linkedin_url')]
+
+    # Paginate to get all results (Supabase has 1000 row server limit)
+    all_results = []
+    offset = 0
+    page_size = 1000
+    while True:
+        filters = {'enriched_at': f'gte.{cutoff_date}', 'offset': str(offset)}
+        result = client.select('profiles', 'linkedin_url,original_url', filters, limit=page_size)
+        if not result:
+            break
+        all_results.extend(result)
+        if len(result) < page_size:
+            break
+        offset += page_size
+
+    urls = []
+    for p in all_results:
+        if p.get('linkedin_url'):
+            urls.append(p['linkedin_url'])
+        if p.get('original_url') and p.get('original_url') != p.get('linkedin_url'):
+            urls.append(p['original_url'])
+    return urls
 
 
 def get_dedup_stats(client: SupabaseClient) -> dict:
@@ -565,6 +592,109 @@ def save_setting(client: SupabaseClient, key: str, value: str) -> bool:
     except Exception as e:
         print(f"[DB] Failed to save setting '{key}': {e}")
         return False
+
+
+# ============================================================================
+# SCREENING PROMPTS
+# ============================================================================
+
+def get_screening_prompts(client: SupabaseClient) -> list:
+    """Get all screening prompts from the database."""
+    try:
+        result = client.select('screening_prompts', '*', limit=100)
+        return result if result else []
+    except Exception as e:
+        print(f"[DB] Failed to get screening prompts: {e}")
+        return []
+
+
+def get_screening_prompt_by_role(client: SupabaseClient, role_type: str) -> Optional[dict]:
+    """Get a screening prompt by role type."""
+    try:
+        result = client.select('screening_prompts', '*', {'role_type': f'eq.{role_type}'}, limit=1)
+        if result:
+            return result[0]
+    except Exception as e:
+        print(f"[DB] Failed to get prompt for role '{role_type}': {e}")
+    return None
+
+
+def get_default_screening_prompt(client: SupabaseClient) -> Optional[dict]:
+    """Get the default screening prompt (is_default=true)."""
+    try:
+        result = client.select('screening_prompts', '*', {'is_default': 'eq.true'}, limit=1)
+        if result:
+            return result[0]
+    except Exception as e:
+        print(f"[DB] Failed to get default prompt: {e}")
+    return None
+
+
+def save_screening_prompt(client: SupabaseClient, role_type: str, prompt_text: str,
+                          keywords: list = None, is_default: bool = False, name: str = None) -> bool:
+    """Save or update a screening prompt."""
+    try:
+        data = {
+            'role_type': role_type.lower().strip(),
+            'prompt_text': prompt_text,
+            'keywords': keywords or [],
+            'is_default': is_default,
+            'name': name or role_type.title(),
+            'updated_at': datetime.utcnow().isoformat(),
+        }
+        client.upsert('screening_prompts', data, on_conflict='role_type')
+        return True
+    except Exception as e:
+        print(f"[DB] Failed to save prompt '{role_type}': {e}")
+        return False
+
+
+def delete_screening_prompt(client: SupabaseClient, role_type: str) -> bool:
+    """Delete a screening prompt by role type."""
+    try:
+        client.delete('screening_prompts', {'role_type': role_type})
+        return True
+    except Exception as e:
+        print(f"[DB] Failed to delete prompt '{role_type}': {e}")
+        return False
+
+
+def match_prompt_by_keywords(client: SupabaseClient, text: str) -> Optional[dict]:
+    """Find the best matching prompt based on keywords in the text.
+
+    Scans the job description text for keywords and returns the prompt
+    with the most keyword matches.
+    """
+    try:
+        prompts = get_screening_prompts(client)
+        if not prompts:
+            return None
+
+        text_lower = text.lower()
+        best_match = None
+        best_score = 0
+
+        for prompt in prompts:
+            keywords = prompt.get('keywords', [])
+            if not keywords:
+                continue
+
+            # Count keyword matches
+            score = sum(1 for kw in keywords if kw.lower() in text_lower)
+
+            if score > best_score:
+                best_score = score
+                best_match = prompt
+
+        # Return match if we found at least 2 keyword matches
+        if best_score >= 2:
+            return best_match
+
+        # Fall back to default prompt
+        return get_default_screening_prompt(client)
+    except Exception as e:
+        print(f"[DB] Failed to match prompt: {e}")
+        return None
 
 
 # ============================================================================
