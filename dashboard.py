@@ -3316,6 +3316,45 @@ def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_re
     # Extract full work history with dates from raw_crustdata
     def format_work_history(profile):
         """Format work history with dates for accurate experience calculation."""
+        from datetime import datetime
+        from dateutil.relativedelta import relativedelta
+
+        def parse_date(date_str):
+            """Parse ISO date string to datetime."""
+            if not date_str:
+                return None
+            try:
+                # Handle ISO format: "2019-04-01T00:00:00+00:00"
+                if 'T' in str(date_str):
+                    return datetime.fromisoformat(date_str.replace('+00:00', '').replace('Z', ''))
+                # Handle simple format: "2019-04"
+                return datetime.strptime(str(date_str)[:7], '%Y-%m')
+            except:
+                return None
+
+        def format_date(dt):
+            """Format datetime as 'Mon YYYY'."""
+            if not dt:
+                return ''
+            return dt.strftime('%b %Y')
+
+        def calc_duration(start_dt, end_dt):
+            """Calculate duration between dates."""
+            if not start_dt:
+                return ''
+            if not end_dt:
+                end_dt = datetime.now()
+            try:
+                rd = relativedelta(end_dt, start_dt)
+                parts = []
+                if rd.years:
+                    parts.append(f"{rd.years}y")
+                if rd.months:
+                    parts.append(f"{rd.months}m")
+                return ' '.join(parts) if parts else '<1m'
+            except:
+                return ''
+
         raw = profile.get('raw_crustdata', {})
 
         # Try past_employers first (Crustdata format)
@@ -3325,24 +3364,35 @@ def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_re
 
         if all_positions:
             positions = []
+            total_months = 0
             for emp in all_positions[:15]:  # Limit to 15 positions
                 if isinstance(emp, dict):
                     title = emp.get('employee_title') or emp.get('title') or ''
                     company = emp.get('employer_name') or emp.get('company_name') or ''
-                    start = emp.get('start_date') or emp.get('started_on') or ''
-                    end = emp.get('end_date') or emp.get('ended_on') or 'Present'
-                    duration = emp.get('duration') or ''
+                    start_str = emp.get('start_date') or emp.get('started_on') or ''
+                    end_str = emp.get('end_date') or emp.get('ended_on') or ''
+
+                    start_dt = parse_date(start_str)
+                    end_dt = parse_date(end_str)
+                    duration = calc_duration(start_dt, end_dt)
+
+                    # Track total experience
+                    if start_dt:
+                        end_for_calc = end_dt or datetime.now()
+                        months = (end_for_calc.year - start_dt.year) * 12 + (end_for_calc.month - start_dt.month)
+                        total_months += max(0, months)
 
                     if title or company:
-                        pos_str = f"- {title} at {company}"
-                        if start:
-                            pos_str += f" ({start} - {end})"
+                        start_fmt = format_date(start_dt) or '?'
+                        end_fmt = format_date(end_dt) or 'Present'
+                        pos_str = f"- {title} at {company} ({start_fmt} - {end_fmt})"
                         if duration:
                             pos_str += f" [{duration}]"
                         positions.append(pos_str)
 
             if positions:
-                return '\n'.join(positions)
+                total_years = round(total_months / 12, 1)
+                return f"Total experience: ~{total_years} years\n" + '\n'.join(positions)
 
         # Fallback to past_positions field
         return profile.get('past_positions', 'N/A')
