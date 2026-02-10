@@ -88,3 +88,19 @@ Give higher scores when candidate has:
 4. **Check Extra Requirements**: If user provides must-haves, evaluate against those first.
 5. **Company > Skills**: Strong company pedigree compensates for skill list gaps.
 6. **Full-stack OK**: Full-stack title with right stack is fine for backend roles.
+
+## Email Personalization Rules (Subject Lines & Openers)
+
+When generating personalized subject lines and email openers:
+
+1. **Normalize company names**: LinkedIn data contains messy names like "Check Point Software Technologies, Ltd.", "Apple Inc.", "WalkMe™". ALWAYS clean these to their common short form (Check Point, Apple, WalkMe). Strip suffixes (Ltd, Inc, Corp, LLC, GmbH), trademark symbols, and unicode junk.
+
+2. **Only reference RECENT employers (2018+)**: Never mention a position from 10+ years ago. Parse position dates and only reference the last ~8 years. Sort by end_date descending and pick the most recent notable employer.
+
+3. **Avoid false keyword matches**: "intel" matches "Intelligence" in military unit names. Use exact company name matching against normalized position data, NOT substring search against the raw employers string.
+
+4. **Vary the templates**: Use multiple subject/opener variations randomly so bulk outreach doesn't look bot-generated. Never use the same phrasing for every candidate.
+
+5. **No special characters**: No em dashes, smart quotes, trademark symbols, or unicode in output. Keep it plain ASCII-friendly text.
+
+6. **Keep it human**: Short, punchy, conversational. Reference one specific thing about THEM (recent notable company, years of experience, current role). Don't over-compliment. Write like a real recruiter, not a template engine.

@@ -7,6 +7,7 @@ Uses REST API directly - no supabase package required.
 
 import os
 import json
+import re
 import requests
 from datetime import datetime, timedelta
 from typing import Optional
@@ -679,15 +680,25 @@ def match_prompt_by_keywords(client: SupabaseClient, text: str) -> Optional[dict
             if not keywords:
                 continue
 
-            # Count keyword matches
-            score = sum(1 for kw in keywords if kw.lower() in text_lower)
+            # Score keyword matches with word-boundary matching
+            score = 0
+            for kw in keywords:
+                kw_lower = kw.lower()
+                if ' ' in kw_lower:
+                    # Multi-word phrase: substring match, worth 2 points
+                    if kw_lower in text_lower:
+                        score += 2
+                else:
+                    # Single word: word-boundary match to avoid false positives
+                    if re.search(r'\b' + re.escape(kw_lower) + r'\b', text_lower):
+                        score += 1
 
             if score > best_score:
                 best_score = score
                 best_match = prompt
 
-        # Return match if we found at least 1 keyword match
-        if best_score >= 1:
+        # Return match if score >= 2 (a phrase match, or 2+ single-word matches)
+        if best_score >= 2:
             return best_match
 
         return None

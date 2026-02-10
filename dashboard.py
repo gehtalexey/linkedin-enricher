@@ -2619,6 +2619,27 @@ def apply_pre_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, di
 from prompts import DEFAULT_PROMPTS, DEFAULT_SCREENING_PROMPT
 
 
+def _score_keywords(keywords: list, text_lower: str) -> float:
+    """Score keyword matches using word-boundary matching.
+
+    Multi-word keywords (phrases) get 2 points each since they're more specific.
+    Single-word keywords get 1 point and use word-boundary regex to avoid
+    false substring matches (e.g. 'go' matching inside 'going').
+    """
+    score = 0
+    for kw in keywords:
+        kw_lower = kw.lower()
+        if ' ' in kw_lower:
+            # Multi-word phrase: substring match is fine, worth 2 points
+            if kw_lower in text_lower:
+                score += 2
+        else:
+            # Single word: use word boundary to avoid false matches
+            if re.search(r'\b' + re.escape(kw_lower) + r'\b', text_lower):
+                score += 1
+    return score
+
+
 def get_screening_prompt_for_role(role_type: str = None, job_description: str = None) -> tuple:
     """Get screening prompt, either by role or auto-detected from JD.
 
@@ -2650,11 +2671,11 @@ def get_screening_prompt_for_role(role_type: str = None, job_description: str = 
         for role_key, role_data in DEFAULT_PROMPTS.items():
             if role_key == 'general':
                 continue
-            score = sum(1 for kw in role_data['keywords'] if kw in jd_lower)
+            score = _score_keywords(role_data['keywords'], jd_lower)
             if score > best_score:
                 best_score = score
                 best_match = role_key
-        if best_score >= 1 and best_match:
+        if best_score >= 2 and best_match:
             return DEFAULT_PROMPTS[best_match]['prompt'], best_match, DEFAULT_PROMPTS[best_match]['name']
 
     # Fall back to general/default
@@ -5902,6 +5923,7 @@ with tab_screening:
             existing_results = st.session_state.get('screening_results', [])
             start_button = False
             continue_button = False
+            rescreen_selected_button = False
 
             if existing_results and not screening_in_progress:
                 # Find profiles not yet screened
@@ -5924,6 +5946,26 @@ with tab_screening:
                         st.session_state['screening_batch_state'] = {}
                         st.success("Results cleared!")
                         st.rerun()
+
+                # Re-screen specific profiles
+                with st.expander("🔄 Re-screen specific profiles"):
+                    profile_options = {
+                        f"{r.get('name', 'Unknown')} — {r.get('current_title', '')[:30]} ({r.get('fit', '?')}, {r.get('score', 0)}/10)": r.get('linkedin_url', '')
+                        for r in existing_results if r.get('linkedin_url')
+                    }
+                    selected_labels = st.multiselect(
+                        "Select profiles to re-screen",
+                        options=list(profile_options.keys()),
+                        key="rescreen_profile_select"
+                    )
+                    selected_urls = [profile_options[label] for label in selected_labels]
+                    st.session_state['rescreen_selected_urls'] = selected_urls
+                    if selected_urls:
+                        rescreen_selected_button = st.button(
+                            f"🔄 Re-screen {len(selected_urls)} selected",
+                            key="rescreen_selected_btn",
+                            type="primary"
+                        )
             else:
                 start_disabled = screening_in_progress
                 start_button = st.button("Start Screening", type="primary", key="start_screening", disabled=start_disabled)
@@ -6041,7 +6083,7 @@ with tab_screening:
                         save_session_state()  # Save for restore
                         st.rerun()
 
-            if start_button or continue_button:
+            if start_button or continue_button or rescreen_selected_button:
                 # Validate OpenAI API key before starting (uses free models.list endpoint)
                 try:
                     test_client = OpenAI(api_key=openai_key)
@@ -6057,7 +6099,13 @@ with tab_screening:
                     st.stop()
 
                 # Determine which profiles to screen
-                if continue_button:
+                if rescreen_selected_button:
+                    # Re-screen specific profiles: screen only selected, keep the rest
+                    rescreen_urls = set(st.session_state.get('rescreen_selected_urls', []))
+                    existing_results = st.session_state.get('screening_results', [])
+                    initial_results = [r for r in existing_results if r.get('linkedin_url', '') not in rescreen_urls]
+                    profiles_to_screen = [p for p in profiles if p.get('linkedin_url', '') in rescreen_urls]
+                elif continue_button:
                     # Continue: only screen profiles not yet screened
                     existing_results = st.session_state.get('screening_results', [])
                     screened_urls = set(r.get('linkedin_url', '') for r in existing_results if r.get('linkedin_url'))
@@ -6087,7 +6135,7 @@ with tab_screening:
                     'total': len(initial_results) + len(profiles_to_screen)
                 }
 
-                action = "Continuing" if continue_button else "Starting"
+                action = "Re-screening" if rescreen_selected_button else ("Continuing" if continue_button else "Starting")
                 st.info(f"{action} screening of {len(profiles_to_screen)} profiles in batches of 10...")
                 st.rerun()
         else:
