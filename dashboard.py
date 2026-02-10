@@ -5487,13 +5487,25 @@ with tab_screening:
         profiles_missing_raw = [p for p in profiles if not p.get('raw_crustdata') and not p.get('raw_data')]
         if profiles_missing_raw:
             # Try enriched_results first (in-memory, fast)
+            # Index by BOTH linkedin_flagship_url (clean) and linkedin_url (encoded)
+            # since display DF uses flagship but raw Crustdata has both
             raw_by_url = {}
             for ep in (st.session_state.get('enriched_results') or []):
-                url = ep.get('linkedin_url', '')
-                if url:
-                    raw = ep.get('raw_data') or ep.get('raw_crustdata')
-                    if raw:
-                        raw_by_url[url] = _ensure_raw_dict(raw)
+                raw = ep.get('raw_data') or ep.get('raw_crustdata') or ep
+                parsed_raw = _ensure_raw_dict(raw) if not isinstance(raw, dict) else raw
+                if not parsed_raw:
+                    continue
+                # Index under all possible URL variants from both the entry
+                # (DB profile has linkedin_url at top) and the raw data inside
+                # (Crustdata response has linkedin_flagship_url, linkedin_url, etc.)
+                urls_to_index = set()
+                for url_key in ['linkedin_flagship_url', 'linkedin_url', 'linkedin_profile_url']:
+                    for source in [ep, parsed_raw]:
+                        url = source.get(url_key, '') if isinstance(source, dict) else ''
+                        if url:
+                            urls_to_index.add(url)
+                for url in urls_to_index:
+                    raw_by_url[url] = parsed_raw
             for p in profiles_missing_raw:
                 url = p.get('linkedin_url', '')
                 if url and url in raw_by_url and raw_by_url[url]:
