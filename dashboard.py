@@ -205,10 +205,7 @@ with st.sidebar:
                 st.error("Failed to save")
     with col_clear:
         if st.button("Clear", key="sidebar_clear_session", help="Clear saved session"):
-            from pathlib import Path
-            SESSION_FILE = Path(__file__).parent / '.last_session.json'
-            if SESSION_FILE.exists():
-                SESSION_FILE.unlink()
+            clear_session_file()
             for key in ['results', 'results_df', 'enriched_results', 'enriched_df', 'screening_results',
                         'passed_candidates_df', 'filter_stats', 'f2_filter_stats', 'original_results_df',
                         'active_screening_prompt', 'active_screening_role', 'jd_screening', 'extra_requirements']:
@@ -3734,9 +3731,9 @@ with tab_upload:
     # Show restore options if there's data to restore
     if has_local_session or HAS_DATABASE:
         with st.expander("Resume Last Session", expanded=False):
-            # Local session restore (includes filtered data)
-            if has_local_session:
-                st.markdown("**Local Session** (includes filtered data)")
+            # Session restore (from Supabase on cloud, local file for dev)
+            if has_local_session or HAS_DATABASE:
+                st.markdown("**Saved Session** (includes filtered data)")
                 col_local1, col_local2 = st.columns([3, 1])
                 with col_local1:
                     if st.button("Restore Last Session", key="restore_local_session", type="primary"):
@@ -3824,7 +3821,7 @@ with tab_upload:
                                         st.success(f"Loaded {len(profiles)} profiles!")
                                         st.rerun()
                 except Exception as e:
-                    pass  # Silently fail if database not available
+                    st.caption(f"Database restore unavailable: {e}")
 
     # ===== File Upload Section =====
     st.markdown("### Upload File")
