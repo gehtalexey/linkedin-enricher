@@ -2803,7 +2803,7 @@ def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_re
             except:
                 return ''
 
-        raw = profile.get('raw_crustdata', {})
+        raw = profile.get('raw_crustdata') or profile.get('raw_data') or {}
 
         # Try past_employers first (Crustdata format)
         past_employers = raw.get('past_employers', [])
@@ -2846,7 +2846,7 @@ def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_re
         return profile.get('past_positions', 'N/A')
 
     # Get full raw Crustdata JSON for comprehensive screening
-    raw_crustdata = profile.get('raw_crustdata', {})
+    raw_crustdata = profile.get('raw_crustdata') or profile.get('raw_data') or {}
 
     # Clean up raw data - remove unnecessary fields to reduce tokens
     def clean_raw_data(raw):

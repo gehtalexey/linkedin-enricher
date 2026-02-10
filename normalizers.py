@@ -559,7 +559,7 @@ def profile_to_display_dict(profile: dict) -> dict:
     name = f"{first} {last}".strip() or 'Unknown'
 
     # Extract past_positions from raw_crustdata - full JSON for preview
-    raw = profile.get('raw_crustdata', {})
+    raw = profile.get('raw_crustdata') or profile.get('raw_data') or {}
     past_employers = raw.get('past_employers', [])
     past_positions = json.dumps(past_employers, ensure_ascii=False) if past_employers else ''
 
