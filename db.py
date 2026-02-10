@@ -690,8 +690,7 @@ def match_prompt_by_keywords(client: SupabaseClient, text: str) -> Optional[dict
         if best_score >= 2:
             return best_match
 
-        # Fall back to default prompt
-        return get_default_screening_prompt(client)
+        return None
     except Exception as e:
         print(f"[DB] Failed to match prompt: {e}")
         return None
