@@ -5460,20 +5460,38 @@ with tab_screening:
         profiles = profiles_df.to_dict('records')
 
         # Ensure profiles have raw data for AI screening.
-        # - Enrichment path: enriched_df (from flatten_for_csv) already has raw_crustdata
-        # - DB load path: enriched_df (from profiles_to_display_df) strips raw_data,
-        #   so we inject it back from enriched_results (which are full DB rows)
-        enriched_list = st.session_state.get('enriched_results') or []
-        if enriched_list:
+        # The display DataFrame may strip raw_data/raw_crustdata, so we inject it
+        # back from enriched_results (session state) or the database directly.
+        profiles_missing_raw = [p for p in profiles if not p.get('raw_crustdata') and not p.get('raw_data')]
+        if profiles_missing_raw:
+            # Try enriched_results first (in-memory, fast)
             raw_by_url = {}
-            for ep in enriched_list:
+            for ep in (st.session_state.get('enriched_results') or []):
                 url = ep.get('linkedin_url', '')
                 if url:
                     raw_by_url[url] = ep.get('raw_data') or ep.get('raw_crustdata')
-            for p in profiles:
+            for p in profiles_missing_raw:
                 url = p.get('linkedin_url', '')
-                if url and url in raw_by_url and not p.get('raw_crustdata') and not p.get('raw_data'):
+                if url and url in raw_by_url and raw_by_url[url]:
                     p['raw_data'] = raw_by_url[url]
+
+            # If still missing, fetch from database directly
+            still_missing = [p for p in profiles if not p.get('raw_crustdata') and not p.get('raw_data')]
+            if still_missing and HAS_DATABASE:
+                try:
+                    db_client = _get_db_client()
+                    if db_client:
+                        missing_urls = [p.get('linkedin_url', '') for p in still_missing if p.get('linkedin_url')]
+                        if missing_urls:
+                            # Batch fetch all profiles from DB
+                            db_profiles = db_client.select('profiles', 'linkedin_url,raw_data', limit=len(profiles) + 100)
+                            db_raw_by_url = {dp['linkedin_url']: dp.get('raw_data') for dp in db_profiles if dp.get('linkedin_url')}
+                            for p in still_missing:
+                                url = p.get('linkedin_url', '')
+                                if url and url in db_raw_by_url and db_raw_by_url[url]:
+                                    p['raw_data'] = db_raw_by_url[url]
+                except Exception as e:
+                    print(f"[Screening] Failed to fetch raw data from DB: {e}")
 
         # Job Description Input
         st.markdown("### Job Description")
