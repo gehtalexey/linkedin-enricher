@@ -2847,10 +2847,15 @@ def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_re
 
     # Get full raw Crustdata JSON for comprehensive screening
     raw_crustdata = profile.get('raw_crustdata') or profile.get('raw_data') or {}
+    if isinstance(raw_crustdata, str):
+        try:
+            raw_crustdata = json.loads(raw_crustdata)
+        except (json.JSONDecodeError, TypeError):
+            raw_crustdata = {}
 
     # Clean up raw data - remove unnecessary fields to reduce tokens
     def clean_raw_data(raw):
-        if not raw:
+        if not raw or not isinstance(raw, dict):
             return {}
         # Fields to exclude (large/unnecessary for screening)
         # Note: employer_linkedin_description is INCLUDED (helps evaluate company context)
@@ -5459,9 +5464,26 @@ with tab_screening:
         # Convert DataFrame to dicts for screening
         profiles = profiles_df.to_dict('records')
 
+        # Helper: ensure raw_data is a dict (may arrive as JSON string from DB/session)
+        def _ensure_raw_dict(raw):
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    return {}
+            return raw if isinstance(raw, dict) else {}
+
         # Ensure profiles have raw data for AI screening.
         # The display DataFrame may strip raw_data/raw_crustdata, so we inject it
         # back from enriched_results (session state) or the database directly.
+
+        # First, parse any existing raw_data/raw_crustdata that are JSON strings
+        for p in profiles:
+            if p.get('raw_crustdata'):
+                p['raw_crustdata'] = _ensure_raw_dict(p['raw_crustdata'])
+            if p.get('raw_data'):
+                p['raw_data'] = _ensure_raw_dict(p['raw_data'])
+
         profiles_missing_raw = [p for p in profiles if not p.get('raw_crustdata') and not p.get('raw_data')]
         if profiles_missing_raw:
             # Try enriched_results first (in-memory, fast)
@@ -5469,7 +5491,9 @@ with tab_screening:
             for ep in (st.session_state.get('enriched_results') or []):
                 url = ep.get('linkedin_url', '')
                 if url:
-                    raw_by_url[url] = ep.get('raw_data') or ep.get('raw_crustdata')
+                    raw = ep.get('raw_data') or ep.get('raw_crustdata')
+                    if raw:
+                        raw_by_url[url] = _ensure_raw_dict(raw)
             for p in profiles_missing_raw:
                 url = p.get('linkedin_url', '')
                 if url and url in raw_by_url and raw_by_url[url]:
@@ -5485,13 +5509,24 @@ with tab_screening:
                         if missing_urls:
                             # Batch fetch all profiles from DB
                             db_profiles = db_client.select('profiles', 'linkedin_url,raw_data', limit=len(profiles) + 100)
-                            db_raw_by_url = {dp['linkedin_url']: dp.get('raw_data') for dp in db_profiles if dp.get('linkedin_url')}
+                            db_raw_by_url = {}
+                            for dp in db_profiles:
+                                if dp.get('linkedin_url'):
+                                    db_raw_by_url[dp['linkedin_url']] = _ensure_raw_dict(dp.get('raw_data'))
                             for p in still_missing:
                                 url = p.get('linkedin_url', '')
                                 if url and url in db_raw_by_url and db_raw_by_url[url]:
                                     p['raw_data'] = db_raw_by_url[url]
                 except Exception as e:
                     print(f"[Screening] Failed to fetch raw data from DB: {e}")
+
+        # Diagnostic: show data status so issues can be identified
+        has_raw = sum(1 for p in profiles if p.get('raw_crustdata') or p.get('raw_data'))
+        missing_raw = len(profiles) - has_raw
+        if missing_raw > 0:
+            st.warning(f"**{missing_raw}** of {len(profiles)} profiles are missing detailed data. AI screening may be limited for these profiles.")
+        else:
+            st.caption(f"All {len(profiles)} profiles have full data for AI screening.")
 
         # Job Description Input
         st.markdown("### Job Description")
