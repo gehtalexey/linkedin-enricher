@@ -3405,9 +3405,10 @@ def screen_profile(profile: dict, job_description: str, client: OpenAI, extra_re
         if not raw:
             return {}
         # Fields to exclude (large/unnecessary for screening)
+        # Note: employer_linkedin_description is INCLUDED (helps evaluate company context)
         exclude_fields = [
             'employer_logo_url', 'profile_picture_url', 'profile_pic_url',
-            'employer_company_website_domain', 'domains', 'employer_linkedin_description',
+            'employer_company_website_domain', 'domains',
             'employer_company_id', 'employee_position_id', 'employer_linkedin_id',
             'profile_picture_permalink', 'background_picture_permalink',
             'linkedin_profile_url', 'linkedin_flagship_url', 'linkedin_sales_navigator_url',
