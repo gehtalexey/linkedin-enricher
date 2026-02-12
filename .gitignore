@@ -5,6 +5,10 @@ google-service-account.json
 *.json.backup
 .streamlit/secrets.toml
 
+# Session files (per-user)
+.sessions/
+.last_session.json
+
 # Search history (user-specific)
 search_history.json
 

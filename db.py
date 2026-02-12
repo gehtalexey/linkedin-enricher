@@ -50,14 +50,32 @@ class SupabaseClient:
         return {}
 
     def select(self, table: str, columns: str = '*', filters: dict = None, limit: int = 50000) -> list:
-        """Select rows from a table."""
+        """Select rows from a table. Auto-paginates past Supabase 1000-row server limit."""
+        PAGE_SIZE = 1000
         params = {'select': columns}
         if filters:
             for key, value in filters.items():
                 params[key] = value
-        # Always set limit to avoid Supabase default of 1000
-        params['limit'] = limit
-        return self._request('GET', table, params=params)
+
+        # Small requests don't need pagination
+        if limit <= PAGE_SIZE:
+            params['limit'] = limit
+            return self._request('GET', table, params=params)
+
+        # Paginate to get all results
+        all_results = []
+        offset = 0
+        while offset < limit:
+            page_limit = min(PAGE_SIZE, limit - offset)
+            page_params = {**params, 'limit': page_limit, 'offset': offset}
+            page = self._request('GET', table, params=page_params)
+            if not page:
+                break
+            all_results.extend(page)
+            if len(page) < page_limit:
+                break
+            offset += PAGE_SIZE
+        return all_results
 
     def insert(self, table: str, data: dict) -> list:
         """Insert a row into a table."""
@@ -78,6 +96,29 @@ class SupabaseClient:
         json_str = json_str.replace(': Infinity', ': null').replace(':Infinity', ':null')
         json_str = json_str.replace(': -Infinity', ': null').replace(':-Infinity', ':null')
         response = requests.post(url, headers=headers, params=params, data=json_str, timeout=30)
+        if response.status_code >= 400:
+            error_msg = f"{response.status_code}: {response.text}"
+            raise requests.HTTPError(error_msg)
+        if response.text:
+            return response.json()
+        return []
+
+    def upsert_batch(self, table: str, rows: list, on_conflict: str = None) -> list:
+        """Upsert multiple rows in a single request (much faster than individual upserts)."""
+        if not rows:
+            return []
+        headers = self.headers.copy()
+        if on_conflict:
+            headers['Prefer'] = f'resolution=merge-duplicates,return=representation'
+        url = f"{self.url}/rest/v1/{table}"
+        params = {}
+        if on_conflict:
+            params['on_conflict'] = on_conflict
+        json_str = json.dumps(rows, allow_nan=True)
+        json_str = json_str.replace(': NaN', ': null').replace(':NaN', ':null')
+        json_str = json_str.replace(': Infinity', ': null').replace(':Infinity', ':null')
+        json_str = json_str.replace(': -Infinity', ': null').replace(':-Infinity', ':null')
+        response = requests.post(url, headers=headers, params=params, data=json_str, timeout=60)
         if response.status_code >= 400:
             error_msg = f"{response.status_code}: {response.text}"
             raise requests.HTTPError(error_msg)
@@ -283,6 +324,45 @@ def update_profile_screening(client: SupabaseClient, linkedin_url: str, score: i
 
     result = client.upsert('profiles', data, on_conflict='linkedin_url')
     return result[0] if result else None
+
+
+def update_profile_screening_batch(client: SupabaseClient, results: list) -> dict:
+    """Batch update profiles with AI screening results (single DB call instead of N).
+
+    Args:
+        client: SupabaseClient instance
+        results: List of dicts with keys: linkedin_url, score, fit_level, summary, reasoning
+    Returns:
+        Stats dict with 'saved' and 'errors' counts
+    """
+    if not results:
+        return {'saved': 0, 'errors': 0}
+
+    now = datetime.utcnow().isoformat()
+    rows = []
+    for r in results:
+        url = normalize_linkedin_url(r.get('linkedin_url', ''))
+        if not url:
+            continue
+        rows.append({
+            'linkedin_url': url,
+            'screening_score': r.get('score'),
+            'screening_fit_level': r.get('fit_level'),
+            'screening_summary': r.get('summary'),
+            'screening_reasoning': r.get('reasoning'),
+            'screened_at': now,
+            'status': 'screened',
+        })
+
+    if not rows:
+        return {'saved': 0, 'errors': 0}
+
+    try:
+        client.upsert_batch('profiles', rows, on_conflict='linkedin_url')
+        return {'saved': len(rows), 'errors': 0}
+    except Exception as e:
+        print(f"[DB] Batch screening save failed: {e}")
+        return {'saved': 0, 'errors': len(rows)}
 
 
 def update_profile_email(client: SupabaseClient, linkedin_url: str, email: str, source: str = 'salesql') -> dict:

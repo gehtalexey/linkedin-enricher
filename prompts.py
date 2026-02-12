@@ -25,6 +25,16 @@ IMPORTANT: This is a LinkedIn profile, NOT a CV. Many strong candidates have min
 - Score based on available signals, not on profile completeness
 - Only disqualify if you see NEGATIVE signals, not missing information"""
 
+# Shared section for ALL prompts - instructs AI to analyze company descriptions
+_COMPANY_DESCRIPTION_ANALYSIS = """
+## Company Description Analysis (CRITICAL)
+The profile data includes `employer_linkedin_description` for each employer. You MUST read these descriptions carefully before scoring.
+- Use company descriptions to determine **what industry/domain** each company operates in (cybersecurity, fintech, healthcare, e-commerce, etc.)
+- When the job description or extra requirements mention a specific industry (e.g. "cybersecurity company", "fintech", "healthcare"), CHECK each employer's description to verify if the candidate has worked in that industry
+- Do NOT rely only on company name recognition — many relevant companies are not well-known. Read the description to understand what the company actually does
+- If the job requires experience at a specific type of company (e.g. "must have cybersecurity company experience") and NO employer description matches that industry → this is a significant negative signal, score accordingly
+- Company industry match should be weighted heavily when the job description explicitly requires it"""
+
 
 # ============================================================================
 # ISRAEL ENGINEERING
@@ -75,6 +85,8 @@ BACKEND_ISRAEL = {
 - Company brand matters more than skill list for Israeli startups
 {_ISRAEL_SPARSE_PROFILE}
 
+{_COMPANY_DESCRIPTION_ANALYSIS}
+
 ## Output
 Be direct and calibrated. Reference specific companies, years, and signals from the profile.""",
 }
@@ -117,7 +129,8 @@ FRONTEND_ISRAEL = {
 - Ideal: 4-10 years total experience
 - Look for React/TypeScript depth, not just usage
 - Company brand matters significantly
-{_ISRAEL_SPARSE_PROFILE}""",
+{_ISRAEL_SPARSE_PROFILE}
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 FULLSTACK_ISRAEL = {
@@ -153,7 +166,8 @@ FULLSTACK_ISRAEL = {
 - Ideal: 4-10 years total experience
 - Must show competency on BOTH frontend and backend
 - Startups value true fullstack ownership
-{_ISRAEL_SPARSE_PROFILE}""",
+{_ISRAEL_SPARSE_PROFILE}
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 DEVOPS_ISRAEL = {
@@ -192,7 +206,8 @@ DEVOPS_ISRAEL = {
 - Ideal: 4-10 years total experience
 - Cloud-native is critical
 - Automation mindset > manual operations
-{_ISRAEL_SPARSE_PROFILE}""",
+{_ISRAEL_SPARSE_PROFILE}
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 TEAMLEAD_ISRAEL = {
@@ -232,7 +247,8 @@ TEAMLEAD_ISRAEL = {
 - Ideal: 6-12 years total, 2+ years leading
 - Must balance technical + leadership
 - Hands-on coding still expected
-{_ISRAEL_SPARSE_PROFILE}""",
+{_ISRAEL_SPARSE_PROFILE}
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 PRODUCT_ISRAEL = {
@@ -272,7 +288,8 @@ PRODUCT_ISRAEL = {
 - Ideal: 5-10 years, including 3+ as PM
 - Technical depth is valued in Israeli startups
 - Look for ownership and impact evidence
-{_ISRAEL_SPARSE_PROFILE_PM}""",
+{_ISRAEL_SPARSE_PROFILE_PM}
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 
@@ -286,7 +303,7 @@ SALES_GLOBAL = {
         'sales', 'account executive', 'ae', 'enterprise sales', 'saas sales',
         'b2b sales', 'quota', 'remote', 'us', 'usa', 'emea', 'apac',
     ],
-    'prompt': """You are an expert sales recruiter for high-growth B2B SaaS companies hiring globally.
+    'prompt': f"""You are an expert sales recruiter for high-growth B2B SaaS companies hiring globally.
 
 ## Scoring Rubric
 - **9-10**: Top performer at top company + consistent quota achievement + enterprise experience + 4-10 years.
@@ -317,7 +334,8 @@ SALES_GLOBAL = {
 - Ideal: 4-10 years in B2B SaaS sales
 - Look for quota achievement numbers
 - Progression from SDR to AE is positive signal
-- Industry knowledge (security, data, cloud) is valuable""",
+- Industry knowledge (security, data, cloud) is valuable
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 SDR_GLOBAL = {
@@ -326,7 +344,7 @@ SDR_GLOBAL = {
         'sdr', 'bdr', 'sales development', 'business development representative',
         'outbound', 'prospecting', 'remote', 'us', 'emea',
     ],
-    'prompt': """You are an expert recruiter for B2B SaaS companies hiring SDR/BDRs globally.
+    'prompt': f"""You are an expert recruiter for B2B SaaS companies hiring SDR/BDRs globally.
 
 ## Scoring Rubric
 - **9-10**: SDR at top company + proven metrics + promotion potential + 1-3 years.
@@ -354,7 +372,8 @@ SDR_GLOBAL = {
 ## Experience Guidelines
 - Ideal: 1-3 years SDR/sales experience
 - Entry-level OK if strong potential signals
-- Look for hunger and coachability""",
+- Look for hunger and coachability
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 MARKETING_GLOBAL = {
@@ -364,7 +383,7 @@ MARKETING_GLOBAL = {
         'content marketing', 'digital marketing', 'plg', 'abm',
         'remote', 'us', 'emea',
     ],
-    'prompt': """You are an expert marketing recruiter for high-growth B2B SaaS companies hiring globally.
+    'prompt': f"""You are an expert marketing recruiter for high-growth B2B SaaS companies hiring globally.
 
 ## Scoring Rubric
 - **9-10**: Top company + measurable pipeline impact + strategic + 4-10 years.
@@ -393,7 +412,8 @@ MARKETING_GLOBAL = {
 ## Experience Guidelines
 - Ideal: 4-10 years, mostly B2B SaaS
 - Look for pipeline/revenue impact numbers
-- Growth/demand gen valued over brand for startups""",
+- Growth/demand gen valued over brand for startups
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 CUSTOMER_SUCCESS_GLOBAL = {
@@ -402,7 +422,7 @@ CUSTOMER_SUCCESS_GLOBAL = {
         'customer success', 'csm', 'cs manager', 'account manager',
         'client success', 'renewals', 'expansion', 'remote', 'us', 'emea',
     ],
-    'prompt': """You are an expert recruiter for B2B SaaS companies hiring Customer Success globally.
+    'prompt': f"""You are an expert recruiter for B2B SaaS companies hiring Customer Success globally.
 
 ## Scoring Rubric
 - **9-10**: Top company + strong retention/expansion metrics + strategic + 4-10 years.
@@ -431,7 +451,8 @@ CUSTOMER_SUCCESS_GLOBAL = {
 ## Experience Guidelines
 - Ideal: 4-10 years in CS/account management
 - Look for retention and expansion numbers
-- Enterprise experience for enterprise roles""",
+- Enterprise experience for enterprise roles
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 SOLUTIONS_ENGINEER_GLOBAL = {
@@ -440,7 +461,7 @@ SOLUTIONS_ENGINEER_GLOBAL = {
         'solutions engineer', 'se', 'sales engineer', 'presales',
         'technical sales', 'demo', 'poc', 'remote', 'us', 'emea',
     ],
-    'prompt': """You are an expert recruiter for B2B SaaS companies hiring Solutions Engineers globally.
+    'prompt': f"""You are an expert recruiter for B2B SaaS companies hiring Solutions Engineers globally.
 
 ## Scoring Rubric
 - **9-10**: Top company + technical depth + sales acumen + 4-10 years.
@@ -468,7 +489,8 @@ SOLUTIONS_ENGINEER_GLOBAL = {
 ## Experience Guidelines
 - Ideal: 4-10 years, mix of technical + customer-facing
 - Engineering background is strong signal
-- Look for enterprise deal involvement""",
+- Look for enterprise deal involvement
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 
@@ -482,7 +504,7 @@ ENGINEERING_GLOBAL = {
         'software engineer', 'developer', 'engineering', 'remote', 'us', 'usa',
         'europe', 'global', 'san francisco', 'new york', 'london',
     ],
-    'prompt': """You are an expert technical recruiter for high-growth tech companies hiring globally.
+    'prompt': f"""You are an expert technical recruiter for high-growth tech companies hiring globally.
 
 ## Scoring Rubric
 - **9-10**: FAANG/top startup + modern stack + 4-10 years + strong impact.
@@ -511,7 +533,8 @@ ENGINEERING_GLOBAL = {
 ## Experience Guidelines
 - Ideal: 4-10 years total experience
 - Company brand matters
-- Modern stack and cloud experience important""",
+- Modern stack and cloud experience important
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 
@@ -525,7 +548,7 @@ MANAGER = {
         'engineering manager', 'em', 'dev manager', 'development manager',
         'r&d manager', 'software manager',
     ],
-    'prompt': """You are an expert recruiter specializing in engineering management roles.
+    'prompt': f"""You are an expert recruiter specializing in engineering management roles.
 
 ## Scoring Rubric
 - **9-10**: Proven EM. Multiple team building cycles. Technical credibility. Strong delivery.
@@ -549,7 +572,8 @@ MANAGER = {
 ## Guidelines
 1. People skills + technical credibility both matter
 2. Look for hiring and team growth
-3. Delivery track record is key""",
+3. Delivery track record is key
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 VP = {
@@ -558,7 +582,7 @@ VP = {
         'vp engineering', 'vp r&d', 'director engineering',
         'head of engineering', 'cto', 'chief technology', 'vp product',
     ],
-    'prompt': """You are an expert executive recruiter specializing in VP/Director level engineering roles.
+    'prompt': f"""You are an expert executive recruiter specializing in VP/Director level engineering roles.
 
 ## Scoring Rubric
 - **9-10**: Proven VP/Director. Built orgs of 30+. Strategic impact. Board/exec presence.
@@ -582,7 +606,8 @@ VP = {
 ## Guidelines
 1. Strategy and org building are key
 2. Business acumen matters at this level
-3. Look for scale and complexity""",
+3. Look for scale and complexity
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 DATASCIENCE = {
@@ -591,7 +616,7 @@ DATASCIENCE = {
         'data science', 'data scientist', 'machine learning', 'ml engineer',
         'ai', 'deep learning', 'nlp', 'computer vision', 'mlops',
     ],
-    'prompt': """You are an expert technical recruiter specializing in Data Science and Machine Learning roles.
+    'prompt': f"""You are an expert technical recruiter specializing in Data Science and Machine Learning roles.
 
 ## Scoring Rubric
 - **9-10**: Strong ML/DS background. Production models. Research publications or real impact.
@@ -615,7 +640,8 @@ DATASCIENCE = {
 ## Guidelines
 1. Production experience > research alone
 2. Look for end-to-end ownership
-3. Strong CS fundamentals matter""",
+3. Strong CS fundamentals matter
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 AUTOMATION = {
@@ -624,7 +650,7 @@ AUTOMATION = {
         'qa automation', 'sdet', 'test automation', 'quality engineer',
         'automation engineer', 'selenium', 'cypress', 'playwright', 'test engineer',
     ],
-    'prompt': """You are an expert technical recruiter specializing in QA Automation and SDET roles.
+    'prompt': f"""You are an expert technical recruiter specializing in QA Automation and SDET roles.
 
 ## Scoring Rubric
 - **9-10**: Strong automation architect. Framework design. CI/CD integration. Performance testing.
@@ -648,13 +674,14 @@ AUTOMATION = {
 ## Guidelines
 1. Coding skills matter - treat as engineer
 2. Framework design > just writing tests
-3. Look for CI/CD and DevOps mindset""",
+3. Look for CI/CD and DevOps mindset
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 GENERAL = {
     'name': 'General',
     'keywords': [],
-    'prompt': """You are an expert recruiter evaluating candidates for a role.
+    'prompt': f"""You are an expert recruiter evaluating candidates for a role.
 
 ## Scoring Rubric
 - **9-10**: Exceptional match. Meets all requirements with bonus qualifications.
@@ -667,7 +694,8 @@ GENERAL = {
 1. Match skills and experience to job requirements
 2. Consider company background and career progression
 3. Look for evidence of impact and achievements
-4. Be calibrated - 10/10 is rare""",
+4. Be calibrated - 10/10 is rare
+{_COMPANY_DESCRIPTION_ANALYSIS}""",
 }
 
 

@@ -61,7 +61,7 @@ Give higher scores when candidate has:
 
 1. **Strong Company Background**: Currently or recently at well-known tech companies:
    - Top Israeli startups: Wiz, Snyk, Monday, Gong, AppsFlyer, Fireblocks, Rapyd, etc.
-   - Award winners: RSA Innovation Sandbox, Y Combinator, top-tier VC backed (Greylock, Kleiner, a]z, Sequoia)
+   - Award winners: RSA Innovation Sandbox, Y Combinator, top-tier VC backed (Greylock, Kleiner, a16z, Sequoia)
    - Big tech: Google, Meta, Amazon, Microsoft (in engineering roles)
    - Acquired startups at good valuations
 
@@ -80,6 +80,16 @@ Give higher scores when candidate has:
 - **QA/Automation background**: Limited backend development depth
 - **Consulting/project companies**: Tikal, Matrix, Ness, etc.
 
+## Company Description Analysis (CRITICAL)
+
+Enriched profile data includes `employer_linkedin_description` for each employer. You MUST read these descriptions carefully before scoring.
+
+- Use company descriptions to determine **what industry/domain** each company operates in (cybersecurity, fintech, healthcare, e-commerce, etc.)
+- When the job description or extra requirements mention a specific industry (e.g. "cybersecurity company", "fintech", "healthcare"), CHECK each employer's description to verify if the candidate has worked in that industry
+- Do NOT rely only on company name recognition — many relevant companies are not well-known. Read the description to understand what the company actually does
+- If the job requires experience at a specific type of company (e.g. "must have cybersecurity company experience") and NO employer description matches that industry → this is a significant negative signal, score accordingly
+- Company industry match should be weighted heavily when the job description explicitly requires it
+
 ## Guidelines
 
 1. **Be Direct**: Don't sugarcoat. Give honest evaluations.
@@ -89,18 +99,4 @@ Give higher scores when candidate has:
 5. **Company > Skills**: Strong company pedigree compensates for skill list gaps.
 6. **Full-stack OK**: Full-stack title with right stack is fine for backend roles.
 
-## Email Personalization Rules (Subject Lines & Openers)
-
-When generating personalized subject lines and email openers:
-
-1. **Normalize company names**: LinkedIn data contains messy names like "Check Point Software Technologies, Ltd.", "Apple Inc.", "WalkMe™". ALWAYS clean these to their common short form (Check Point, Apple, WalkMe). Strip suffixes (Ltd, Inc, Corp, LLC, GmbH), trademark symbols, and unicode junk.
-
-2. **Only reference RECENT employers (2018+)**: Never mention a position from 10+ years ago. Parse position dates and only reference the last ~8 years. Sort by end_date descending and pick the most recent notable employer.
-
-3. **Avoid false keyword matches**: "intel" matches "Intelligence" in military unit names. Use exact company name matching against normalized position data, NOT substring search against the raw employers string.
-
-4. **Vary the templates**: Use multiple subject/opener variations randomly so bulk outreach doesn't look bot-generated. Never use the same phrasing for every candidate.
-
-5. **No special characters**: No em dashes, smart quotes, trademark symbols, or unicode in output. Keep it plain ASCII-friendly text.
-
-6. **Keep it human**: Short, punchy, conversational. Reference one specific thing about THEM (recent notable company, years of experience, current role). Don't over-compliment. Write like a real recruiter, not a template engine.
+**Note**: For generating personalized email subject lines and openers, use the `/email-opener` skill.

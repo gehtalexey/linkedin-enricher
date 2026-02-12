@@ -50,7 +50,7 @@ from helpers import format_past_positions, format_education
 try:
     from db import (
         get_supabase_client, check_connection, save_enriched_profile,
-        update_profile_enrichment, update_profile_screening, get_all_profiles,
+        update_profile_enrichment, update_profile_screening, update_profile_screening_batch, get_all_profiles,
         get_pipeline_stats, get_profiles_by_fit_level, get_all_linkedin_urls,
         get_dedup_stats, profiles_to_dataframe, get_usage_summary, get_usage_logs,
         get_usage_by_date, get_enriched_urls, get_recently_enriched_urls,
@@ -272,7 +272,17 @@ def load_salesql_key():
 
 
 # ===== Session Persistence =====
-SESSION_FILE = Path(__file__).parent / '.last_session.json'
+SESSION_DIR = Path(__file__).parent / '.sessions'
+SESSION_DIR.mkdir(exist_ok=True)
+# Legacy shared file (for migration)
+_LEGACY_SESSION_FILE = Path(__file__).parent / '.last_session.json'
+
+
+def _get_session_file():
+    """Get per-user session file path."""
+    username = st.session_state.get('username', 'default')
+    safe_name = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in username)
+    return SESSION_DIR / f'.session_{safe_name}.json'
 
 def _clean_for_json(obj):
     """Recursively clean data for JSON serialization (handle NaN, numpy types, etc.)."""
@@ -347,26 +357,20 @@ def _restore_session_data(session_data: dict):
 
 
 def save_session_state():
-    """Save current session state. Uses Supabase on cloud, local file for dev."""
+    """Save current session state to local per-user file only.
+
+    NOTE: Session state is saved locally only (not to Supabase) to avoid
+    excessive disk IO. DataFrames can be 8MB+ and saves happen frequently.
+    Profile data is already persisted in Supabase via save_enriched_profile().
+    """
     try:
         session_data = _build_session_data()
         if not session_data:
             return False
 
-        # Try Supabase first (works on cloud)
-        if HAS_DATABASE:
-            try:
-                client = get_supabase_client()
-                if client:
-                    session_key = _get_session_key()
-                    json_data = json.dumps(session_data)
-                    if save_setting(client, session_key, json_data):
-                        return True
-            except Exception as e:
-                print(f"[Session] Supabase save failed: {e}")
-
-        # Fallback to local file (for local development)
-        with open(SESSION_FILE, 'w') as f:
+        # Save to local per-user file only (no Supabase - too much IO)
+        session_file = _get_session_file()
+        with open(session_file, 'w') as f:
             json.dump(session_data, f)
         return True
     except Exception as e:
@@ -375,27 +379,26 @@ def save_session_state():
 
 
 def load_session_state():
-    """Load session state. Tries Supabase first, then local file."""
+    """Load session state from local per-user file."""
     try:
-        # Try Supabase first (works on cloud)
-        if HAS_DATABASE:
-            try:
-                client = get_supabase_client()
-                if client:
-                    session_key = _get_session_key()
-                    json_data = get_setting(client, session_key)
-                    if json_data:
-                        session_data = json.loads(json_data)
-                        _restore_session_data(session_data)
-                        return True
-            except Exception as e:
-                print(f"[Session] Supabase load failed: {e}")
 
-        # Fallback to local file (for local development)
-        if SESSION_FILE.exists():
-            with open(SESSION_FILE, 'r') as f:
+        # Fallback to local file (per-user)
+        session_file = _get_session_file()
+        if session_file.exists():
+            with open(session_file, 'r') as f:
                 session_data = json.load(f)
             _restore_session_data(session_data)
+            return True
+
+        # Try legacy shared file as last resort (one-time migration)
+        if _LEGACY_SESSION_FILE.exists():
+            with open(_LEGACY_SESSION_FILE, 'r') as f:
+                session_data = json.load(f)
+            _restore_session_data(session_data)
+            # Migrate: save to per-user file and delete legacy
+            with open(session_file, 'w') as f:
+                json.dump(session_data, f)
+            _LEGACY_SESSION_FILE.unlink(missing_ok=True)
             return True
     except Exception as e:
         print(f"[Session] Load failed: {e}")
@@ -403,25 +406,18 @@ def load_session_state():
 
 
 def clear_session_file():
-    """Delete the session data from Supabase and/or local file."""
+    """Delete session data from local file."""
     cleared = False
 
-    # Clear from Supabase
-    if HAS_DATABASE:
-        try:
-            client = get_supabase_client()
-            if client:
-                session_key = _get_session_key()
-                # Save empty value to clear
-                save_setting(client, session_key, '{}')
-                cleared = True
-        except Exception as e:
-            print(f"[Session] Supabase clear failed: {e}")
-
-    # Clear local file too
+    # Clear per-user local file
     try:
-        if SESSION_FILE.exists():
-            SESSION_FILE.unlink()
+        session_file = _get_session_file()
+        if session_file.exists():
+            session_file.unlink()
+            cleared = True
+        # Also clean up legacy shared file if it exists
+        if _LEGACY_SESSION_FILE.exists():
+            _LEGACY_SESSION_FILE.unlink()
             cleared = True
     except Exception:
         pass
@@ -481,6 +477,62 @@ def get_usage_tracker():
 SALESQL_REQUESTS_PER_MINUTE = 180
 SALESQL_DAILY_LIMIT = 5000
 SALESQL_DELAY_BETWEEN_REQUESTS = 0.35  # ~170 requests/minute to stay safe
+
+
+@st.cache_resource
+def _get_screening_counter():
+    """Shared counter of active screening sessions across all users.
+    Used to dynamically scale OpenAI concurrent workers."""
+    return {'lock': threading.Lock(), 'active': 0}
+
+
+def _screening_session_start():
+    """Increment active screening sessions counter. Returns recommended max_workers."""
+    counter = _get_screening_counter()
+    with counter['lock']:
+        counter['active'] += 1
+        # Scale workers: 50 for 1 user, 25 for 2, 16 for 3, etc. Min 5.
+        workers = max(5, 50 // counter['active'])
+        return workers
+
+
+def _screening_session_end():
+    """Decrement active screening sessions counter."""
+    counter = _get_screening_counter()
+    with counter['lock']:
+        counter['active'] = max(0, counter['active'] - 1)
+
+
+@st.cache_resource
+def _get_global_rate_limiter():
+    """Shared rate limiter across all user sessions.
+    Returns a dict with a lock and timestamp list for token-bucket limiting."""
+    return {
+        'lock': threading.Lock(),
+        'timestamps': [],  # Recent request timestamps
+        'max_per_minute': 140,  # Global cap (below 180 hard limit)
+    }
+
+
+def _global_rate_limit_wait():
+    """Wait if needed to stay under the global SalesQL rate limit.
+    Call this BEFORE each SalesQL API request."""
+    limiter = _get_global_rate_limiter()
+    with limiter['lock']:
+        now = time.time()
+        cutoff = now - 60.0
+        # Prune old timestamps
+        limiter['timestamps'] = [t for t in limiter['timestamps'] if t > cutoff]
+        if len(limiter['timestamps']) >= limiter['max_per_minute']:
+            # Wait until the oldest request in the window expires
+            wait_time = limiter['timestamps'][0] - cutoff + 0.1
+            if wait_time > 0:
+                time.sleep(wait_time)
+            # Re-prune after waiting
+            now = time.time()
+            cutoff = now - 60.0
+            limiter['timestamps'] = [t for t in limiter['timestamps'] if t > cutoff]
+        limiter['timestamps'].append(time.time())
 
 def enrich_with_salesql(linkedin_url: str, api_key: str, personal_only: bool = True, tracker: 'UsageTracker' = None) -> dict:
     """Enrich a single profile with SalesQL to get email.
@@ -602,6 +654,9 @@ def enrich_profiles_with_salesql(profiles_df: pd.DataFrame, api_key: str, progre
         row = df.loc[idx]
         linkedin_url = row.get(url_col)
 
+        # Global rate limit — shared across all users to stay under 180 req/min
+        _global_rate_limit_wait()
+
         result = enrich_with_salesql(linkedin_url, api_key, personal_only=personal_only, tracker=tracker)
         processed_count += 1
 
@@ -623,9 +678,6 @@ def enrich_profiles_with_salesql(profiles_df: pd.DataFrame, api_key: str, progre
 
         if progress_callback:
             progress_callback(processed_count, total)
-
-        # Rate limiting - 1 request per second to stay within limits
-        time.sleep(SALESQL_DELAY_BETWEEN_REQUESTS)
 
     return df
 
@@ -1584,6 +1636,44 @@ def clear_all_phantombuster_files(api_key: str, agent_id: str) -> int:
     return deleted_count
 
 
+@st.cache_resource
+def _get_pb_agent_locks():
+    """Shared tracker for PhantomBuster agent launches across all user sessions.
+    Prevents two users from launching the same agent simultaneously."""
+    return {'lock': threading.Lock(), 'running': {}}  # {agent_id: {'user': username, 'started': timestamp, 'container_id': str}}
+
+
+def pb_agent_is_busy(agent_id: str) -> dict:
+    """Check if a PhantomBuster agent is currently locked by another user.
+    Returns the lock info dict if busy, or None if free.
+    Auto-expires locks older than 15 minutes (agents should finish by then)."""
+    locks = _get_pb_agent_locks()
+    with locks['lock']:
+        info = locks['running'].get(str(agent_id))
+        if info and (time.time() - info['started']) > 900:  # 15 min expiry
+            del locks['running'][str(agent_id)]
+            return None
+        return info
+
+
+def pb_agent_lock(agent_id: str, username: str, container_id: str = None):
+    """Mark an agent as running by a user."""
+    locks = _get_pb_agent_locks()
+    with locks['lock']:
+        locks['running'][str(agent_id)] = {
+            'user': username,
+            'started': time.time(),
+            'container_id': container_id,
+        }
+
+
+def pb_agent_unlock(agent_id: str):
+    """Release the lock on an agent."""
+    locks = _get_pb_agent_locks()
+    with locks['lock']:
+        locks['running'].pop(str(agent_id), None)
+
+
 def launch_phantombuster_agent(api_key: str, agent_id: str, argument: dict = None, clear_results: bool = False, tracker: 'UsageTracker' = None) -> dict:
     """Launch a PhantomBuster agent with the given argument.
 
@@ -1594,6 +1684,11 @@ def launch_phantombuster_agent(api_key: str, agent_id: str, argument: dict = Non
         clear_results: If True, delete existing result AND database files before launching for fresh results
         tracker: Optional UsageTracker for logging API usage
     """
+    # Check if another user is already running this agent
+    busy = pb_agent_is_busy(agent_id)
+    if busy:
+        return {'error': f"Agent is already running (launched by {busy['user']} {int((time.time() - busy['started']) / 60)}m ago). Please wait or use a different agent."}
+
     start_time = time.time()
     try:
         # Delete existing results AND database for a fresh start
@@ -1633,6 +1728,10 @@ def launch_phantombuster_agent(api_key: str, agent_id: str, argument: dict = Non
         if response.status_code == 200:
             data = response.json()
             container_id = data.get('containerId')
+
+            # Lock the agent so other users see it's running
+            username = st.session_state.get('username', 'unknown')
+            pb_agent_lock(agent_id, username, container_id)
 
             # Log successful launch
             if tracker:
@@ -2937,16 +3036,46 @@ Respond with ONLY valid JSON in this exact format:
     try:
         # Use provided prompt or fall back to default
         prompt_to_use = system_prompt if system_prompt else get_screening_prompt()
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": prompt_to_use},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.3,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"}
+
+        # Always append company description analysis instruction (covers custom DB prompts too)
+        _company_desc_reminder = (
+            "\n\n## Company Description Analysis (CRITICAL)\n"
+            "The profile JSON includes `employer_linkedin_description` for each employer. "
+            "You MUST read these descriptions to determine each company's industry/domain. "
+            "When the job description or extra requirements mention a specific industry "
+            "(e.g. cybersecurity, fintech, healthcare), verify from employer descriptions "
+            "that the candidate actually worked in that industry. "
+            "Do NOT rely only on company name recognition — read the descriptions. "
+            "If the job requires a specific industry and no employer matches → score accordingly."
         )
+        if 'Company Description Analysis' not in prompt_to_use:
+            prompt_to_use += _company_desc_reminder
+
+        # Retry with exponential backoff on rate limit (429) errors
+        response = None
+        last_err = None
+        for _attempt in range(4):  # 1 initial + 3 retries
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": prompt_to_use},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"}
+                )
+                break  # Success
+            except Exception as api_err:
+                err_str = str(api_err).lower()
+                if '429' in err_str or 'rate' in err_str:
+                    last_err = api_err
+                    time.sleep(2 ** _attempt)  # 1s, 2s, 4s
+                    continue
+                raise  # Non-rate-limit error, don't retry
+        if response is None:
+            raise last_err or Exception("OpenAI rate limit exceeded after retries")
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         # Log usage with token counts
@@ -3106,13 +3235,14 @@ def screen_profiles_batch(profiles: list, job_description: str, openai_api_key: 
 # ===== Sidebar: API Connection Status =====
 with st.sidebar:
     config = load_config()
+    _db_ok = bool(HAS_DATABASE and _get_db_client())
     _api_status = {
         'Crustdata': bool(config.get('api_key')),
         'OpenAI': bool(config.get('openai_api_key')),
         'PhantomBuster': bool(config.get('phantombuster_api_key')),
         'SalesQL': bool(config.get('salesql_api_key')),
         'Google Sheets': bool(config.get('google_credentials')),
-        'Supabase': bool(HAS_DATABASE and (config.get('supabase_url') or (hasattr(st, 'secrets') and 'supabase_url' in st.secrets))),
+        'Supabase': _db_ok,
     }
     _missing = [name for name, ok in _api_status.items() if not ok]
     if _missing:
@@ -3143,7 +3273,7 @@ tab_upload, tab_filter, tab_enrich, tab_filter2, tab_screening, tab_database, ta
 # ========== TAB 1: Upload ==========
 with tab_upload:
     # ===== Resume Last Session =====
-    has_local_session = SESSION_FILE.exists()
+    has_local_session = _get_session_file().exists() or _LEGACY_SESSION_FILE.exists()
 
     # Show restore options if there's data to restore
     if has_local_session or HAS_DATABASE:
@@ -3625,6 +3755,9 @@ with tab_upload:
                 # Check if finished or error
                 if container_status == 'finished':
                     st.session_state['pb_launch_status'] = 'finished'
+                    # Release agent lock so other users can launch
+                    if st.session_state.get('pb_launch_agent_id'):
+                        pb_agent_unlock(st.session_state['pb_launch_agent_id'])
                     # Desktop notification
                     try:
                         profiles = status_result.get('profiles_count', 0)
@@ -3648,6 +3781,9 @@ with tab_upload:
                 elif container_status == 'error':
                     st.session_state['pb_launch_status'] = 'error'
                     st.session_state['pb_launch_error'] = status_result.get('exitMessage', 'Phantom failed')
+                    # Release agent lock on error too
+                    if st.session_state.get('pb_launch_agent_id'):
+                        pb_agent_unlock(st.session_state['pb_launch_agent_id'])
                     # Desktop notification for error
                     try:
                         if HAS_PLYER:
@@ -4645,6 +4781,25 @@ with tab_enrich:
                     return None
 
                 # Check for recently enriched profiles in database (within ENRICHMENT_REFRESH_MONTHS)
+                # Cached to avoid fetching 50K+ URLs on every tab load
+                @st.cache_data(ttl=300, show_spinner=False)
+                def _get_cached_enriched_urls(_months):
+                    """Fetch recently enriched URLs from DB (cached 5 min)."""
+                    db_client = _get_db_client()
+                    if not db_client:
+                        return [], set(), set()
+                    url_list = get_recently_enriched_urls(db_client, months=_months)
+                    url_set = set(normalize_linkedin_url(u) for u in url_list if u)
+                    username_set = set()
+                    for u in url_list:
+                        base = get_base_username_from_url(u)
+                        if base:
+                            username_set.add(base)
+                            reversed_name = get_reversed_username(base)
+                            if reversed_name:
+                                username_set.add(reversed_name)
+                    return url_list, url_set, username_set
+
                 recently_enriched = set()
                 recently_enriched_usernames = set()
                 recently_enriched_list = []
@@ -4653,21 +4808,7 @@ with tab_enrich:
                 if HAS_DATABASE:
                     try:
                         refresh_months = ENRICHMENT_REFRESH_MONTHS
-                        db_client = _get_db_client()
-                        if db_client:
-                            # Only skip profiles enriched within the refresh period
-                            recently_enriched_list = get_recently_enriched_urls(db_client, months=refresh_months)
-                            recently_enriched = set(normalize_linkedin_url(u) for u in recently_enriched_list if u)
-
-                            # Also build set of base usernames (without ID suffix) for fuzzy matching
-                            for u in recently_enriched_list:
-                                base = get_base_username_from_url(u)
-                                if base:
-                                    recently_enriched_usernames.add(base)
-                                    # Also add reversed name order
-                                    reversed_name = get_reversed_username(base)
-                                    if reversed_name:
-                                        recently_enriched_usernames.add(reversed_name)
+                        recently_enriched_list, recently_enriched, recently_enriched_usernames = _get_cached_enriched_urls(refresh_months)
                     except Exception as e:
                         db_check_error = str(e)
 
@@ -5810,8 +5951,9 @@ with tab_screening:
                 help="Quick: score + fit + short summary | Detailed: adds reasoning, strengths, concerns"
             )
 
-        # Fixed concurrent workers (optimal for Tier 3)
-        max_workers = 50
+        # Dynamic concurrent workers — scales down when multiple users screen simultaneously
+        max_workers = _screening_session_start()
+        st.session_state['_screening_active'] = True  # Track so we can decrement on completion
 
         # Cost estimate based on mode
         if screening_mode == "Quick (cheaper)":
@@ -5893,26 +6035,31 @@ with tab_screening:
                         partial_results = st.session_state.get('screening_batch_state', {}).get('results', [])
                         if partial_results:
                             st.session_state['screening_results'] = partial_results
-                            # Save partial results to DB
+                            # Save partial results to DB (batch)
                             if HAS_DATABASE:
                                 try:
                                     db_client = _get_db_client()
                                     if db_client:
-                                        for result in partial_results:
-                                            linkedin_url = result.get('linkedin_url') or result.get('public_url')
-                                            if linkedin_url and result.get('fit') != 'Error':
-                                                update_profile_screening(
-                                                    db_client, linkedin_url,
-                                                    score=result.get('score', 0),
-                                                    fit_level=result.get('fit', ''),
-                                                    summary=result.get('summary', ''),
-                                                    reasoning=result.get('why', '')
-                                                )
+                                        batch_rows = [
+                                            {
+                                                'linkedin_url': r.get('linkedin_url') or r.get('public_url'),
+                                                'score': r.get('score', 0),
+                                                'fit_level': r.get('fit', ''),
+                                                'summary': r.get('summary', ''),
+                                                'reasoning': r.get('why', ''),
+                                            }
+                                            for r in partial_results
+                                            if (r.get('linkedin_url') or r.get('public_url')) and r.get('fit') != 'Error'
+                                        ]
+                                        update_profile_screening_batch(db_client, batch_rows)
                                 except Exception as e:
                                     import logging
                                     logging.error(f"Failed to save partial screening results to DB: {e}")
                         st.session_state['screening_cancelled'] = True
                         st.session_state['screening_batch_mode'] = False
+                        if st.session_state.get('_screening_active'):
+                            _screening_session_end()
+                            st.session_state['_screening_active'] = False
                         save_session_state()  # Save partial results for restore
                         st.warning(f"Screening cancelled! {len(partial_results)} profiles were completed and saved.")
                         st.rerun()
@@ -5987,24 +6134,9 @@ with tab_screening:
 
                 if batch_profiles:
                     with st.status(f"Processing batch {current_batch + 1} ({screen_mode} mode)...", expanded=True) as status:
-                        # Save each profile to DB immediately as it completes
+                        # Progress callback (DB save deferred to batch at end)
                         def _on_profile_screened(completed, total, result):
-                            if not HAS_DATABASE or not result or result.get('fit') == 'Error':
-                                return
-                            try:
-                                db_client = _get_db_client()
-                                if db_client:
-                                    linkedin_url = result.get('linkedin_url') or result.get('public_url')
-                                    if linkedin_url:
-                                        update_profile_screening(
-                                            db_client, linkedin_url,
-                                            score=result.get('score', 0),
-                                            fit_level=result.get('fit', ''),
-                                            summary=result.get('summary', ''),
-                                            reasoning=result.get('why', '')
-                                        )
-                            except Exception:
-                                pass  # Will retry on final save
+                            pass  # DB save happens in batch after screening completes
 
                         # Screen this batch
                         batch_results = screen_profiles_batch(
@@ -6027,9 +6159,8 @@ with tab_screening:
                             'total': len(profiles_to_screen)
                         }
 
-                        # Persist to session state after each batch
+                        # Persist to session state after each batch (in-memory only, save at end)
                         st.session_state['screening_results'] = all_results
-                        save_session_state()
 
                         # Show batch stats
                         strong = sum(1 for r in batch_results if r.get('fit') == 'Strong Fit')
@@ -6041,6 +6172,9 @@ with tab_screening:
                     if errors_in_batch == len(batch_results) and current_batch == 0:
                         st.session_state['screening_batch_mode'] = False
                         st.session_state['screening_results'] = all_results
+                        if st.session_state.get('_screening_active'):
+                            _screening_session_end()
+                            st.session_state['_screening_active'] = False
                         error_sample = batch_results[0].get('summary', '') if batch_results else 'Unknown'
                         st.error(f"All profiles in first batch failed. Stopping to save credits.\n\nError: {error_sample}")
                         st.rerun()
@@ -6060,21 +6194,26 @@ with tab_screening:
                             try:
                                 db_client = _get_db_client()
                                 if db_client:
-                                    for result in all_results:
-                                        linkedin_url = result.get('linkedin_url') or result.get('public_url')
-                                        if linkedin_url and result.get('fit') != 'Error':
-                                            update_profile_screening(
-                                                db_client, linkedin_url,
-                                                score=result.get('score', 0),
-                                                fit_level=result.get('fit', ''),
-                                                summary=result.get('summary', ''),
-                                                reasoning=result.get('why', '')
-                                            )
-                                            db_saved += 1
+                                    batch_rows = [
+                                        {
+                                            'linkedin_url': r.get('linkedin_url') or r.get('public_url'),
+                                            'score': r.get('score', 0),
+                                            'fit_level': r.get('fit', ''),
+                                            'summary': r.get('summary', ''),
+                                            'reasoning': r.get('why', ''),
+                                        }
+                                        for r in all_results
+                                        if (r.get('linkedin_url') or r.get('public_url')) and r.get('fit') != 'Error'
+                                    ]
+                                    stats = update_profile_screening_batch(db_client, batch_rows)
+                                    db_saved = stats.get('saved', 0)
                             except Exception as e:
                                 import logging
                                 logging.error(f"Failed to save screening results to DB: {e}")
 
+                        if st.session_state.get('_screening_active'):
+                            _screening_session_end()
+                            st.session_state['_screening_active'] = False
                         db_msg = f" ({db_saved} saved to DB)" if db_saved > 0 else ""
                         st.success(f"✅ Screening complete! {len(all_results)} profiles{db_msg}")
                         send_notification("Screening Complete", f"Screened {len(all_results)} profiles")
@@ -6391,42 +6530,97 @@ with tab_database:
 
                 st.divider()
 
-                # View profiles by fit level
+                # Browse & filter profiles
                 st.markdown("#### Browse Profiles")
 
-                view_options = ["All Profiles", "Strong Fit", "Good Fit", "Partial Fit", "Not a Fit", "Needs Enrichment", "Needs Screening"]
-                selected_view = st.selectbox("View", view_options, key="db_view_select")
+                # Fetch all profiles once
+                all_profiles = get_all_profiles(db_client, limit=2000)
 
-                # Fetch profiles based on selection
-                profiles = []
-                if selected_view == "All Profiles":
-                    profiles = get_all_profiles(db_client, limit=500)
-                elif selected_view in ["Strong Fit", "Good Fit", "Partial Fit", "Not a Fit"]:
-                    profiles = get_profiles_by_fit_level(db_client, selected_view, limit=500)
-                elif selected_view == "Needs Enrichment":
-                    from db import get_profiles_needing_enrichment
-                    profiles = get_profiles_needing_enrichment(db_client, limit=500)
-                elif selected_view == "Needs Screening":
-                    from db import get_profiles_needing_screening
-                    profiles = get_profiles_needing_screening(db_client, limit=500)
+                if all_profiles:
+                    df = profiles_to_dataframe(all_profiles)
 
-                if profiles:
-                    st.info(f"Showing **{len(profiles)}** profiles")
-                    df = profiles_to_dataframe(profiles)
-
-                    # Create combined name column for display
+                    # Create combined name column
                     if 'first_name' in df.columns and 'last_name' in df.columns:
                         df['name'] = (df['first_name'].fillna('') + ' ' + df['last_name'].fillna('')).str.strip()
+
+                    # Fill NaN for filtering
+                    filter_cols = ['current_title', 'current_company', 'all_employers', 'location', 'skills', 'screening_fit_level', 'status']
+                    for col in filter_cols:
+                        if col in df.columns:
+                            df[col] = df[col].fillna('')
+
+                    # --- Filters ---
+                    fcol1, fcol2, fcol3 = st.columns(3)
+                    with fcol1:
+                        f_title = st.text_input("Title", key="db_f_title", placeholder="e.g. devops, backend, product manager")
+                    with fcol2:
+                        f_company = st.text_input("Company", key="db_f_company", placeholder="e.g. Wiz, Monday, Check Point")
+                    with fcol3:
+                        f_location = st.text_input("Location", key="db_f_location", placeholder="e.g. israel, new york, london")
+
+                    fcol4, fcol5, fcol6 = st.columns(3)
+                    with fcol4:
+                        f_skills = st.text_input("Skills", key="db_f_skills", placeholder="e.g. python, kubernetes, react")
+                    with fcol5:
+                        f_fit = st.multiselect(
+                            "Fit Level",
+                            options=["Strong Fit", "Good Fit", "Partial Fit", "Not a Fit", "Not Screened"],
+                            key="db_f_fit"
+                        )
+                    with fcol6:
+                        f_status = st.multiselect(
+                            "Status",
+                            options=["enriched", "screened", "contacted", "archived"],
+                            key="db_f_status"
+                        )
+
+                    # Apply filters
+                    filtered_df = df.copy()
+
+                    if f_title:
+                        filtered_df = filtered_df[filtered_df['current_title'].str.contains(f_title, case=False, na=False)]
+
+                    if f_company:
+                        if 'all_employers' in filtered_df.columns:
+                            company_mask = (
+                                filtered_df['current_company'].str.contains(f_company, case=False, na=False) |
+                                filtered_df['all_employers'].str.contains(f_company, case=False, na=False)
+                            )
+                        else:
+                            company_mask = filtered_df['current_company'].str.contains(f_company, case=False, na=False)
+                        filtered_df = filtered_df[company_mask]
+
+                    if f_location and 'location' in filtered_df.columns:
+                        filtered_df = filtered_df[filtered_df['location'].str.contains(f_location, case=False, na=False)]
+
+                    if f_skills and 'skills' in filtered_df.columns:
+                        filtered_df = filtered_df[filtered_df['skills'].str.contains(f_skills, case=False, na=False)]
+
+                    if f_fit:
+                        fit_mask = pd.Series(False, index=filtered_df.index)
+                        named_fits = [f for f in f_fit if f != "Not Screened"]
+                        if named_fits and 'screening_fit_level' in filtered_df.columns:
+                            fit_mask = fit_mask | filtered_df['screening_fit_level'].isin(named_fits)
+                        if "Not Screened" in f_fit and 'screening_fit_level' in filtered_df.columns:
+                            fit_mask = fit_mask | (filtered_df['screening_fit_level'] == '')
+                        filtered_df = filtered_df[fit_mask]
+
+                    if f_status and 'status' in filtered_df.columns:
+                        filtered_df = filtered_df[filtered_df['status'].isin(f_status)]
+
+                    # Results
+                    has_filters = any([f_title, f_company, f_location, f_skills, f_fit, f_status])
+                    filter_label = f" (filtered from {len(df)})" if has_filters else ""
+                    st.info(f"Showing **{len(filtered_df)}** profiles{filter_label}")
 
                     # Toggle to show all columns
                     show_all_db_cols = st.checkbox("Show all columns", value=False, key="db_show_all_cols")
 
                     if show_all_db_cols:
-                        # Show all Crustdata columns + screening fields
                         all_cols = ['name', 'current_title', 'current_company', 'all_employers', 'all_titles', 'all_schools', 'skills', 'past_positions', 'headline', 'location', 'summary', 'connections_count', 'screening_score', 'screening_fit_level', 'email', 'status', 'enriched_at', 'linkedin_url']
-                        available_cols = [c for c in all_cols if c in df.columns]
+                        available_cols = [c for c in all_cols if c in filtered_df.columns]
                         st.dataframe(
-                            df[available_cols] if available_cols else df,
+                            filtered_df[available_cols] if available_cols else filtered_df,
                             use_container_width=True,
                             hide_index=True,
                             column_config={
@@ -6437,12 +6631,11 @@ with tab_database:
                         )
                         st.caption(f"{len(available_cols)} columns")
                     else:
-                        # Simple preview: name, title, company, linkedin
-                        preview_cols = ['name', 'current_title', 'current_company', 'linkedin_url']
-                        available_cols = [c for c in preview_cols if c in df.columns]
+                        preview_cols = ['name', 'current_title', 'current_company', 'screening_fit_level', 'screening_score', 'location', 'linkedin_url']
+                        available_cols = [c for c in preview_cols if c in filtered_df.columns]
 
                         st.dataframe(
-                            df[available_cols] if available_cols else df,
+                            filtered_df[available_cols] if available_cols else filtered_df,
                             use_container_width=True,
                             hide_index=True,
                             column_config={
@@ -6450,18 +6643,21 @@ with tab_database:
                                 "linkedin_url": st.column_config.LinkColumn("LinkedIn"),
                                 "current_company": st.column_config.TextColumn("Company"),
                                 "current_title": st.column_config.TextColumn("Title"),
+                                "screening_fit_level": st.column_config.TextColumn("Fit"),
+                                "screening_score": st.column_config.NumberColumn("Score", format="%d"),
+                                "location": st.column_config.TextColumn("Location"),
                             }
                         )
 
                     # Export button
                     st.download_button(
-                        f"Download {selected_view} (CSV)",
-                        df.to_csv(index=False),
-                        f"database_{selected_view.lower().replace(' ', '_')}.csv",
+                        f"Download Results ({len(filtered_df)} profiles)",
+                        filtered_df.to_csv(index=False),
+                        "database_filtered.csv",
                         "text/csv"
                     )
                 else:
-                    st.info(f"No profiles found for '{selected_view}'")
+                    st.info("No profiles in database yet")
 
                 # Load from database to session
                 st.divider()
