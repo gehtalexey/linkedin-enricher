@@ -1,9 +1,11 @@
 -- Migration 025: public.sourcingx_upsert_profiles — project-scoped
 -- identity-aware profile upsert wrapper.
 --
--- STATUS: NOT YET APPLIED to the shared Supabase database. Written
--- 2026-08-03, modelled on agent-kalamata's public.israel_autopilot_upsert_profiles
--- (that project's migrations/023_israel_autopilot_upsert_profiles.sql, applied
+-- STATUS: APPLIED to the shared Supabase database on 2026-08-03, with
+-- Alexey's go-ahead, after three real Codex (gpt-5.5) review rounds (see
+-- PR #125). Written 2026-08-03, modelled on agent-kalamata's
+-- public.israel_autopilot_upsert_profiles (that project's
+-- migrations/023_israel_autopilot_upsert_profiles.sql, applied
 -- 2026-08-02) after the same rejection bug was confirmed live against
 -- SourcingX's own db.py.
 --
