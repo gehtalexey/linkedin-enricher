@@ -79,9 +79,17 @@
 -- failure (unlike engine_upsert_profiles' own handler, which discards it —
 -- see agent-kalamata migration 023's header for why that matters).
 --
--- WHAT THIS FUNCTION READS FROM EACH PROFILE OBJECT (same contract as
--- agent-kalamata migration 023, verified against sourcing_core.upsert_profile's
--- own SQL body): linkedin_url (the identity key, read separately as
+-- WHAT THIS FUNCTION READS FROM EACH PROFILE OBJECT — plus an OPTIONAL
+-- top-level `alias_urls` array, which THIS wrapper (not
+-- sourcing_core.upsert_profile) merges into public.profiles.original_urls
+-- after the identity call resolves the row. That merge is ported from
+-- agent-kalamata migration 024; the first draft of this file mirrored only
+-- that project's migration 023 and therefore silently dropped every alias
+-- db.py's _prepare_profile_payload sends — caught by the real Codex gpt-5.5
+-- review of PR #125 and confirmed live against this database.
+--
+-- The rest, verified against sourcing_core.upsert_profile's
+-- own SQL body: linkedin_url (the identity key, read separately as
 -- input_linkedin_url — NOT from inside input_profile), name, current_title,
 -- current_company, location, enrichment_status, schema_version, raw_data
 -- (object), skills, all_titles, all_employers, all_schools (arrays),
@@ -105,6 +113,7 @@
 
 CREATE OR REPLACE FUNCTION public.sourcingx_upsert_profiles(
   p_profiles jsonb            -- array of profile objects, each with a top-level linkedin_url
+                              -- and an OPTIONAL top-level alias_urls array
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -128,6 +137,8 @@ declare
   v_action   text;
   v_curl     text;
   v_err      text;
+  v_aliases  text[];
+  v_alias_n  int;
   v_results  jsonb := '[]'::jsonb;
   v_ins int := 0; v_upd int := 0; v_noop int := 0; v_rej int := 0;
   v_err_n int := 0; v_unk int := 0;
@@ -162,6 +173,7 @@ begin
      order by e.ord
   loop
     v_pid := null; v_action := null; v_curl := null; v_err := null; v_sent := null;
+    v_aliases := null; v_alias_n := null;
 
     if jsonb_typeof(v_elem) <> 'object' then
       v_action := 'rejected';
@@ -183,6 +195,59 @@ begin
         v_err := SQLERRM;      -- preserved deliberately, not discarded
         v_action := 'error';
       end;
+
+      -- Merge any secondary LinkedIn URLs for this SAME person (e.g. the
+      -- obfuscated ACoAA search-result form, or a caller-supplied
+      -- original_url) into original_urls, now that the identity call above
+      -- has resolved which profile row this person actually is.
+      -- sourcing_core.upsert_profile CANNOT do this itself: it derives the
+      -- identity handle from the ONE input_linkedin_url it is given and only
+      -- registers THAT url, and an ACoAA url yields a DIFFERENT handle than a
+      -- vanity url — sending the obfuscated form as the identity would create
+      -- a SECOND profile row for the same person instead of aliasing them.
+      -- Ported from agent-kalamata migration 024, which added exactly this
+      -- block after its migration 023 (the file THIS migration was modelled
+      -- on) was found to silently drop aliases.
+      --
+      -- TRIGGER SAFETY: sourcing_core.profiles_identity_before_write gates its
+      -- identity-collision branch on `tg_op = 'INSERT'`, so it never runs on
+      -- UPDATE. The only UPDATE-time check is the immutability guard comparing
+      -- linkedin_handle(old.linkedin_url) with linkedin_handle(new.linkedin_url).
+      -- This statement sets ONLY original_urls and never assigns linkedin_url,
+      -- so new.linkedin_url is byte-identical to old.linkedin_url and that
+      -- exception can never fire from this path.
+      if v_pid is not null and v_action in ('inserted', 'updated', 'noop')
+         and jsonb_typeof(v_elem -> 'alias_urls') = 'array' then
+        begin
+          -- Ignore non-string elements and blanks rather than failing the row.
+          select array_agg(distinct btrim(elem_val #>> '{}'))
+            into v_aliases
+            from jsonb_array_elements(v_elem -> 'alias_urls') as elem_val
+           where jsonb_typeof(elem_val) = 'string'
+             and nullif(btrim(elem_val #>> '{}'), '') is not null;
+
+          if v_aliases is not null and array_length(v_aliases, 1) > 0 then
+            -- aliases_merged = how many aliases this payload CARRIED into the
+            -- merge (post-dedup), not a before/after diff of original_urls.
+            v_alias_n := array_length(v_aliases, 1);
+
+            update public.profiles p
+               set original_urls = (
+                 select array_agg(distinct a)
+                   from unnest(coalesce(p.original_urls, '{}'::text[]) || v_aliases) as t(a)
+                  where nullif(btrim(a), '') is not null)
+             where p.id = v_pid;
+          else
+            v_alias_n := 0;
+          end if;
+        exception when others then
+          -- An alias-merge failure must NEVER flip a successful profile save
+          -- into a failure: the save itself already succeeded, and THAT is the
+          -- outcome this RPC exists to guarantee. Record the reason only.
+          v_err := coalesce(v_err || '; ', '') || 'alias-merge-failed: ' || SQLERRM;
+          v_alias_n := 0;
+        end;
+      end if;
     end if;
 
     case coalesce(v_action, 'rejected')
@@ -195,11 +260,12 @@ begin
     end case;
 
     v_results := v_results || jsonb_build_object(
-      'sent_url',      v_sent,
-      'canonical_url', v_curl,
-      'profile_id',    v_pid,
-      'action',        coalesce(v_action, 'rejected'),
-      'error',         v_err
+      'sent_url',       v_sent,
+      'canonical_url',  v_curl,
+      'profile_id',     v_pid,
+      'action',         coalesce(v_action, 'rejected'),
+      'error',          v_err,
+      'aliases_merged', v_alias_n
     );
   end loop;
 
