@@ -33,6 +33,23 @@ DEFAULT_SCREENING_SOURCE_PROJECT = 'sourcingx'
 DEFAULT_SCREENING_JD_HASH = 'default'
 
 
+def _sanitize_nan(value):
+    """Recursively replace float NaN/Infinity/-Infinity with None.
+
+    Used before json.dumps(allow_nan=False) so no invalid JSON token can be
+    emitted regardless of where the bad value sits (top-level, nested dict,
+    or inside a list) — see SupabaseClient.rpc()'s docstring for why the
+    older colon-prefixed string-replace patch wasn't enough.
+    """
+    if isinstance(value, float) and (value != value or value in (float('inf'), float('-inf'))):
+        return None
+    if isinstance(value, dict):
+        return {k: _sanitize_nan(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_nan(v) for v in value]
+    return value
+
+
 class SupabaseClient:
     """Simple Supabase REST API client."""
 
@@ -197,14 +214,18 @@ class SupabaseClient:
         if schema:
             headers['Content-Profile'] = schema
         url = f"{self.url}/rest/v1/rpc/{function}"
-        # Sanitize NaN/Infinity before serializing (matches upsert/upsert_batch
-        # below) — raw_data can legitimately contain NaN from Crustdata, and
-        # posting it unsanitized lets Python's json encoder emit bare
-        # NaN/Infinity, which PostgREST rejects, failing the whole batch.
-        json_str = json.dumps(params or {}, allow_nan=True)
-        json_str = json_str.replace(': NaN', ': null').replace(':NaN', ':null')
-        json_str = json_str.replace(': Infinity', ': null').replace(':Infinity', ':null')
-        json_str = json_str.replace(': -Infinity', ': null').replace(':-Infinity', ':null')
+        # Sanitize NaN/Infinity recursively before serializing — raw_data can
+        # legitimately contain NaN from Crustdata, anywhere in nested
+        # dicts/lists (not just at "key: value" positions). The string-replace
+        # patch used by upsert()/upsert_batch() below only catches
+        # colon-prefixed occurrences (': NaN') and misses NaN inside arrays
+        # (e.g. '[1, NaN, 3]'), which would otherwise reach PostgREST as
+        # invalid JSON and fail the ENTIRE batch — up to 100 profiles lost to
+        # one bad value (real Codex finding, PR #125 round 2). Walking the
+        # object and replacing float NaN/Infinity with None before
+        # json.dumps(allow_nan=False) guarantees no invalid token can be
+        # emitted, regardless of position.
+        json_str = json.dumps(_sanitize_nan(params or {}), allow_nan=False)
         response = requests.post(url, headers=headers, data=json_str, timeout=30)
         if response.status_code >= 400:
             raise requests.HTTPError(f"{response.status_code}: {response.text}")
