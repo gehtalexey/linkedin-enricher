@@ -63,7 +63,6 @@ AS $function$
 declare
   v_id uuid;
   v_identity_rows_deleted int := 0;
-  v_err text;
 begin
   if coalesce(btrim(p_linkedin_url), '') = '' then
     return jsonb_build_object('deleted', false, 'reason', 'missing linkedin_url');
@@ -74,35 +73,31 @@ begin
     return jsonb_build_object('deleted', false, 'reason', 'no profile found for this linkedin_url');
   end if;
 
+  -- Both deletes live in ONE begin/exception block (real Codex gpt-5.5 finding,
+  -- PR #126 round 1): the first draft used TWO separate blocks, so if the
+  -- profiles delete failed (e.g. blocked by sourcing_core.personal_contacts),
+  -- the identity delete from the FIRST block had already committed and was
+  -- never rolled back — permanently orphaning a surviving profile's identity
+  -- mapping while reporting deleted=false. A single block means a failure at
+  -- EITHER statement rolls back BOTH via the implicit savepoint, so a blocked
+  -- delete leaves everything exactly as it was.
   begin
-    with removed as (
-      delete from sourcing_core.profile_identity
-       where canonical_profile_id = v_id
-      returning 1
-    )
-    select count(*) into v_identity_rows_deleted from removed;
-  exception when others then
-    -- Identity cleanup failing should not by itself block reporting the
-    -- real outcome below — the profiles DELETE attempt is the source of
-    -- truth for whether this actually succeeded.
-    v_err := 'identity cleanup failed: ' || SQLERRM;
-  end;
+    delete from sourcing_core.profile_identity where canonical_profile_id = v_id;
+    get diagnostics v_identity_rows_deleted = row_count;
 
-  begin
     delete from public.profiles where id = v_id;
   exception when others then
     return jsonb_build_object(
       'deleted', false,
       'blocked', true,
-      'reason', coalesce(v_err || '; ', '') || SQLERRM,
-      'identity_rows_deleted', v_identity_rows_deleted
+      'reason', SQLERRM,
+      'identity_rows_deleted', 0
     );
   end;
 
   return jsonb_build_object(
     'deleted', true,
-    'identity_rows_deleted', v_identity_rows_deleted,
-    'reason', v_err
+    'identity_rows_deleted', v_identity_rows_deleted
   );
 end
 $function$;
