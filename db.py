@@ -566,13 +566,18 @@ def _prepare_profile_payload(linkedin_url: str, crustdata_response: dict, extra_
     handle from the ONE url it's given and can't register a second alias
     itself.
 
-    NOT carried through — a real, deliberate gap versus the old raw-upsert
-    path, not an oversight: current_start_date, current_years_at_company
-    (sourcing_core.upsert_profile's INSERT/UPDATE never reference these
-    `profiles` columns), and email/email_source (same reason —
-    save_enriched_profiles_bulk's email_map parameter is kept for signature
-    compatibility but is a no-op through this path). enriched_at is also not
+    NOT carried through this payload — a real, deliberate gap versus the old
+    raw-upsert path, not an oversight: current_start_date,
+    current_years_at_company (sourcing_core.upsert_profile's INSERT/UPDATE
+    never reference these `profiles` columns). enriched_at is also not
     threaded through — the RPC always passes now() server-side.
+
+    email/email_source are NOT in this RPC payload either (same reason —
+    sourcing_core.upsert_profile doesn't write those columns), but
+    save_enriched_profiles_bulk's `email_map` is still honoured: it issues a
+    small supplementary plain UPDATE for the email fields after this RPC
+    call succeeds, keyed on the RPC's resolved canonical_url. See that
+    function's docstring.
     """
     row = _prepare_profile_row(linkedin_url, crustdata_response)
     cd = crustdata_response or {}
@@ -732,9 +737,20 @@ def save_enriched_profiles_bulk(client: SupabaseClient, profiles: list,
     passed to `_prepare_profile_payload` as an alias candidate for each
     profile, so a caller-supplied source URL that differs from the chosen
     canonical URL is merged into `profiles.original_urls` server-side.
-    `email_map` is a no-op through this path — see `_prepare_profile_payload`'s
-    docstring for the full, deliberate list of behavior this RPC path does
-    not reproduce (tenure columns, email columns).
+
+    `email_map` (real Codex finding, PR #125 round 3 — the old bulk path
+    wrote CSV-provided emails via `_prepare_profile_row`, and this RPC path
+    silently dropped them at first, a genuine data-loss regression since
+    dashboard.py's CSV-enrich flow passes real emails here): honoured via a
+    small supplementary plain UPDATE (PATCH) after the RPC call, keyed on
+    the RPC's *resolved* `canonical_url` (never the sent URL — the RPC can
+    merge an incoming URL into a DIFFERENT existing row, and writing to the
+    sent URL in that case would silently miss the real row or hit nothing).
+    A plain UPDATE doesn't go through sourcing_core.upsert_profile at all,
+    so this doesn't require extending that function's contract. Only issued
+    for rows whose RPC action succeeded (inserted/updated/noop) — a
+    rejected/errored row already reports the failure, no email write should
+    paper over that.
 
     batch_size is capped at 100 regardless of what is passed — the RPC
     itself raises if handed more than 100 profiles in one call.
@@ -767,12 +783,14 @@ def save_enriched_profiles_bulk(client: SupabaseClient, profiles: list,
         batch_size = 100
 
     original_url_map = original_url_map or {}
+    email_map = email_map or {}
     stats = {'saved': 0, 'errors': 0, 'error_messages': [], 'url_map': {}}
 
     # Step 1: Collect all linkedin_urls and normalize. Every profile that
     # doesn't make it into url_profile_pairs MUST be counted in
     # stats['errors'] here — see this function's docstring INVARIANT.
     url_profile_pairs = []
+    email_by_sent_url = {}
     for idx, profile in enumerate(profiles):
         if not isinstance(profile, dict):
             stats['errors'] += 1
@@ -797,6 +815,16 @@ def save_enriched_profiles_bulk(client: SupabaseClient, profiles: list,
             stats['error_messages'].append(f"{linkedin_url}: normalize_linkedin_url rejected this URL")
             continue
         url_profile_pairs.append((norm_url, profile))
+
+        # Same email-resolution fallback as the pre-RPC code: check the
+        # normalized URL first, then the caller's original (pre-normalization)
+        # URL via original_url_map, since email_map may be keyed either way.
+        original_url = original_url_map.get(norm_url)
+        email = email_map.get(norm_url)
+        if not email and original_url:
+            email = email_map.get(normalize_linkedin_url(original_url))
+        if email:
+            email_by_sent_url[norm_url] = email
 
     # Step 2: Prepare one RPC payload object per profile.
     payloads = []
@@ -840,6 +868,19 @@ def save_enriched_profiles_bulk(client: SupabaseClient, profiles: list,
                 stats['url_map'][sent] = {'canonical_url': canonical, 'action': action}
             if action in ('inserted', 'updated', 'noop'):
                 stats['saved'] += 1
+                email = email_by_sent_url.get(sent) if sent else None
+                if email:
+                    write_url = canonical or sent
+                    try:
+                        client.update('profiles', {'email': email, 'email_source': 'csv'},
+                                       {'linkedin_url': write_url})
+                    except Exception as e:
+                        # The profile itself already saved successfully (stats['saved']
+                        # above) — an email write failure is logged, not counted as a
+                        # row error, so callers don't mistake a saved profile for a
+                        # dropped one over a secondary field.
+                        print(f"[DB] email write failed for {write_url}: {str(e)[:150]}",
+                              file=__import__('sys').stderr)
             else:
                 stats['errors'] += 1
                 err = row.get('error') or f"action={action}"
