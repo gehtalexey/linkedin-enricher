@@ -2637,15 +2637,37 @@ def delete_screening_prompt(client: SupabaseClient, role_type: str) -> bool:
 
 
 def delete_profile(client: SupabaseClient, linkedin_url: str) -> bool:
-    """Permanently remove a profile from the database by LinkedIn URL."""
+    """Permanently remove a profile from the database by LinkedIn URL.
+
+    Uses the public.sourcingx_delete_profile RPC (migrations/026), NOT a
+    plain client.delete('profiles', ...), since 2026-08-03. Every profile
+    saved through migrations/025's identity-aware upsert RPC gets a row in
+    sourcing_core.profile_identity (ON DELETE RESTRICT on profiles.id), so a
+    plain DELETE now fails with a foreign-key violation for any such
+    profile. The RPC removes that identity row first, then deletes the
+    profile — this fixes deletion for the common case (12,147 of ~200k
+    profiles already have one, and every profile saved from now on will).
+
+    Real callers (dashboard.py's two "Remove selected" buttons) loop over
+    many URLs expecting a plain bool per URL and already collect + show
+    failures via st.warning — so this still returns False (not an
+    exception) on any failure, including the rare remaining case where
+    sourcing_core.personal_contacts (real contact data this RPC
+    deliberately does not touch, see migrations/026's header) blocks
+    deletion too. A clear reason is printed to the server log either way;
+    raising here would abort the caller's loop partway through instead of
+    reporting per-URL, which is worse than the silent-False bug it would
+    "fix".
+    """
     try:
         normalized = normalize_linkedin_url(linkedin_url)
         if not normalized:
             print(f"[DB] Could not normalize URL: {linkedin_url}")
             return False
-        deleted = client.delete('profiles', {'linkedin_url': normalized})
-        if not deleted:
-            print(f"[DB] No row matched for deletion: {normalized}")
+        result = client.rpc('sourcingx_delete_profile', {'p_linkedin_url': normalized})
+        if not (result or {}).get('deleted'):
+            reason = (result or {}).get('reason') or 'unknown reason'
+            print(f"[DB] Could not delete {normalized}: {reason}")
             return False
         # Best-effort cleanup of screening data for this URL
         try:
