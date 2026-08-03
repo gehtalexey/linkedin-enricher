@@ -603,8 +603,22 @@ def save_enriched_profile(client: SupabaseClient, linkedin_url: str, crustdata_r
     restores the same "raises on failure" contract the old raw-upsert call
     had (it raised requests.HTTPError on a PostgREST 4xx).
 
-    Returns the RPC's per-profile result dict on success:
-    {'sent_url', 'canonical_url', 'profile_id', 'action', 'error'}.
+    Returns the SAVED PROFILE ROW, same as the pre-2026-08-03 raw-upsert
+    path did (`result[0] if result else None`). This matters: callers such
+    as similar_profiles.py do `get_profile(db_client, canonical_url) or
+    saved` and then read `raw_data` / `name` / the indexed columns off the
+    result. sourcing_core.upsert_profile may resolve the URL we sent to a
+    DIFFERENT existing canonical row, in which case a refetch keyed on the
+    URL WE SENT finds nothing and the caller falls through to this return
+    value — so returning the bare RPC verdict there would hand them a dict
+    with no profile fields at all. We therefore refetch on the RPC's own
+    `canonical_url` (the identity-resolved one) and return that row.
+
+    Falls back to the RPC verdict dict only if the refetch comes back
+    empty. The refetch NEVER raises: the profile is already committed at
+    that point, and a read-back failure must not be reported as a save
+    failure. The verdict dict is still available to callers that want it
+    under the 'rpc_result' key of the returned row.
     """
     linkedin_url = normalize_linkedin_url(linkedin_url)
     if not linkedin_url:
@@ -618,7 +632,25 @@ def save_enriched_profile(client: SupabaseClient, linkedin_url: str, crustdata_r
     if action not in ('inserted', 'updated', 'noop'):
         err = (row or {}).get('error') or f"action={action or 'no-result'}"
         raise RuntimeError(f"sourcingx_upsert_profiles did not save {linkedin_url}: {err}")
-    return row
+
+    # Read the row back on the identity-resolved URL first, then on the URL we
+    # sent. Never let a read-back problem surface as a save failure — the write
+    # is already committed by this point.
+    saved_row = None
+    for lookup_url in (row.get('canonical_url'), linkedin_url):
+        if not lookup_url:
+            continue
+        try:
+            saved_row = get_profile(client, lookup_url)
+        except Exception:
+            saved_row = None
+        if saved_row:
+            break
+
+    if not saved_row:
+        return row
+    saved_row['rpc_result'] = row
+    return saved_row
 
 
 def _bulk_fetch_existing_original_urls(client: SupabaseClient, linkedin_urls: list) -> dict:
