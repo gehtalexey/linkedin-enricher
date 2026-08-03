@@ -33,6 +33,23 @@ DEFAULT_SCREENING_SOURCE_PROJECT = 'sourcingx'
 DEFAULT_SCREENING_JD_HASH = 'default'
 
 
+def _sanitize_nan(value):
+    """Recursively replace float NaN/Infinity/-Infinity with None.
+
+    Used before json.dumps(allow_nan=False) so no invalid JSON token can be
+    emitted regardless of where the bad value sits (top-level, nested dict,
+    or inside a list) — see SupabaseClient.rpc()'s docstring for why the
+    older colon-prefixed string-replace patch wasn't enough.
+    """
+    if isinstance(value, float) and (value != value or value in (float('inf'), float('-inf'))):
+        return None
+    if isinstance(value, dict):
+        return {k: _sanitize_nan(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_nan(v) for v in value]
+    return value
+
+
 class SupabaseClient:
     """Simple Supabase REST API client."""
 
@@ -175,6 +192,46 @@ class SupabaseClient:
         if response.text:
             return response.json()
         return []
+
+    def rpc(self, function: str, params: dict = None, schema: str = None) -> dict:
+        """Call a PostgREST RPC function: POST /rest/v1/rpc/{function}.
+
+        `schema` selects a non-default exposed schema via PostgREST's
+        `Content-Profile` header. Only `public` and `graphql_public` are
+        exposed on this project (ciyyvbzblogtbwabhbmh) — `sourcing_core` and
+        `sourcing_raw` are NOT reachable directly (406 PGRST106 "Invalid
+        schema"). `public.sourcingx_upsert_profiles` (migrations/025) is the
+        project-scoped public wrapper that reaches `sourcing_core.upsert_profile`
+        indirectly — see save_enriched_profile[s_bulk] below.
+
+        30s HTTP timeout — the RPC functions this project calls set their own
+        `statement_timeout` comfortably under this, so a genuinely slow call
+        fails with a clean Postgres statement-timeout error the caller can
+        see, rather than this client giving up first while the write may
+        still be committing server-side.
+        """
+        headers = self.headers.copy()
+        if schema:
+            headers['Content-Profile'] = schema
+        url = f"{self.url}/rest/v1/rpc/{function}"
+        # Sanitize NaN/Infinity recursively before serializing — raw_data can
+        # legitimately contain NaN from Crustdata, anywhere in nested
+        # dicts/lists (not just at "key: value" positions). The string-replace
+        # patch used by upsert()/upsert_batch() below only catches
+        # colon-prefixed occurrences (': NaN') and misses NaN inside arrays
+        # (e.g. '[1, NaN, 3]'), which would otherwise reach PostgREST as
+        # invalid JSON and fail the ENTIRE batch — up to 100 profiles lost to
+        # one bad value (real Codex finding, PR #125 round 2). Walking the
+        # object and replacing float NaN/Infinity with None before
+        # json.dumps(allow_nan=False) guarantees no invalid token can be
+        # emitted, regardless of position.
+        json_str = json.dumps(_sanitize_nan(params or {}), allow_nan=False)
+        response = requests.post(url, headers=headers, data=json_str, timeout=30)
+        if response.status_code >= 400:
+            raise requests.HTTPError(f"{response.status_code}: {response.text}")
+        if response.text:
+            return response.json()
+        return None
 
     def update(self, table: str, data: dict, filters: dict) -> list:
         """Update rows matching filters."""
@@ -473,47 +530,153 @@ def _prepare_profile_row(linkedin_url: str, crustdata_response: dict, original_u
     return data
 
 
+# 2026-08-03 UPDATE: save_enriched_profile and save_enriched_profiles_bulk no
+# longer write via client.upsert('profiles', on_conflict='linkedin_url'). That
+# call fires trg_profiles_identity_before_write on the PROPOSED row BEFORE the
+# ON CONFLICT is resolved, so it unconditionally rejects re-saving anyone
+# already in `profiles` — see migrations/025_sourcingx_upsert_profiles.sql for
+# the full diagnosis (same bug agent-kalamata fixed 2026-08-02). They now call
+# the public.sourcingx_upsert_profiles RPC, which reaches the identity-aware
+# sourcing_core.upsert_profile the trigger's own error message names. THIS IS A
+# SHARED-DB BEHAVIOR CHANGE: the two autopilot siblings hit the exact same
+# rejection and need the equivalent fix — not yet done anywhere but this
+# project. _prepare_profile_row is no longer called by
+# save_enriched_profile[s_bulk] directly (a new adapter,
+# _prepare_profile_payload, wraps it instead) but keeps its own direct
+# callers elsewhere in this repo. _bulk_fetch_existing_original_urls has no
+# other caller left after this change — left in place rather than deleted.
+
+def _prepare_profile_payload(linkedin_url: str, crustdata_response: dict, extra_alias: str = None) -> dict:
+    """Adapt _prepare_profile_row's field extraction into the payload shape
+    public.sourcingx_upsert_profiles / sourcing_core.upsert_profile actually
+    reads (same contract as agent-kalamata's migrations/023 — see that
+    project's db.py::_prepare_profile_payload for the full field-by-field
+    verification against sourcing_core.upsert_profile's own SQL body).
+
+    Reuses _prepare_profile_row for the extraction logic so there is ONE
+    place that logic lives — _prepare_profile_row itself is unchanged.
+
+    `alias_urls`: every OTHER LinkedIn URL known for this person — Crustdata's
+    obfuscated `linkedin_profile_url` (the ACoAA search-result form) and/or
+    the caller-supplied `extra_alias` (the original/obfuscated URL a caller
+    resolved via its own original_url_map) — normalized, deduplicated, blanks
+    dropped, anything equal to the canonical `linkedin_url` excluded. The RPC
+    merges these into `profiles.original_urls` AFTER resolving the real
+    identity, since `sourcing_core.upsert_profile` derives the identity
+    handle from the ONE url it's given and can't register a second alias
+    itself.
+
+    NOT carried through this payload — a real, deliberate gap versus the old
+    raw-upsert path, not an oversight: current_start_date,
+    current_years_at_company (sourcing_core.upsert_profile's INSERT/UPDATE
+    never reference these `profiles` columns). enriched_at is also not
+    threaded through — the RPC always passes now() server-side.
+
+    email/email_source are NOT in this RPC payload either (same reason —
+    sourcing_core.upsert_profile doesn't write those columns), but
+    save_enriched_profiles_bulk's `email_map` is still honoured: it issues a
+    small supplementary plain UPDATE for the email fields after this RPC
+    call succeeds, keyed on the RPC's resolved canonical_url. See that
+    function's docstring.
+    """
+    row = _prepare_profile_row(linkedin_url, crustdata_response)
+    cd = crustdata_response or {}
+    canonical_url = row.get('linkedin_url')
+
+    alias_candidates = [
+        cd.get('linkedin_profile_url'),
+        cd.get('linkedin_url'),
+        extra_alias,
+    ]
+    alias_urls = []
+    seen_aliases = set()
+    for candidate in alias_candidates:
+        norm = normalize_linkedin_url(candidate) if candidate else None
+        if not norm or norm == canonical_url or norm in seen_aliases:
+            continue
+        seen_aliases.add(norm)
+        alias_urls.append(norm)
+
+    payload = {
+        'linkedin_url': canonical_url,
+        'name': row.get('name'),
+        'current_title': row.get('current_title'),
+        'current_company': row.get('current_company'),
+        'location': row.get('location'),
+        'enrichment_status': row.get('enrichment_status', 'enriched'),
+        'raw_data': row.get('raw_data'),
+        'skills': row.get('skills'),
+        'all_titles': row.get('all_titles'),
+        'all_employers': row.get('all_employers'),
+        'all_schools': row.get('all_schools'),
+        'github_url': cd.get('github_url'),
+        'normalized_title': cd.get('normalized_title'),
+        'seniority_level': cd.get('seniority_level'),
+        'schema_version': cd.get('schema_version'),
+        'alias_urls': alias_urls if alias_urls else None,
+    }
+    return {k: v for k, v in payload.items() if v is not None}
+
+
 def save_enriched_profile(client: SupabaseClient, linkedin_url: str, crustdata_response: dict, original_url: str = None) -> dict:
-    """Save a Crustdata-enriched profile to the database.
+    """Save a Crustdata-enriched profile via the identity-aware
+    public.sourcingx_upsert_profiles RPC (migrations/025), NOT the raw
+    client.upsert('profiles', on_conflict='linkedin_url') PostgREST call
+    this function used before 2026-08-03.
 
-    Simplified approach: Store raw_data as-is, extract only title/company for indexing.
-    All other fields are extracted at display time from raw_data.
+    Raises RuntimeError if the RPC's own per-profile verdict for this
+    linkedin_url is not a success (action not in inserted/updated/noop) —
+    restores the same "raises on failure" contract the old raw-upsert call
+    had (it raised requests.HTTPError on a PostgREST 4xx).
 
-    Multi-source support: Appends to original_urls array instead of overwriting,
-    allowing tracking of all input URLs from different sources.
+    Returns the SAVED PROFILE ROW, same as the pre-2026-08-03 raw-upsert
+    path did (`result[0] if result else None`). This matters: callers such
+    as similar_profiles.py do `get_profile(db_client, canonical_url) or
+    saved` and then read `raw_data` / `name` / the indexed columns off the
+    result. sourcing_core.upsert_profile may resolve the URL we sent to a
+    DIFFERENT existing canonical row, in which case a refetch keyed on the
+    URL WE SENT finds nothing and the caller falls through to this return
+    value — so returning the bare RPC verdict there would hand them a dict
+    with no profile fields at all. We therefore refetch on the RPC's own
+    `canonical_url` (the identity-resolved one) and return that row.
 
-    Args:
-        client: SupabaseClient instance
-        linkedin_url: The LinkedIn URL (used as primary key, typically from Crustdata)
-        crustdata_response: Raw response from Crustdata API
-        original_url: The original input URL (for matching with loaded data)
-
-    Returns:
-        The saved profile record
+    Falls back to the RPC verdict dict only if the refetch comes back
+    empty. The refetch NEVER raises: the profile is already committed at
+    that point, and a read-back failure must not be reported as a save
+    failure. The verdict dict is still available to callers that want it
+    under the 'rpc_result' key of the returned row.
     """
     linkedin_url = normalize_linkedin_url(linkedin_url)
     if not linkedin_url:
         raise ValueError("Valid linkedin_url is required")
 
-    original_url = normalize_linkedin_url(original_url) if original_url else None
+    payload = _prepare_profile_payload(linkedin_url, crustdata_response, extra_alias=original_url)
+    result = client.rpc('sourcingx_upsert_profiles', {'p_profiles': [payload]})
+    results = (result or {}).get('results') or []
+    row = results[0] if results else None
+    action = (row or {}).get('action')
+    if action not in ('inserted', 'updated', 'noop'):
+        err = (row or {}).get('error') or f"action={action or 'no-result'}"
+        raise RuntimeError(f"sourcingx_upsert_profiles did not save {linkedin_url}: {err}")
 
-    # Multi-source support: Get existing URLs and append (deduplicated)
-    existing_urls = _get_existing_original_urls(client, linkedin_url)
-
-    data = _prepare_profile_row(linkedin_url, crustdata_response, original_url, existing_urls)
-
-    # Try to save with original_urls array (post-migration)
-    if 'original_urls' in data:
+    # Read the row back on the identity-resolved URL first, then on the URL we
+    # sent. Never let a read-back problem surface as a save failure — the write
+    # is already committed by this point.
+    saved_row = None
+    for lookup_url in (row.get('canonical_url'), linkedin_url):
+        if not lookup_url:
+            continue
         try:
-            result = client.upsert('profiles', data, on_conflict='linkedin_url')
-            return result[0] if result else None
+            saved_row = get_profile(client, lookup_url)
         except Exception:
-            # Column doesn't exist yet (pre-migration), fall through to save without it
-            data.pop('original_urls', None)
+            saved_row = None
+        if saved_row:
+            break
 
-    # Save without original_urls array (backward compatible)
-    result = client.upsert('profiles', data, on_conflict='linkedin_url')
-    return result[0] if result else None
+    if not saved_row:
+        return row
+    saved_row['rpc_result'] = row
+    return saved_row
 
 
 def _bulk_fetch_existing_original_urls(client: SupabaseClient, linkedin_urls: list) -> dict:
@@ -565,35 +728,74 @@ def save_enriched_profiles_bulk(client: SupabaseClient, profiles: list,
                                 original_url_map: dict = None,
                                 email_map: dict = None,
                                 batch_size: int = 100) -> dict:
-    """Save multiple enriched profiles using batch upsert (much faster than individual saves).
+    """Save multiple enriched profiles via the identity-aware
+    public.sourcingx_upsert_profiles RPC (migrations/025), NOT the raw batch
+    client.upsert_batch('profiles', on_conflict='linkedin_url') call this
+    function used before 2026-08-03.
 
-    Replaces the old pattern of N individual save_enriched_profile() calls with:
-    1. One bulk SELECT to fetch existing original_urls
-    2. In-memory row preparation
-    3. Batch upserts of 100 rows each
+    `original_url_map` is honoured: `original_url_map.get(norm_url)` is
+    passed to `_prepare_profile_payload` as an alias candidate for each
+    profile, so a caller-supplied source URL that differs from the chosen
+    canonical URL is merged into `profiles.original_urls` server-side.
 
-    For 2000 profiles: ~60 HTTP calls instead of ~6000.
+    `email_map` (real Codex finding, PR #125 round 3 — the old bulk path
+    wrote CSV-provided emails via `_prepare_profile_row`, and this RPC path
+    silently dropped them at first, a genuine data-loss regression since
+    dashboard.py's CSV-enrich flow passes real emails here): honoured via a
+    small supplementary plain UPDATE (PATCH) after the RPC call, keyed on
+    the RPC's *resolved* `canonical_url` (never the sent URL — the RPC can
+    merge an incoming URL into a DIFFERENT existing row, and writing to the
+    sent URL in that case would silently miss the real row or hit nothing).
+    A plain UPDATE doesn't go through sourcing_core.upsert_profile at all,
+    so this doesn't require extending that function's contract. Only issued
+    for rows whose RPC action succeeded (inserted/updated/noop) — a
+    rejected/errored row already reports the failure, no email write should
+    paper over that.
 
-    Args:
-        client: SupabaseClient instance
-        profiles: List of Crustdata response dicts (each must have linkedin_flagship_url or linkedin_url)
-        original_url_map: {normalized_linkedin_url: original_url} mapping
-        email_map: {normalized_url: email} mapping from CSV
-        batch_size: Number of profiles per upsert batch (default 100)
+    batch_size is capped at 100 regardless of what is passed — the RPC
+    itself raises if handed more than 100 profiles in one call.
 
     Returns:
-        Stats dict: {'saved': int, 'errors': int, 'error_messages': list}
+      {'saved': int, 'errors': int, 'error_messages': [str],
+       'url_map': {sent_url: {'canonical_url': str, 'action': str}}}
+
+    INVARIANT: `saved + errors == len(profiles)` always holds. `saved` counts
+    RPC actions 'inserted'/'updated'/'noop' — all three mean the row is now
+    correctly stored ('noop' means the already-stored copy was at least as
+    rich as the incoming one, so nothing needed to change). `errors` counts:
+    a profile with no usable URL field; a URL rejected by
+    normalize_linkedin_url; a profile that failed to prepare; a batch-level
+    RPC call failure; any sent URL whose RPC action was
+    'rejected'/'error'/'unknown_action'; and any sent URL that never got a
+    result row back at all.
+
+    `url_map` is the critical addition callers MUST use instead of the URL
+    they sent: sourcing_core.upsert_profile may resolve an incoming URL to a
+    DIFFERENT existing canonical profile row — writing downstream state
+    keyed on the sent URL after that happens silently loses the candidate.
     """
     if not profiles:
-        return {'saved': 0, 'errors': 0, 'error_messages': []}
+        return {'saved': 0, 'errors': 0, 'error_messages': [], 'url_map': {}}
+
+    if batch_size > 100 or batch_size < 1:
+        print(f"[DB] save_enriched_profiles_bulk: batch_size={batch_size} is outside "
+              f"the RPC's 1-100 range; clamping to 100", file=__import__('sys').stderr)
+        batch_size = 100
 
     original_url_map = original_url_map or {}
     email_map = email_map or {}
-    stats = {'saved': 0, 'errors': 0, 'error_messages': []}
+    stats = {'saved': 0, 'errors': 0, 'error_messages': [], 'url_map': {}}
 
-    # Step 1: Collect all linkedin_urls and normalize
+    # Step 1: Collect all linkedin_urls and normalize. Every profile that
+    # doesn't make it into url_profile_pairs MUST be counted in
+    # stats['errors'] here — see this function's docstring INVARIANT.
     url_profile_pairs = []
-    for profile in profiles:
+    email_by_sent_url = {}
+    for idx, profile in enumerate(profiles):
+        if not isinstance(profile, dict):
+            stats['errors'] += 1
+            stats['error_messages'].append(f"profiles[{idx}]: not a dict (got {type(profile).__name__})")
+            continue
         # Enrich response: linkedin_flagship_url. Search response: flagship_profile_url.
         linkedin_url = (
             profile.get('linkedin_flagship_url')
@@ -601,82 +803,97 @@ def save_enriched_profiles_bulk(client: SupabaseClient, profiles: list,
             or profile.get('linkedin_profile_url')
             or profile.get('linkedin_url')
         )
+        ident = profile.get('name')
+        ident = f"{ident} (profiles[{idx}])" if ident else f"profiles[{idx}]"
         if not linkedin_url:
+            stats['errors'] += 1
+            stats['error_messages'].append(f"{ident}: no usable linkedin_url field")
             continue
         norm_url = normalize_linkedin_url(linkedin_url)
-        if norm_url:
-            url_profile_pairs.append((norm_url, profile))
+        if not norm_url:
+            stats['errors'] += 1
+            stats['error_messages'].append(f"{linkedin_url}: normalize_linkedin_url rejected this URL")
+            continue
+        url_profile_pairs.append((norm_url, profile))
 
-    all_urls = [url for url, _ in url_profile_pairs]
-
-    # Step 2: Bulk-fetch existing original_urls (one query per 50 URLs)
-    existing_urls_map = _bulk_fetch_existing_original_urls(client, all_urls)
-
-    # Step 3: Prepare all rows in-memory
-    rows = []
-    has_original_urls_column = True  # Optimistic; will retry without if needed
-    for norm_url, profile in url_profile_pairs:
+        # Same email-resolution fallback as the pre-RPC code: check the
+        # normalized URL first, then the caller's original (pre-normalization)
+        # URL via original_url_map, since email_map may be keyed either way.
         original_url = original_url_map.get(norm_url)
-        existing_urls = existing_urls_map.get(norm_url, [])
-
-        # Check email map for this profile
         email = email_map.get(norm_url)
         if not email and original_url:
             email = email_map.get(normalize_linkedin_url(original_url))
+        if email:
+            email_by_sent_url[norm_url] = email
 
+    # Step 2: Prepare one RPC payload object per profile.
+    payloads = []
+    for norm_url, profile in url_profile_pairs:
         try:
-            row = _prepare_profile_row(
-                norm_url, profile, original_url, existing_urls,
-                email=email, email_source='csv' if email else None
-            )
-            rows.append(row)
+            extra_alias = original_url_map.get(norm_url)
+            payloads.append(_prepare_profile_payload(norm_url, profile, extra_alias=extra_alias))
         except Exception as e:
             stats['errors'] += 1
             stats['error_messages'].append(f"{norm_url}: prepare failed: {str(e)[:100]}")
 
-    # Step 4: Batch upsert in chunks, grouped by key-shape.
-    # PostgREST requires every row in a batch to have the same keys (PGRST102).
-    # _prepare_profile_row strips None so rows have varying key sets.  The old
-    # fix padded all rows to the union of keys — but that reintroduces None for
-    # missing fields, which overwrites existing DB values with NULL on upsert.
-    # Instead, group by frozenset(keys) so each sub-batch is shape-homogeneous
-    # with no padding needed.
-    from collections import defaultdict as _dd
-    shape_groups: dict = _dd(list)
-    for r in rows:
-        shape_groups[frozenset(r.keys())].append(r)
+    # Step 3: call the RPC in chunks of batch_size.
+    for i in range(0, len(payloads), batch_size):
+        batch = payloads[i:i + batch_size]
+        try:
+            result = client.rpc('sourcingx_upsert_profiles', {'p_profiles': batch})
+        except Exception as e:
+            error_str = str(e)[:200]
+            print(f"[DB] sourcingx_upsert_profiles RPC failed for a batch of "
+                  f"{len(batch)}: {error_str}", file=__import__('sys').stderr)
+            for row in batch:
+                url = row.get('linkedin_url', 'unknown')
+                stats['errors'] += 1
+                stats['error_messages'].append(f"{url}: RPC call failed: {error_str}")
+            continue
 
-    for shape_rows in shape_groups.values():
-        for i in range(0, len(shape_rows), batch_size):
-            batch = shape_rows[i:i+batch_size]
-            try:
-                if has_original_urls_column:
-                    client.upsert_batch('profiles', batch, on_conflict='linkedin_url')
-                else:
-                    clean_batch = [{k: v for k, v in row.items() if k != 'original_urls'} for row in batch]
-                    client.upsert_batch('profiles', clean_batch, on_conflict='linkedin_url')
-                stats['saved'] += len(batch)
-            except Exception as e:
-                error_str = str(e)
-                if has_original_urls_column and ('original_urls' in error_str or '42703' in error_str):
-                    has_original_urls_column = False
-                    try:
-                        clean_batch = [{k: v for k, v in row.items() if k != 'original_urls'} for row in batch]
-                        client.upsert_batch('profiles', clean_batch, on_conflict='linkedin_url')
-                        stats['saved'] += len(batch)
-                        continue
-                    except Exception as e2:
-                        error_str = str(e2)
+        results_list = (result or {}).get('results') or []
+        received = (result or {}).get('received')
+        if received is not None and received != len(results_list):
+            print(f"[DB] WARNING: sourcingx_upsert_profiles returned "
+                  f"received={received} but {len(results_list)} result rows for a "
+                  f"batch of {len(batch)} — investigate", file=__import__('sys').stderr)
 
-                print(f"[DB] Batch upsert failed ({error_str[:100]}), falling back to individual saves")
-                for row in batch:
+        seen_sent = set()
+        for row in results_list:
+            sent = row.get('sent_url')
+            action = row.get('action')
+            canonical = row.get('canonical_url')
+            if sent:
+                seen_sent.add(sent)
+                stats['url_map'][sent] = {'canonical_url': canonical, 'action': action}
+            if action in ('inserted', 'updated', 'noop'):
+                stats['saved'] += 1
+                email = email_by_sent_url.get(sent) if sent else None
+                if email:
+                    write_url = canonical or sent
                     try:
-                        client.upsert('profiles', row, on_conflict='linkedin_url')
-                        stats['saved'] += 1
-                    except Exception as row_e:
-                        stats['errors'] += 1
-                        url = row.get('linkedin_url', 'unknown')
-                        stats['error_messages'].append(f"{url}: {str(row_e)[:100]}")
+                        client.update('profiles', {'email': email, 'email_source': 'csv'},
+                                       {'linkedin_url': write_url})
+                    except Exception as e:
+                        # The profile itself already saved successfully (stats['saved']
+                        # above) — an email write failure is logged, not counted as a
+                        # row error, so callers don't mistake a saved profile for a
+                        # dropped one over a secondary field.
+                        print(f"[DB] email write failed for {write_url}: {str(e)[:150]}",
+                              file=__import__('sys').stderr)
+            else:
+                stats['errors'] += 1
+                err = row.get('error') or f"action={action}"
+                stats['error_messages'].append(f"{sent or 'unknown'}: {err[:150]}")
+
+        # Defence-in-depth: any URL we sent in this batch but that came back
+        # with no result row at all is an unaccounted failure — never
+        # silently promote it.
+        for sent_row in batch:
+            u = sent_row.get('linkedin_url')
+            if u and u not in seen_sent:
+                stats['errors'] += 1
+                stats['error_messages'].append(f"{u}: no result row returned by RPC")
 
     return stats
 
