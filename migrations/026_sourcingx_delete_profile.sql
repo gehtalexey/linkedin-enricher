@@ -1,8 +1,12 @@
 -- Migration 026: public.sourcingx_delete_profile — safe profile deletion
 -- around the identity-guard system's ON DELETE RESTRICT foreign keys.
 --
--- STATUS: NOT YET APPLIED to the shared Supabase database. Written
--- 2026-08-03, same day as migrations/025 (the identity-aware upsert wrapper).
+-- STATUS: APPLIED to the shared Supabase database on 2026-08-03, with
+-- Alexey's go-ahead, after two real Codex (gpt-5.5) review rounds (see
+-- PR #126) — round 1 found the two deletes weren't atomic (a blocked
+-- profile delete could permanently orphan the identity delete that ran
+-- before it); fixed by merging both into one begin/exception block.
+-- Same day as migrations/025 (the identity-aware upsert wrapper).
 --
 -- Rollback if ever needed:
 --   drop function public.sourcingx_delete_profile(text);

@@ -2664,7 +2664,25 @@ def delete_profile(client: SupabaseClient, linkedin_url: str) -> bool:
         if not normalized:
             print(f"[DB] Could not normalize URL: {linkedin_url}")
             return False
-        result = client.rpc('sourcingx_delete_profile', {'p_linkedin_url': normalized})
+        try:
+            result = client.rpc('sourcingx_delete_profile', {'p_linkedin_url': normalized})
+        except Exception as rpc_err:
+            # Real Codex finding, PR #126 round 2: if migrations/026 were ever
+            # missing from a target database (e.g. a fresh clone, or a
+            # migration rollback that outran a code rollback), this call
+            # fails with PostgREST's "function not found" error (PGRST202 /
+            # 404), which would otherwise blend into the generic handler
+            # below and look identical to a normal delete failure. Surfacing
+            # it distinctly here makes that specific, rare case fast to
+            # diagnose instead of looking like "this profile just can't be
+            # deleted".
+            err_str = str(rpc_err)
+            if '404' in err_str or 'PGRST202' in err_str or 'Could not find the function' in err_str:
+                print(f"[DB] sourcingx_delete_profile RPC not found — is migrations/026 "
+                      f"applied to this database? ({err_str[:200]})")
+            else:
+                print(f"[DB] sourcingx_delete_profile RPC call failed for {normalized}: {err_str[:200]}")
+            return False
         if not (result or {}).get('deleted'):
             reason = (result or {}).get('reason') or 'unknown reason'
             print(f"[DB] Could not delete {normalized}: {reason}")
