@@ -1798,6 +1798,19 @@ def batch_enrich_profiles(
             "credits_used": fulfilled * 1,
             "batch_ids": [...],
         }
+
+    Deduplicates by normalized URL BEFORE submitting (Codex review, PR
+    #127, 2026-08-04): a caller-supplied list containing the same URL
+    twice (verbatim, or as two strings that normalize to the same profile)
+    previously got submitted to Crustdata unchanged — paying for and
+    fetching the same profile twice — while `requested`/`fulfilled`/
+    `credits_used` were derived from a de-duplicated set, silently
+    UNDER-counting the true spend. Only one representative raw string per
+    normalized identity is ever sent to Crustdata; `by_url` is still
+    populated under every one of the caller's original duplicate strings
+    (not just the representative), so callers indexing results against
+    their own input list — including the duplicate — still get a hit at
+    every position.
     """
     linkedin_urls = [u for u in (linkedin_urls or []) if u and str(u).strip()]
     if not linkedin_urls:
@@ -1806,7 +1819,20 @@ def batch_enrich_profiles(
     if not api_key:
         api_key = _load_api_key()
 
-    jobs = [linkedin_urls[i:i + 10000] for i in range(0, len(linkedin_urls), 10000)]
+    # canonical_to_inputs preserves first-seen order (dict insertion order)
+    # and maps each distinct normalized identity to every raw input string
+    # that resolves to it — including the duplicates we're about to skip
+    # submitting.
+    canonical_to_inputs: Dict[str, List[str]] = {}
+    for u in linkedin_urls:
+        norm = normalize_linkedin_url(u) or u
+        canonical_to_inputs.setdefault(norm, []).append(u)
+
+    # One representative raw string per canonical identity — this is what
+    # actually gets billed.
+    submit_urls = [inputs[0] for inputs in canonical_to_inputs.values()]
+
+    jobs = [submit_urls[i:i + 10000] for i in range(0, len(submit_urls), 10000)]
     by_url: Dict[str, Dict[str, Any]] = {}
     batch_ids: List[str] = []
 
@@ -1848,20 +1874,23 @@ def batch_enrich_profiles(
             if not key:
                 continue
             by_url[key] = flat
-            norm_key = normalize_linkedin_url(key)
-            if norm_key and norm_key not in by_url:
+            norm_key = normalize_linkedin_url(key) or key
+            if norm_key not in by_url:
                 by_url[norm_key] = flat
+            # Fan out to every original caller-supplied string that maps to
+            # this same normalized identity, so a duplicate URL in the
+            # input list resolves at every position it appeared.
+            for original_input in canonical_to_inputs.get(norm_key, []):
+                by_url.setdefault(original_input, flat)
 
-    requested_set = set(linkedin_urls)
-    unmatched = sorted(
-        u for u in requested_set
-        if u not in by_url and normalize_linkedin_url(u) not in by_url
-    )
-    fulfilled = len(requested_set) - len(unmatched)
+    unmatched_canonical = [norm for norm in canonical_to_inputs if norm not in by_url]
+    unmatched = sorted(canonical_to_inputs[norm][0] for norm in unmatched_canonical)
+    requested = len(canonical_to_inputs)
+    fulfilled = requested - len(unmatched_canonical)
 
     return {
         "by_url": by_url,
-        "requested": len(requested_set),
+        "requested": requested,
         "fulfilled": fulfilled,
         "unmatched": unmatched,
         "credits_used": fulfilled * CREDITS_PER_ENRICH_PROFILE_BASE,

@@ -213,6 +213,97 @@ class TestBatchEnrichProfilesOrchestrator:
         assert result == {"by_url": {}, "requested": 0, "fulfilled": 0, "unmatched": [], "credits_used": 0, "batch_ids": []}
 
 
+class TestBatchEnrichProfilesDedup:
+    """Codex review, PR #127, 2026-08-04: a caller-supplied list containing
+    the same URL twice was submitted to Crustdata unchanged (paying for it
+    twice) while requested/fulfilled/credits_used were derived from a
+    de-duplicated set — silently UNDER-counting the true spend. Must
+    dedupe by normalized URL BEFORE submitting, while still resolving
+    every original duplicate position via by_url."""
+
+    def test_verbatim_duplicate_submitted_only_once(self, monkeypatch):
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url = "https://www.linkedin.com/in/dupe"
+        urls = [url, url]
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1") as mock_submit, \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[_enrich_record(url)]):
+            result = batch_enrich_profiles(urls, api_key="test-key")
+
+        submitted_urls = mock_submit.call_args.args[0]
+        assert submitted_urls == [url]  # sent once, not twice
+        assert result["requested"] == 1
+        assert result["fulfilled"] == 1
+        assert result["credits_used"] == 1  # NOT 2 — this is the actual bill
+
+    def test_by_url_resolves_at_every_duplicate_input_position(self, monkeypatch):
+        """Even though only one representative gets submitted, a caller
+        indexing results against their own (duplicate-containing) input
+        list must still get a hit at every position — same contract
+        dashboard.enrich_batch() relies on."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url = "https://www.linkedin.com/in/dupe"
+        urls = [url, url, url]
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[_enrich_record(url)]):
+            result = batch_enrich_profiles(urls, api_key="test-key")
+
+        for input_url in urls:
+            assert result["by_url"].get(input_url) is not None
+            assert result["by_url"][input_url]["skills"] == ["Python"]
+
+    def test_different_raw_strings_same_normalized_identity_dedup_together(self, monkeypatch):
+        """A trailing slash (or other cosmetic difference) still counts as
+        the same profile for billing purposes, even though the two input
+        strings aren't byte-identical."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        bare = "https://www.linkedin.com/in/dupe"
+        with_slash = "https://www.linkedin.com/in/dupe/"
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1") as mock_submit, \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[_enrich_record(bare)]):
+            result = batch_enrich_profiles([bare, with_slash], api_key="test-key")
+
+        assert mock_submit.call_args.args[0] == [bare]  # only the first-seen form submitted
+        assert result["requested"] == 1
+        assert result["credits_used"] == 1
+        assert result["by_url"].get(bare) is not None
+        assert result["by_url"].get(with_slash) is not None
+
+    def test_duplicate_among_otherwise_distinct_urls_only_that_one_deduped(self, monkeypatch):
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        a = "https://www.linkedin.com/in/a"
+        b = "https://www.linkedin.com/in/b"
+        urls = [a, b, a]  # a appears twice
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1") as mock_submit, \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[_enrich_record(a), _enrich_record(b)]):
+            result = batch_enrich_profiles(urls, api_key="test-key")
+
+        submitted_urls = mock_submit.call_args.args[0]
+        assert submitted_urls == [a, b]  # a submitted once, b once — 2 total, not 3
+        assert result["requested"] == 2
+        assert result["fulfilled"] == 2
+        assert result["credits_used"] == 2
+        assert result["by_url"][a]["name"] == "Jane Doe"
+        assert result["by_url"][b]["name"] == "Jane Doe"
+
+    def test_duplicate_url_with_no_match_reports_unmatched_once(self, monkeypatch):
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url = "https://www.linkedin.com/in/ghost"
+        urls = [url, url]
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[]):
+            result = batch_enrich_profiles(urls, api_key="test-key")
+
+        assert result["requested"] == 1
+        assert result["fulfilled"] == 0
+        assert result["unmatched"] == [url]
+        assert result["credits_used"] == 0
+
+
 # ---------------------------------------------------------------------------
 # enrich_profile_to_legacy_shape — verified against a REAL live response
 # (captured 2026-07-20 via crustdata_people_enrich_v2, linkedin.com/in/dvdhsu)
