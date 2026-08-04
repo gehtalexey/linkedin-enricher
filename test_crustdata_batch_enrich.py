@@ -304,6 +304,147 @@ class TestBatchEnrichProfilesDedup:
         assert result["credits_used"] == 0
 
 
+class TestBatchEnrichProfilesIdentityValidation:
+    """Codex adversarial review of PR #127, round 2 (2026-08-04, HIGH):
+    round 1 hardened only the sync path's match selection
+    (_select_person_data_from_matches -> _is_valid_person_data). The batch
+    path trusted any non-empty `data` payload that echoed the right
+    `original_identifier`, without ever checking the payload's OWN claimed
+    LinkedIn URL against what was actually requested for it — the exact
+    wrong-person risk round 1 fixed for sync, unfixed here. Batch is the
+    highest-volume call site (the "Enrich N profiles" button), so this is
+    real exposure, not a theoretical one."""
+
+    def _record_with_url(self, identifier, data_url, name="Someone", has_content=True):
+        data = {
+            "basic_profile": {"name": name if has_content else "", "current_title": "Engineer", "headline": "", "summary": ""},
+            "experience": {"employment_details": {"current": [], "past": []}},
+            "education": {"schools": []},
+            "skills": {"professional_network_skills": ["Python"] if has_content else []},
+            "social_handles": {"professional_network_identifier": {"profile_url": data_url}},
+        }
+        return {"original_identifier": identifier, "internal_id": 1, "data": data}
+
+    def test_identifier_echoed_but_payload_url_is_a_different_person_rejected(self, monkeypatch):
+        """The exact Codex regression case: original_identifier says URL A,
+        but data.social_handles...profile_url says URL B. Must not map,
+        must not count fulfilled."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url_a = "https://www.linkedin.com/in/person-a"
+        url_b = "https://www.linkedin.com/in/person-b"
+        record = self._record_with_url(identifier=url_a, data_url=url_b, name="Wrong Person")
+
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[record]):
+            result = batch_enrich_profiles([url_a], api_key="test-key")
+
+        assert result["by_url"].get(url_a) is None
+        assert result["fulfilled"] == 0
+        assert result["credits_used"] == 0
+        assert result["rejected"] == [url_a]
+        assert result["unmatched"] == []  # distinct from a genuine no-match
+
+    def test_empty_shell_data_rejected_not_fulfilled(self, monkeypatch):
+        """{"basic_profile": {}}-style empty shell, but wrapped with a
+        matching original_identifier — content gate must still catch it."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url = "https://www.linkedin.com/in/ghost-shell"
+        record = self._record_with_url(identifier=url, data_url=url, has_content=False)
+
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[record]):
+            result = batch_enrich_profiles([url], api_key="test-key")
+
+        assert result["by_url"].get(url) is None
+        assert result["fulfilled"] == 0
+        assert result["rejected"] == [url]
+
+    def test_valid_matching_record_still_fulfilled(self, monkeypatch):
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url = "https://www.linkedin.com/in/real-person"
+        record = self._record_with_url(identifier=url, data_url=url, name="Real Person")
+
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[record]):
+            result = batch_enrich_profiles([url], api_key="test-key")
+
+        assert result["by_url"][url]["name"] == "Real Person"
+        assert result["fulfilled"] == 1
+        assert result["rejected"] == []
+        assert result["credits_used"] == 1
+
+    def test_record_with_no_original_identifier_is_uncounted_not_trusted(self, monkeypatch):
+        """No independent identity to verify against at all — must not be
+        trusted on its own say-so, and (since we can't attribute it to any
+        requested identity) it's simply uncounted rather than force-mapped
+        into rejected or unmatched."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url = "https://www.linkedin.com/in/no-identifier"
+        record = {
+            "internal_id": 1,
+            "data": {
+                "basic_profile": {"name": "Someone"},
+                "skills": {"professional_network_skills": ["Python"]},
+                "social_handles": {"professional_network_identifier": {"profile_url": url}},
+            },
+        }  # no "original_identifier" key at all
+
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[record]):
+            result = batch_enrich_profiles([url], api_key="test-key")
+
+        assert result["by_url"].get(url) is None
+        assert result["fulfilled"] == 0
+        # Falls through to unmatched (nothing usable was ever mapped for it).
+        assert result["unmatched"] == [url]
+
+    def test_record_echoing_unrequested_identifier_is_ignored(self, monkeypatch):
+        """A record whose original_identifier doesn't correspond to
+        anything we actually submitted must not pollute by_url or counts."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        requested_url = "https://www.linkedin.com/in/requested"
+        stray_url = "https://www.linkedin.com/in/never-asked-for"
+        stray_record = self._record_with_url(identifier=stray_url, data_url=stray_url, name="Stray")
+
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[stray_record]):
+            result = batch_enrich_profiles([requested_url], api_key="test-key")
+
+        assert result["by_url"] == {}
+        assert result["fulfilled"] == 0
+        assert result["unmatched"] == [requested_url]
+
+    def test_mixed_batch_valid_rejected_and_unmatched_counted_distinctly(self, monkeypatch):
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        valid_url = "https://www.linkedin.com/in/valid"
+        wrong_person_url = "https://www.linkedin.com/in/wrong-person-requested"
+        wrong_person_actual = "https://www.linkedin.com/in/wrong-person-actual"
+        no_match_url = "https://www.linkedin.com/in/no-match"
+
+        records = [
+            self._record_with_url(identifier=valid_url, data_url=valid_url, name="Valid"),
+            self._record_with_url(identifier=wrong_person_url, data_url=wrong_person_actual, name="Impostor"),
+            # no_match_url gets no record at all
+        ]
+
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=records):
+            result = batch_enrich_profiles([valid_url, wrong_person_url, no_match_url], api_key="test-key")
+
+        assert result["requested"] == 3
+        assert result["fulfilled"] == 1
+        assert result["by_url"][valid_url]["name"] == "Valid"
+        assert result["rejected"] == [wrong_person_url]
+        assert result["unmatched"] == [no_match_url]
+        assert result["credits_used"] == 1
+
+
 # ---------------------------------------------------------------------------
 # enrich_profile_to_legacy_shape — verified against a REAL live response
 # (captured 2026-07-20 via crustdata_people_enrich_v2, linkedin.com/in/dvdhsu)

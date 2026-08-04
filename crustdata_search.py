@@ -1479,50 +1479,84 @@ def _person_data_has_real_content(person_data: Dict[str, Any]) -> bool:
     return has_experience or has_education or has_skills
 
 
+def _person_data_matches_url(person_data: Any, expected_url: str) -> bool:
+    """Identity check: does `person_data`'s own LinkedIn URL (via
+    social_handles.professional_network_identifier.profile_url) normalize
+    to the same value as `expected_url`?
+
+    This is the identity half of _is_valid_person_data() below, split out
+    so it stays testable on its own; use _is_valid_person_data() for the
+    actual identity+content gate.
+    """
+    if not isinstance(person_data, dict) or not person_data:
+        return False
+    norm_expected = normalize_linkedin_url(expected_url)
+    if not norm_expected:
+        return False
+    candidate_url = _person_data_url(person_data)
+    if not candidate_url:
+        return False
+    return normalize_linkedin_url(candidate_url) == norm_expected
+
+
+def _is_valid_person_data(person_data: Any, expected_url: str) -> bool:
+    """THE single identity+content gate a `person_data`/`data` payload must
+    clear before it's trusted enough to translate and write into the
+    shared Supabase profiles table (four projects read that table —
+    writing another person's data onto a row, or a blank shell, is data
+    corruption, not a harmless miss).
+
+    Used by BOTH enrich paths — the sync endpoint's
+    _select_person_data_from_matches() and the batch endpoint's
+    batch_enrich_profiles() — as ONE shared standard rather than two
+    separate checks that could drift (Codex review, PR #127, round 2,
+    2026-08-04: round 1 hardened only the sync path; the batch path
+    still trusted any non-empty `data` payload that echoed the right
+    `original_identifier`, without checking the payload's OWN claimed
+    LinkedIn URL against what was actually requested — recreating the
+    exact wrong-person risk round 1 fixed for sync).
+
+    A candidate passes only if BOTH:
+      1. Its own LinkedIn URL normalizes to the same value as
+         `expected_url` (_person_data_matches_url()) — a confidence
+         score or an echoed identifier is Crustdata's claim, not
+         verification; comparing the payload's own data against what we
+         actually asked about is.
+      2. It has real content (_person_data_has_real_content()) — not an
+         empty shell.
+
+    When in doubt, this returns False: a missed enrichment costs nothing
+    (Crustdata's global no-charge-on-no-result policy), a wrongly-trusted
+    one corrupts a shared row.
+    """
+    if not _person_data_matches_url(person_data, expected_url):
+        return False
+    return _person_data_has_real_content(person_data)
+
+
 def _select_person_data_from_matches(matches: Any, requested_url: str) -> Optional[Dict[str, Any]]:
     """Pick the right `person_data` dict out of a sync-enrich record's
     `matches` list (verified shape — see _extract_sync_enrich_record()).
 
-    Identity is verified on every candidate BEFORE ranking, not only as a
-    confidence tie-break (Codex review, PR #127, 2026-08-04 — the earlier
-    version let a high-confidence WRONG-person match win over a
-    lower-confidence right one). A candidate is only eligible at all if
-    its own LinkedIn URL (social_handles.professional_network_identifier
-    .profile_url) normalizes to the same URL we requested — confidence_score
-    is Crustdata's guess at relevance, not a substitute for the fact we
-    actually asked about. Eligible candidates also have to pass
-    _person_data_has_real_content() — content gate against an empty shell.
+    Every candidate is run through _is_valid_person_data() — identity
+    verified BEFORE ranking, not only as a confidence tie-break (Codex
+    review, PR #127, 2026-08-04 — the earlier version let a
+    high-confidence WRONG-person match win over a lower-confidence right
+    one). Among candidates that pass, the highest confidence_score wins
+    (a tie doesn't matter for correctness at that point, since every
+    eligible candidate already points at the same requested URL).
 
-    Among eligible candidates, the highest confidence_score wins (a tie
-    doesn't matter for correctness at that point, since every eligible
-    candidate already points at the same requested URL).
-
-    Returns None — never a half-built or wrong-person profile — when:
-    the requested URL itself can't be normalized, `matches` is missing/
-    empty, no candidate's own URL matches the request, or no URL-matching
-    candidate has real content.
+    Returns None — never a half-built or wrong-person profile — when
+    `matches` is missing/empty or no candidate clears
+    _is_valid_person_data().
     """
     if not isinstance(matches, list) or not matches:
         return None
 
-    norm_target = normalize_linkedin_url(requested_url)
-    if not norm_target:
-        return None
-
-    eligible = []
-    for m in matches:
-        if not isinstance(m, dict):
-            continue
-        person_data = m.get("person_data")
-        if not isinstance(person_data, dict) or not person_data:
-            continue
-        candidate_url = _person_data_url(person_data)
-        if not candidate_url or normalize_linkedin_url(candidate_url) != norm_target:
-            continue
-        if not _person_data_has_real_content(person_data):
-            continue
-        eligible.append(m)
-
+    eligible = [
+        m for m in matches
+        if isinstance(m, dict) and _is_valid_person_data(m.get("person_data"), requested_url)
+    ]
     if not eligible:
         return None
 
@@ -1794,7 +1828,10 @@ def batch_enrich_profiles(
             "by_url": {<url>: <flat legacy-enrich-shape dict>},
             "requested": int,
             "fulfilled": int,
-            "unmatched": [urls...],
+            "unmatched": [urls...],       # no record came back at all
+            "rejected": [urls...],        # a record came back but failed
+                                           # identity/content validation —
+                                           # see _is_valid_person_data()
             "credits_used": fulfilled * 1,
             "batch_ids": [...],
         }
@@ -1811,6 +1848,18 @@ def batch_enrich_profiles(
     (not just the representative), so callers indexing results against
     their own input list — including the duplicate — still get a hit at
     every position.
+
+    Every downloaded record is run through the SAME identity+content gate
+    as the sync path, _is_valid_person_data() (Codex review, PR #127,
+    round 2, 2026-08-04): round 1 hardened only sync_enrich_profile()'s
+    match selection; this endpoint's records were still trusted on the
+    strength of `original_identifier` alone, with no check that the
+    payload's OWN claimed LinkedIn URL actually matched what was
+    submitted for it. A record that echoes the right identifier but
+    carries a wrong person (or an empty shell) is now counted in
+    `rejected`, NOT mapped into `by_url`, and NOT counted fulfilled —
+    same standard, same reasoning: a missed enrichment costs nothing, a
+    wrongly-trusted one corrupts a row four other projects read.
     """
     linkedin_urls = [u for u in (linkedin_urls or []) if u and str(u).strip()]
     if not linkedin_urls:
@@ -1835,6 +1884,7 @@ def batch_enrich_profiles(
     jobs = [submit_urls[i:i + 10000] for i in range(0, len(submit_urls), 10000)]
     by_url: Dict[str, Dict[str, Any]] = {}
     batch_ids: List[str] = []
+    rejected_canonical: set = set()
 
     for job_urls in jobs:
         try:
@@ -1867,14 +1917,25 @@ def batch_enrich_profiles(
         for record in records:
             data = record.get("data") or {}
             if not data:
-                continue
-            flat = enrich_profile_to_legacy_shape(data)
+                continue  # genuinely empty payload — stays unmatched, not "rejected"
+
             identifier = record.get("original_identifier")
-            key = identifier or flat.get("linkedin_flagship_url")
-            if not key:
+            if not identifier:
+                # No independent identity to verify this payload against —
+                # cannot safely trust it (see _is_valid_person_data()'s
+                # docstring). Uncounted rather than guessed at.
                 continue
-            by_url[key] = flat
-            norm_key = normalize_linkedin_url(key) or key
+            norm_key = normalize_linkedin_url(identifier) or identifier
+            if norm_key not in canonical_to_inputs:
+                # Echoes an identifier we never actually submitted — ignore.
+                continue
+
+            if not _is_valid_person_data(data, identifier):
+                rejected_canonical.add(norm_key)
+                continue
+
+            flat = enrich_profile_to_legacy_shape(data)
+            by_url[identifier] = flat
             if norm_key not in by_url:
                 by_url[norm_key] = flat
             # Fan out to every original caller-supplied string that maps to
@@ -1883,16 +1944,21 @@ def batch_enrich_profiles(
             for original_input in canonical_to_inputs.get(norm_key, []):
                 by_url.setdefault(original_input, flat)
 
-    unmatched_canonical = [norm for norm in canonical_to_inputs if norm not in by_url]
+    unmatched_canonical = [
+        norm for norm in canonical_to_inputs
+        if norm not in by_url and norm not in rejected_canonical
+    ]
     unmatched = sorted(canonical_to_inputs[norm][0] for norm in unmatched_canonical)
+    rejected = sorted(canonical_to_inputs[norm][0] for norm in rejected_canonical)
     requested = len(canonical_to_inputs)
-    fulfilled = requested - len(unmatched_canonical)
+    fulfilled = requested - len(unmatched_canonical) - len(rejected_canonical)
 
     return {
         "by_url": by_url,
         "requested": requested,
         "fulfilled": fulfilled,
         "unmatched": unmatched,
+        "rejected": rejected,
         "credits_used": fulfilled * CREDITS_PER_ENRICH_PROFILE_BASE,
         "batch_ids": batch_ids,
     }
