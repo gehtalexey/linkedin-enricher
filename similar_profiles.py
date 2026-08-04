@@ -14,8 +14,7 @@ plumbing so the UI code stays thin and the logic is testable.
 
 from __future__ import annotations
 
-import requests
-
+from crustdata_search import sync_enrich_profile
 from db import (
     SimilarityRPCError,
     SupabaseClient,
@@ -34,9 +33,6 @@ from geo_terms import expand_city, expand_country
 from normalizers import normalize_linkedin_url
 
 
-CRUSTDATA_ENRICH_URL = "https://api.crustdata.com/screener/person/enrich"
-
-
 class SimilarProfileError(Exception):
     """Raised when we can't find or build an embedding to search against."""
 
@@ -45,37 +41,22 @@ class SimilarProfileError(Exception):
 # Crustdata helper
 # ---------------------------------------------------------------------------
 def _crustdata_enrich(linkedin_url: str, crustdata_key: str) -> dict | None:
-    """Fetch a single profile from Crustdata.
+    """Fetch a single profile from Crustdata via the cheap v2025-11-01 sync
+    enrich endpoint (crustdata_search.sync_enrich_profile — 1 credit base),
+    NOT the legacy GET /screener/person/enrich (3 credits/profile) this used
+    before 2026-08-04.
 
-    Returns the response dict on success, or ``None`` if Crustdata had no
-    data for the URL. Raises ``SimilarProfileError`` for transport errors
-    or non-2xx HTTP responses so the caller can surface them in the UI.
+    Returns the flat legacy-enrich-shape dict on success (same shape
+    save_enriched_profile()/_prepare_profile_row() already read — see
+    crustdata_search.enrich_profile_to_legacy_shape()), or ``None`` if
+    Crustdata had no data for the URL. Raises ``SimilarProfileError`` for
+    transport errors or non-2xx HTTP responses so the caller can surface
+    them in the UI.
     """
     try:
-        response = requests.get(
-            CRUSTDATA_ENRICH_URL,
-            params={"linkedin_profile_url": linkedin_url},
-            headers={"Authorization": f"Token {crustdata_key}"},
-            timeout=120,
-        )
-    except requests.RequestException as e:
-        raise SimilarProfileError(f"Network error calling Crustdata: {e}") from e
-
-    if response.status_code >= 400:
-        body = response.text[:500] if response.text else "<empty>"
-        raise SimilarProfileError(
-            f"Crustdata enrichment failed ({response.status_code}): {body}"
-        )
-
-    try:
-        data = response.json()
-    except ValueError as e:
-        raise SimilarProfileError(f"Crustdata returned non-JSON body: {e}") from e
-
-    result = data[0] if isinstance(data, list) and data else data
-    if not result or (isinstance(result, dict) and result.get("error")):
-        return None
-    return result if isinstance(result, dict) else None
+        return sync_enrich_profile(linkedin_url, api_key=crustdata_key)
+    except Exception as e:
+        raise SimilarProfileError(f"Crustdata enrichment failed: {e}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +76,7 @@ def get_or_build_query_embedding(
          write it back. ``source="embedded"``.
       3. Profile is not in the DB:
            - If ``crustdata_key`` is provided, enrich via Crustdata (costs
-             ~3 credits), save, embed. ``source="enriched"``.
+             ~1 credit), save, embed. ``source="enriched"``.
            - Otherwise raise ``SimilarProfileError``.
 
     Returns:

@@ -2,22 +2,22 @@
 Tests for similar_profiles.py auto-enrichment path.
 
 All network-free: fake Supabase client, fake OpenAI, monkeypatched
-Crustdata HTTP. We verify:
+crustdata_search.sync_enrich_profile (the cheap v2025-11-01 sync enrich
+call this module rewired to on 2026-08-04 — 1 credit base, replacing the
+legacy GET /screener/person/enrich at 3 credits/profile). We verify:
   1. Profile in DB with embedding         → source="cached", no enrich, no embed
   2. Profile in DB without embedding      → source="embedded", embeds, no enrich
   3. Profile NOT in DB + crustdata_key    → source="enriched", calls Crustdata, saves, embeds
   4. Profile NOT in DB + no crustdata_key → SimilarProfileError
   5. Crustdata returns no data            → SimilarProfileError
-  6. Crustdata 5xx error                  → SimilarProfileError with the body
+  6. Crustdata call raises                → SimilarProfileError wrapping the cause
 """
 
 from __future__ import annotations
 
-import sys
 import types
 
 import pytest
-import requests
 
 import similar_profiles
 from similar_profiles import SimilarProfileError, search_similar
@@ -143,7 +143,7 @@ def test_cached_path_no_enrich_no_embed(monkeypatch):
     oai = FakeOpenAI()
 
     # Crustdata MUST NOT be called.
-    monkeypatch.setattr(requests, "get", lambda *a, **k: (_ for _ in ()).throw(
+    monkeypatch.setattr(similar_profiles, "sync_enrich_profile", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("Crustdata called in cached path!")
     ))
 
@@ -161,7 +161,7 @@ def test_in_db_no_embedding_embeds_no_enrich(monkeypatch):
     client = FakeSupabaseClient(initial_profile=profile)
     oai = FakeOpenAI()
 
-    monkeypatch.setattr(requests, "get", lambda *a, **k: (_ for _ in ()).throw(
+    monkeypatch.setattr(similar_profiles, "sync_enrich_profile", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("Crustdata called when profile already in DB!")
     ))
 
@@ -178,27 +178,20 @@ def test_not_in_db_with_key_enriches_then_embeds(monkeypatch):
     oai = FakeOpenAI()
     calls = []
 
-    class FakeResponse:
-        status_code = 200
-        text = ""
+    def fake_sync_enrich(linkedin_url, api_key=None, fields=None):
+        calls.append({"linkedin_url": linkedin_url, "api_key": api_key})
+        return {
+            "linkedin_flagship_url": "https://www.linkedin.com/in/jane",
+            "name": "Jane Doe",
+            "current_employers": [{"employee_title": "Backend Engineer", "employer_name": "Acme"}],
+            "all_titles": ["Backend Engineer"],
+            "all_employers": ["Acme"],
+            "skills": ["Python"],
+            "headline": "Backend dev",
+            "summary": "Ten years.",
+        }
 
-        def json(self):
-            return [{
-                "linkedin_flagship_url": "https://www.linkedin.com/in/jane",
-                "name": "Jane Doe",
-                "current_employers": [{"title": "Backend Engineer", "employer_name": "Acme"}],
-                "all_titles": ["Backend Engineer"],
-                "all_employers": ["Acme"],
-                "skills": ["Python"],
-                "headline": "Backend dev",
-                "summary": "Ten years.",
-            }]
-
-    def fake_get(url, **kwargs):
-        calls.append({"url": url, "params": kwargs.get("params")})
-        return FakeResponse()
-
-    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(similar_profiles, "sync_enrich_profile", fake_sync_enrich)
 
     result = search_similar(
         client, oai, "https://www.linkedin.com/in/jane", crustdata_key="kc"
@@ -206,8 +199,8 @@ def test_not_in_db_with_key_enriches_then_embeds(monkeypatch):
 
     assert result["source"] == "enriched"
     assert len(calls) == 1, "Crustdata should be called exactly once"
-    assert "person/enrich" in calls[0]["url"]
-    assert calls[0]["params"]["linkedin_profile_url"] == "https://www.linkedin.com/in/jane"
+    assert calls[0]["linkedin_url"] == "https://www.linkedin.com/in/jane"
+    assert calls[0]["api_key"] == "kc"
     assert len(client.saves) == 1, "Enriched profile should be saved"
     assert oai.calls == 1, "Embedding should be generated"
     assert len(client.updates) == 1, "Embedding should be written back"
@@ -225,47 +218,26 @@ def test_crustdata_no_data_raises(monkeypatch):
     client = FakeSupabaseClient()
     oai = FakeOpenAI()
 
-    class FakeResponse:
-        status_code = 200
-        text = ""
-
-        def json(self):
-            return []
-
-    monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse())
+    monkeypatch.setattr(similar_profiles, "sync_enrich_profile", lambda *a, **k: None)
 
     with pytest.raises(SimilarProfileError) as exc:
         search_similar(client, oai, "https://www.linkedin.com/in/ghost/", crustdata_key="kc")
     assert "couldn't find" in str(exc.value).lower()
 
 
-def test_crustdata_http_error_raises(monkeypatch):
-    client = FakeSupabaseClient()
-    oai = FakeOpenAI()
-
-    class FakeResponse:
-        status_code = 500
-        text = "internal server error"
-
-        def json(self):
-            return {}
-
-    monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse())
-
-    with pytest.raises(SimilarProfileError) as exc:
-        search_similar(client, oai, "https://www.linkedin.com/in/x/", crustdata_key="kc")
-    assert "500" in str(exc.value)
-    assert "internal server error" in str(exc.value)
-
-
-def test_crustdata_network_error_raises(monkeypatch):
+def test_crustdata_error_raises(monkeypatch):
+    """Any exception out of sync_enrich_profile() (auth failure, 5xx,
+    timeout, connection error — crustdata_search raises typed
+    error_handling exceptions for all of these) must surface as a
+    SimilarProfileError wrapping the cause, not propagate raw."""
     client = FakeSupabaseClient()
     oai = FakeOpenAI()
 
     def boom(*a, **k):
-        raise requests.ConnectionError("no route")
-    monkeypatch.setattr(requests, "get", boom)
+        raise RuntimeError("Crustdata is temporarily unavailable")
+
+    monkeypatch.setattr(similar_profiles, "sync_enrich_profile", boom)
 
     with pytest.raises(SimilarProfileError) as exc:
         search_similar(client, oai, "https://www.linkedin.com/in/x/", crustdata_key="kc")
-    assert "network error" in str(exc.value).lower()
+    assert "Crustdata is temporarily unavailable" in str(exc.value)
