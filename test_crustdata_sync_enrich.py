@@ -179,6 +179,21 @@ class TestSyncEnrichProfileResponseParsing:
         assert flat["name"] == "Israeli Candidate"
         assert flat["skills"] == ["Python"]
 
+    def test_company_lookalike_url_in_person_data_never_returns_a_profile(self):
+        """Codex adversarial review of PR #127, round 4 (HIGH): a
+        person_data payload claiming a company-style URL with a nested
+        /in/ segment that happens to end in the requested slug must be
+        rejected, not accepted as a match."""
+        requested_url = "https://www.linkedin.com/in/target"
+        lookalike_url = "https://www.linkedin.com/company/acme/in/target"
+        with patch("crustdata_search.requests.post") as mock_post:
+            mock_post.return_value = _mock_response(
+                json_data=_real_shape_response(lookalike_url, name="Not Actually Target")
+            )
+            flat = sync_enrich_profile(requested_url, api_key="test-key")
+
+        assert flat is None
+
     def test_empty_matches_returns_none(self):
         url = "https://www.linkedin.com/in/ghost"
         with patch("crustdata_search.requests.post") as mock_post:

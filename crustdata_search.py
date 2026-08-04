@@ -1490,9 +1490,24 @@ _LINKEDIN_HOST_RE = re.compile(r'^(?:[a-z]{2}\.)?(?:www\.)?linkedin\.com$')
 
 def _linkedin_profile_slug(url: Any) -> Optional[Tuple[str, str]]:
     """Parse a LinkedIn profile URL into (host, slug) — but ONLY if it's
-    on an allowlisted LinkedIn host (see _LINKEDIN_HOST_RE) and has a
-    /in/<slug> path. Returns None for anything else, including lookalike
-    hosts, so callers can't accidentally trust a non-LinkedIn domain.
+    on an allowlisted LinkedIn host (see _LINKEDIN_HOST_RE) AND the path
+    is EXACTLY a person-profile path: `/in/<slug>` with an optional
+    trailing slash and nothing else. Returns None for anything else,
+    including lookalike hosts and non-profile paths, so callers can't
+    accidentally trust a non-LinkedIn domain or a non-person URL.
+
+    The path check is intentionally strict — require the path to BEGIN
+    with `/in/` and contain exactly one further non-empty segment — not
+    merely "contains /in/ somewhere" (Codex review, PR #127, round 4,
+    HIGH): a path like `/company/acme/in/target` would otherwise parse
+    with slug "target" and identity-match a genuine `/in/target` URL,
+    letting a malformed or adversarial profile_url from an enrichment
+    payload clear this gate even though it isn't a real person-profile
+    URL at all. That would defeat the wrong-person protection this gate
+    exists for — this repo's last line of defense against writing one
+    person's data onto another person's row in the shared profiles
+    table. Fail closed: any path shape other than exactly one slug
+    segment returns None, never a guess.
 
     The slug is percent-decoded and lowercased for identity comparison —
     this is a narrower "is this the same public profile" check than
@@ -1522,13 +1537,32 @@ def _linkedin_profile_slug(url: Any) -> Optional[Tuple[str, str]]:
         return None
 
     path = parsed.path or ''
-    path_lower = path.lower()
     marker = '/in/'
-    if marker not in path_lower:
+    if not path.lower().startswith(marker):
+        # Must BEGIN with /in/ — a prefix like /company/acme/in/target
+        # is a different resource entirely, not a person profile with a
+        # slug we can trust.
         return None
-    slug = path[path_lower.index(marker) + len(marker):]
-    slug = slug.split('/')[0]  # drop anything past a further path segment
-    slug = unquote(slug).rstrip('/').lower()
+
+    remainder = path[len(marker):]
+    segments = remainder.split('/')
+    # Exactly one non-empty segment, with at most one trailing slash:
+    #   "target"      -> ["target"]           len 1
+    #   "target/"     -> ["target", ""]       len 2, second empty
+    # Anything else (a further segment, or no segment at all) is rejected:
+    #   "target/bar"  -> ["target", "bar"]    len 2, second non-empty -> reject
+    #   ""            -> [""]                 len 1, but empty        -> reject
+    if len(segments) == 1:
+        slug_raw = segments[0]
+    elif len(segments) == 2 and segments[1] == '':
+        slug_raw = segments[0]
+    else:
+        return None
+
+    if not slug_raw:
+        return None
+
+    slug = unquote(slug_raw).lower()
     if not slug:
         return None
     return host, slug

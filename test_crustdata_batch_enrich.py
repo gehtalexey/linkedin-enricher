@@ -590,6 +590,26 @@ class TestBatchEnrichProfilesRegionalHostIdentity:
         assert result["fulfilled"] == 0
         assert result["rejected"] == [requested_url]
 
+    def test_company_lookalike_url_in_payload_still_rejected(self, monkeypatch):
+        """Codex adversarial review of PR #127, round 4 (HIGH): a
+        payload claiming a company-style URL with a nested /in/ segment
+        ending in the requested slug must be rejected, not accepted —
+        covers the batch path for the same regression the sync-path
+        test in test_crustdata_sync_enrich.py exercises."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        requested_url = "https://www.linkedin.com/in/target"
+        lookalike_url = "https://www.linkedin.com/company/acme/in/target"
+        record = self._record_with_url(identifier=requested_url, data_url=lookalike_url, name="Not Actually Target")
+
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[record]):
+            result = batch_enrich_profiles([requested_url], api_key="test-key")
+
+        assert result["by_url"].get(requested_url) is None
+        assert result["fulfilled"] == 0
+        assert result["rejected"] == [requested_url]
+
 
 class TestStatusFulfilledHint:
     def test_known_key_extracted(self):

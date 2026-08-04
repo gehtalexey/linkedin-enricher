@@ -95,6 +95,29 @@ class TestLinkedinProfileSlugParsing:
         assert _linkedin_profile_slug("https://mobile.linkedin.com/in/foo") is None
         assert _linkedin_profile_slug("https://news.linkedin.com/in/foo") is None
 
+    def test_path_prefix_before_in_marker_rejected(self):
+        """Codex review, PR #127, round 4 (HIGH): the path must BEGIN
+        with /in/, not merely contain it somewhere. A company URL with a
+        nested /in/ segment is a different resource entirely, not a
+        person profile — must not parse as one."""
+        assert _linkedin_profile_slug("https://www.linkedin.com/company/acme/in/target") is None
+        assert _linkedin_profile_slug("https://www.linkedin.com/pub/in/target") is None
+        assert _linkedin_profile_slug("https://www.linkedin.com/x/in/target") is None
+
+    def test_extra_path_segment_after_slug_rejected(self):
+        """Codex review, PR #127, round 4 (HIGH): exactly ONE non-empty
+        slug segment after /in/ — anything with a further path segment
+        is a different (or malformed) resource, not this person's
+        profile root."""
+        assert _linkedin_profile_slug("https://www.linkedin.com/in/foo/bar") is None
+        assert _linkedin_profile_slug("https://www.linkedin.com/in/foo/bar/") is None
+        assert _linkedin_profile_slug("https://www.linkedin.com/in/foo/recent-activity") is None
+
+    def test_single_valid_slug_with_or_without_trailing_slash_still_parses(self):
+        """The tightened parser must not regress the ordinary case."""
+        assert _linkedin_profile_slug("https://www.linkedin.com/in/foo") == ("www.linkedin.com", "foo")
+        assert _linkedin_profile_slug("https://www.linkedin.com/in/foo/") == ("www.linkedin.com", "foo")
+
 
 class TestLinkedinProfileIdentityMatches:
     def test_www_vs_regional_hosts_same_slug_match(self):
@@ -132,6 +155,28 @@ class TestLinkedinProfileIdentityMatches:
         assert linkedin_profile_identity_matches("not a url", "not a url") is False
         assert linkedin_profile_identity_matches(None, None) is False
 
+    def test_company_url_with_nested_in_segment_does_not_match_real_profile(self):
+        """Codex adversarial review of PR #127, round 4 (HIGH) — the
+        exact regression case: a company URL with a nested /in/ segment
+        must NOT identity-match the real person-profile URL for the same
+        slug. Before this fix, both parsed to slug "target" and matched,
+        letting a malformed/adversarial profile_url clear the wrong-
+        person gate."""
+        company_lookalike = "https://www.linkedin.com/company/acme/in/target"
+        real_profile = "https://www.linkedin.com/in/target"
+        assert linkedin_profile_identity_matches(company_lookalike, real_profile) is False
+
+    def test_extra_path_segment_does_not_match_shorter_slug(self):
+        deeper = "https://www.linkedin.com/in/foo/bar"
+        shallow = "https://www.linkedin.com/in/foo"
+        assert linkedin_profile_identity_matches(deeper, shallow) is False
+
+    def test_empty_slug_never_matches(self):
+        empty = "https://www.linkedin.com/in/"
+        real = "https://www.linkedin.com/in/foo"
+        assert linkedin_profile_identity_matches(empty, real) is False
+        assert linkedin_profile_identity_matches(empty, empty) is False
+
 
 class TestIdentityGateUsesRegionalHostMatching:
     """Integration: the actual identity gate the sync AND batch enrich
@@ -159,4 +204,16 @@ class TestIdentityGateUsesRegionalHostMatching:
         protection — a different slug on an allowlisted host still fails."""
         requested = "https://il.linkedin.com/in/foo"
         data = _person_data("https://www.linkedin.com/in/someone-else", name="Wrong Person")
+        assert _is_valid_person_data(data, requested) is False
+
+    def test_is_valid_person_data_rejects_non_profile_url_even_with_matching_slug(self):
+        """Codex adversarial review of PR #127, round 4 (HIGH): a
+        payload claiming a company-style URL with a nested /in/ segment
+        must not pass the gate just because the trailing text happens to
+        match the requested slug — this is the gate standing between an
+        adversarial/malformed profile_url and writing the wrong data
+        onto the shared profiles table."""
+        requested = "https://www.linkedin.com/in/target"
+        data = _person_data("https://www.linkedin.com/company/acme/in/target", name="Not Actually Target")
+        assert _person_data_matches_url(data, requested) is False
         assert _is_valid_person_data(data, requested) is False
