@@ -8,9 +8,19 @@ legacy GET /screener/person/enrich at 3 credits/profile). We verify:
   1. Profile in DB with embedding         → source="cached", no enrich, no embed
   2. Profile in DB without embedding      → source="embedded", embeds, no enrich
   3. Profile NOT in DB + crustdata_key    → source="enriched", calls Crustdata, saves, embeds
-  4. Profile NOT in DB + no crustdata_key → SimilarProfileError
-  5. Crustdata returns no data            → SimilarProfileError
-  6. Crustdata call raises                → SimilarProfileError wrapping the cause
+  4. Profile NOT in DB + no crustdata_key → SimilarProfileError, not attempted
+  5. Crustdata returns no data            → SimilarProfileError, attempted but not fulfilled
+  6. Crustdata call raises                → SimilarProfileError wrapping the cause, attempted + error
+  7. A downstream failure AFTER a successful enrich (the similarity RPC
+     itself failing) still tags the raised error as fulfilled=True, since
+     the credit was genuinely spent before that point
+
+Also covers the crustdata_attempted/crustdata_fulfilled/crustdata_error
+attributes SimilarProfileError now carries (Codex review, PR #127,
+2026-08-04) — dashboard.log_similar_profiles_crustdata_usage() reads these
+to log usage at the dashboard boundary without this module needing a
+UsageTracker parameter threaded through it; see
+test_similar_profiles_usage_logging.py for that function's own tests.
 """
 
 from __future__ import annotations
@@ -21,6 +31,7 @@ import pytest
 
 import similar_profiles
 from similar_profiles import SimilarProfileError, search_similar
+from db import SimilarityRPCError
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +223,8 @@ def test_not_in_db_no_key_raises():
     with pytest.raises(SimilarProfileError) as exc:
         search_similar(client, oai, "https://www.linkedin.com/in/unknown/", crustdata_key=None)
     assert "isn't in our database" in str(exc.value)
+    # No API key means no Crustdata call was ever attempted — nothing to log.
+    assert exc.value.crustdata_attempted is False
 
 
 def test_crustdata_no_data_raises(monkeypatch):
@@ -223,6 +236,11 @@ def test_crustdata_no_data_raises(monkeypatch):
     with pytest.raises(SimilarProfileError) as exc:
         search_similar(client, oai, "https://www.linkedin.com/in/ghost/", crustdata_key="kc")
     assert "couldn't find" in str(exc.value).lower()
+    # Genuine no-match: attempted, but Crustdata's no-charge-on-no-match
+    # policy means it cost nothing and it's NOT an error.
+    assert exc.value.crustdata_attempted is True
+    assert exc.value.crustdata_fulfilled is False
+    assert exc.value.crustdata_error is None
 
 
 def test_crustdata_error_raises(monkeypatch):
@@ -241,3 +259,41 @@ def test_crustdata_error_raises(monkeypatch):
     with pytest.raises(SimilarProfileError) as exc:
         search_similar(client, oai, "https://www.linkedin.com/in/x/", crustdata_key="kc")
     assert "Crustdata is temporarily unavailable" in str(exc.value)
+    # A real transport/HTTP failure: attempted, and logged as an error.
+    assert exc.value.crustdata_attempted is True
+    assert exc.value.crustdata_fulfilled is False
+    assert exc.value.crustdata_error is not None
+    assert "Crustdata is temporarily unavailable" in exc.value.crustdata_error
+
+
+def test_rpc_failure_after_successful_enrich_tags_fulfilled_true(monkeypatch):
+    """A real credit was already spent (enrichment + save + embed all
+    succeeded) before the similarity RPC itself failed — the raised error
+    must still say fulfilled=True so the caller logs the true spend,
+    not a silent miss."""
+    client = FakeSupabaseClient()
+    oai = FakeOpenAI()
+
+    def fake_sync_enrich(linkedin_url, api_key=None, fields=None):
+        return {
+            "linkedin_flagship_url": "https://www.linkedin.com/in/jane",
+            "name": "Jane Doe",
+            "current_employers": [],
+            "all_titles": [], "all_employers": [], "skills": ["Python"],
+            "headline": "Backend dev", "summary": "Ten years.",
+        }
+
+    def fake_find_similar_boom(client, query_embedding, match_count, min_similarity, country_terms=None, city_terms=None):
+        raise SimilarityRPCError("RPC unavailable")
+
+    monkeypatch.setattr(similar_profiles, "sync_enrich_profile", fake_sync_enrich)
+    monkeypatch.setattr(similar_profiles, "find_similar_profiles_rpc", fake_find_similar_boom)
+
+    with pytest.raises(SimilarProfileError) as exc:
+        search_similar(client, oai, "https://www.linkedin.com/in/jane", crustdata_key="kc")
+    assert exc.value.crustdata_attempted is True
+    assert exc.value.crustdata_fulfilled is True
+    assert exc.value.crustdata_error is None
+    # And the enrichment/save/embed side effects genuinely happened.
+    assert len(client.saves) == 1
+    assert oai.calls == 1

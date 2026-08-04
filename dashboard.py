@@ -3578,6 +3578,43 @@ def enrich_batch(urls: list[str], api_key: str, tracker: 'UsageTracker' = None) 
     return output
 
 
+def log_similar_profiles_crustdata_usage(tracker: 'UsageTracker' = None, source: str = None, error: Exception = None) -> None:
+    """Log Crustdata usage for the "Find Similar Profiles" tab's
+    on-the-fly enrich call — extracted so it's unit-testable, since the
+    tab itself is inline Streamlit UI code with no other extracted
+    function (Codex review, PR #127, 2026-08-04: this call site had no
+    usage logging at all before, defeating the point of a cost-control
+    PR). similar_profiles.search_similar() intentionally isn't threaded
+    with a UsageTracker parameter — SimilarProfileError instead carries
+    crustdata_attempted/crustdata_fulfilled/crustdata_error attributes so
+    this boundary function can log correctly even on failure paths (see
+    that class's docstring for the full contract).
+
+    Call with `source=result.get('source')` after a successful
+    search_similar() call, XOR `error=<the caught SimilarProfileError>`.
+    No-op if `tracker` is falsy, or if no Crustdata call was actually
+    attempted (source not "enriched" and error has no crustdata_attempted).
+    """
+    if not tracker:
+        return
+    if source == "enriched":
+        tracker.log_crustdata_sync_enrich(requested=1, fulfilled=1, status='success')
+        return
+    if error is not None and getattr(error, "crustdata_attempted", False):
+        error_message = getattr(error, "crustdata_error", None)
+        if error_message:
+            tracker.log_crustdata_sync_enrich(
+                requested=1, fulfilled=0, status='error',
+                error_message=error_message,
+            )
+        else:
+            tracker.log_crustdata_sync_enrich(
+                requested=1,
+                fulfilled=1 if getattr(error, "crustdata_fulfilled", False) else 0,
+                status='success',
+            )
+
+
 def normalize_crustdata_profile(record: dict) -> dict:
     """Normalize a single Crustdata profile using shared normalizers.
 
@@ -12111,9 +12148,10 @@ with tab_similar:
                         st.session_state["similar_last_result"] = result
                         source = result.get("source")
                         if source == "enriched":
+                            log_similar_profiles_crustdata_usage(get_usage_tracker(), source=source)
                             st.info(
                                 "This profile wasn't in our database. We enriched it via "
-                                "Crustdata (~3 credits), saved it, and embedded it. Future "
+                                "Crustdata (~1 credit), saved it, and embedded it. Future "
                                 "searches for the same URL are free."
                             )
                         elif source == "embedded":
@@ -12123,6 +12161,7 @@ with tab_similar:
                             )
 
                 except SimilarProfileError as e:
+                    log_similar_profiles_crustdata_usage(get_usage_tracker(), error=e)
                     st.warning(str(e))
                 except Exception as e:
                     st.error(f"Similar search failed: {e}")
