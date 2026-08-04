@@ -1820,6 +1820,59 @@ def _status_fulfilled_hint(status_payload: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _submit_definitely_never_started(exc: Exception) -> bool:
+    """True ONLY for a submit_batch_enrich() failure where we can be
+    CONFIDENT the batch job never started on Crustdata's side — safe to
+    report as genuine no-spend. Everything else (a timeout or connection
+    loss during the POST, a 5xx response, a 200 with no batch_id, or any
+    exception type not specifically recognized here) is AMBIGUOUS and
+    must be routed to the `unknown` bucket instead (Codex review, PR #127,
+    round 3, HIGH): a client-side timeout/connection loss during the
+    submit POST can happen AFTER Crustdata already accepted and started
+    the job — reporting that as a clean, free no-match recreates the
+    exact spend-observability failure round 2 already fixed for the
+    post-acceptance (poll/download) window.
+
+    Deliberately a narrow ALLOWLIST, not a broad denylist:
+    - ValueError: submit_batch_enrich()'s own client-side input
+      validation (empty list / over 10,000 URLs) — raised before any
+      network call is even attempted.
+    - AuthenticationError (401) / RateLimitError (429): the request was
+      rejected by Crustdata's gateway before any job processing could
+      begin.
+    - A generic 4xx (ExternalServiceError with a real 400-499
+      status_code straight off an HTTP response, excluding the 5xx-only
+      ServiceUnavailableError subclass): the same kind of explicit
+      rejection Codex's own examples named ("DNS failure, 4xx rejection,
+      auth error").
+
+    Nothing else qualifies — in particular NOT a bare requests.Timeout/
+    ConnectionError (translated by submit_batch_enrich() into
+    ExternalServiceError(status_code=504) / ServiceUnavailableError
+    respectively), NOT a genuine 5xx response, and NOT the "200 but no
+    batch_id in the response body" case — all of those mean we simply
+    don't know whether Crustdata received and started processing the
+    request.
+
+    No client-side idempotency/request key is used here because
+    Crustdata's v2025-11-01 batch-enrich API doesn't document support
+    for one (checked docs.crustdata.com and this repo's Crustdata API
+    reference skill, 2026-08-04) — a retried submit after an ambiguous
+    failure can't be deduplicated server-side, so the caller is left
+    with the `unknown` bucket's diagnostics for manual reconciliation
+    rather than an automatic dedupe.
+    """
+    if isinstance(exc, ValueError):
+        return True
+    if isinstance(exc, (AuthenticationError, RateLimitError)):
+        return True
+    if isinstance(exc, ExternalServiceError) and not isinstance(exc, ServiceUnavailableError):
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(status_code, int) and 400 <= status_code < 500:
+            return True
+    return False
+
+
 def batch_enrich_profiles(
     linkedin_urls: List[str],
     api_key: str = None,
@@ -1948,19 +2001,36 @@ def batch_enrich_profiles(
     unknown_diagnostics: List[Dict[str, Any]] = []
 
     for job_urls in jobs:
+        job_norms = {normalize_linkedin_url(u) or u for u in job_urls}
+
         try:
             batch_id = submit_batch_enrich(job_urls, api_key=api_key, chunk_size=chunk_size, fields=fields)
-        except Exception:
-            # Job never got accepted by Crustdata — genuinely nothing was
-            # billed, so this is a real "no results", not unknown billing.
-            # Its URLs stay unmatched below.
+        except Exception as e:
+            if _submit_definitely_never_started(e):
+                # Confidently rejected before any job processing could
+                # begin — genuinely nothing was billed. Its URLs stay
+                # unmatched below.
+                continue
+            # Ambiguous (Codex review, PR #127, round 3): a timeout or
+            # connection loss during the submit POST itself means we
+            # don't know whether Crustdata received and started the job
+            # before we lost the response. Must not collapse to a free
+            # no-match — same "unknown" treatment as a post-acceptance
+            # poll/download failure, just with no batch_id to show for it.
+            unknown_canonical.update(job_norms)
+            unknown_diagnostics.append({
+                "batch_id": None,
+                "reason": "submit_error",
+                "fulfilled_hint": None,
+                "last_status_payload": None,
+                "error": str(e)[:300],
+            })
             continue
         batch_ids.append(batch_id)
 
         # From here on the job WAS accepted — Crustdata may already be
         # running (and billing) it, so any failure to read its outcome
         # from this point on is "unknown", never silently "no match".
-        job_norms = {normalize_linkedin_url(u) or u for u in job_urls}
 
         elapsed = 0.0
         status_payload = {}

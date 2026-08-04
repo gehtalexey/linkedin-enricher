@@ -27,6 +27,7 @@ from crustdata_search import (
     enrich_profile_to_legacy_shape,
     _download_batch_results,
     _status_fulfilled_hint,
+    _submit_definitely_never_started,
     CRUSTDATA_BATCH_ENRICH_ENDPOINT,
     CRUSTDATA_API_VERSION,
 )
@@ -207,14 +208,36 @@ class TestBatchEnrichProfilesOrchestrator:
         first_call_urls = mock_submit.call_args_list[0].args[0]
         assert len(first_call_urls) == 10000
 
-    def test_submit_failure_leaves_urls_unmatched_not_raised(self, monkeypatch):
+    def test_submit_failure_unrecognized_exception_is_unknown_not_unmatched(self, monkeypatch):
+        """Codex review, PR #127, round 3: a generic/unrecognized submit
+        failure is AMBIGUOUS (we can't confirm Crustdata never received
+        the request) — must land in `unknown`, not be silently reported
+        as a free no-match. See TestSubmitBatchEnrichFailureClassification
+        for the full ambiguous-vs-unambiguous matrix."""
         monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
         urls = ["https://www.linkedin.com/in/a"]
         with patch("crustdata_search.submit_batch_enrich", side_effect=Exception("boom")):
             result = batch_enrich_profiles(urls, api_key="test-key")
 
         assert result["fulfilled"] == 0
+        assert result["unmatched"] == []
+        assert result["unknown"] == urls
+        assert result["unknown_diagnostics"][0]["reason"] == "submit_error"
+        assert result["unknown_diagnostics"][0]["batch_id"] is None
+
+    def test_submit_failure_explicit_rejection_is_unmatched_not_unknown(self, monkeypatch):
+        """A confidently-classified "job never started" submit failure
+        (e.g. auth rejection) stays a genuine, free no-match."""
+        from error_handling import AuthenticationError
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        urls = ["https://www.linkedin.com/in/a"]
+        with patch("crustdata_search.submit_batch_enrich", side_effect=AuthenticationError("Crustdata")):
+            result = batch_enrich_profiles(urls, api_key="test-key")
+
+        assert result["fulfilled"] == 0
         assert result["unmatched"] == urls
+        assert result["unknown"] == []
+        assert result["credits_used"] == 0
 
     def test_empty_input_returns_zeroed_result_without_any_call(self):
         with patch("crustdata_search.submit_batch_enrich") as mock_submit:
@@ -602,6 +625,91 @@ class TestBatchEnrichProfilesUnknownBilling:
         assert len(result["unknown_diagnostics"]) == 1
         assert result["unknown_diagnostics"][0]["reason"] == "poll_error"
         assert result["unknown_diagnostics"][0]["batch_id"] == "batchBad"
+
+
+class TestSubmitBatchEnrichFailureClassification:
+    """Codex adversarial review of PR #127, round 3 (2026-08-04, HIGH):
+    round 2 fixed post-acceptance ambiguity (poll/download failures after
+    a batch_id was obtained) but a client-side timeout or connection loss
+    during the submit POST itself was still collapsed to "job never
+    started" — even though Crustdata may have already received and
+    started the job before the response was lost. _submit_definitely_
+    never_started() is a narrow allowlist of the ONLY submit failures
+    safe to treat as genuine no-spend; everything else must land in
+    `unknown`. Directly exercises the classifier, then confirms
+    batch_enrich_profiles() routes each case correctly end-to-end."""
+
+    def test_value_error_is_unambiguous(self):
+        assert _submit_definitely_never_started(ValueError("bad input")) is True
+
+    def test_auth_error_is_unambiguous(self):
+        from error_handling import AuthenticationError
+        assert _submit_definitely_never_started(AuthenticationError("Crustdata")) is True
+
+    def test_rate_limit_error_is_unambiguous(self):
+        from error_handling import RateLimitError
+        assert _submit_definitely_never_started(RateLimitError("Crustdata")) is True
+
+    def test_generic_4xx_is_unambiguous(self):
+        from error_handling import ExternalServiceError
+        exc = ExternalServiceError("Crustdata", message="bad request", status_code=400)
+        assert _submit_definitely_never_started(exc) is True
+
+    def test_timeout_translated_exception_is_ambiguous(self):
+        """submit_batch_enrich() converts requests.exceptions.Timeout into
+        ExternalServiceError(status_code=504) — Codex's exact example of
+        an ambiguous submit failure."""
+        from error_handling import ExternalServiceError
+        exc = ExternalServiceError("Crustdata", message="Batch enrich submit timed out", status_code=504)
+        assert _submit_definitely_never_started(exc) is False
+
+    def test_connection_error_translated_exception_is_ambiguous(self):
+        """submit_batch_enrich() converts requests.exceptions.ConnectionError
+        into ServiceUnavailableError with no real HTTP status_code —
+        Codex's other exact example of an ambiguous submit failure."""
+        from error_handling import ServiceUnavailableError
+        exc = ServiceUnavailableError("Crustdata", message="Connection error: refused")
+        assert _submit_definitely_never_started(exc) is False
+
+    def test_real_5xx_response_is_ambiguous(self):
+        """A genuine 5xx HTTP response means Crustdata's server DID
+        receive and attempt to process the request — the opposite of
+        "definitely never started"."""
+        from error_handling import ServiceUnavailableError
+        exc = ServiceUnavailableError("Crustdata", status_code=502, response_body="bad gateway")
+        assert _submit_definitely_never_started(exc) is False
+
+    def test_200_with_no_batch_id_is_ambiguous(self):
+        from error_handling import ExternalServiceError
+        exc = ExternalServiceError("Crustdata", message="Batch enrich submit returned no batch id: {}")
+        assert _submit_definitely_never_started(exc) is False
+
+    def test_unrecognized_exception_type_is_ambiguous(self):
+        assert _submit_definitely_never_started(RuntimeError("mystery failure")) is False
+
+    def test_end_to_end_ambiguous_submit_failure_lands_in_unknown(self, monkeypatch):
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        from error_handling import ServiceUnavailableError
+        url = "https://www.linkedin.com/in/a"
+        with patch(
+            "crustdata_search.submit_batch_enrich",
+            side_effect=ServiceUnavailableError("Crustdata", message="Connection error: refused"),
+        ):
+            result = batch_enrich_profiles([url], api_key="test-key")
+
+        assert result["unmatched"] == []
+        assert result["unknown"] == [url]
+        assert result["credits_used"] == 0
+        assert result["unknown_diagnostics"][0]["reason"] == "submit_error"
+
+    def test_end_to_end_unambiguous_submit_failure_lands_in_unmatched(self, monkeypatch):
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url = "https://www.linkedin.com/in/a"
+        with patch("crustdata_search.submit_batch_enrich", side_effect=ValueError("bad input")):
+            result = batch_enrich_profiles([url], api_key="test-key")
+
+        assert result["unmatched"] == [url]
+        assert result["unknown"] == []
 
 
 # ---------------------------------------------------------------------------
