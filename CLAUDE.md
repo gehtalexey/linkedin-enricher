@@ -260,9 +260,9 @@ spends credits.
 
 **The rule:** all three projects MUST write profiles to the `profiles` table the exact same way, and search/read them the exact same way. If they drift apart, one project silently corrupts or misreads another's data.
 
-- The two autopilot projects' profile-saving code (`core/db.py`: `save_enriched_profile`, `_prepare_profile_row`, `_bulk_fetch_existing_original_urls`, `save_enriched_profiles_bulk`, `SupabaseClient.upsert` / `upsert_batch`; `core/normalizers.py`: `normalize_linkedin_url`, `pick_current_employer`, `_parse_start_date_sort_key`) is a **direct port of this project's** `db.py` / `normalizers.py`.
-- **Before changing how SourcingX writes or searches profiles** (the `profiles` table — columns written, field extraction from the Crustdata response, timestamp format, URL normalization, `original_urls` array handling, search/filter query patterns), remember the change must be mirrored into both autopilot projects. Flag it so the ports stay in sync.
-- SourcingX wins ties — it is the reference implementation. But a change here is not "done" until the autopilots match.
+- The sibling projects' profile-saving code (`db_core/db.py` in Supanova, `core/db.py` in agent-kalamata: `save_enriched_profile`, `_prepare_profile_row`, `_bulk_fetch_existing_original_urls`, `save_enriched_profiles_bulk`, `SupabaseClient.upsert` / `upsert_batch`; the matching `normalizers.py`: `normalize_linkedin_url`, `pick_current_employer`, `_parse_start_date_sort_key`) is a **direct port of this project's** `db.py` / `normalizers.py`.
+- **Before changing how SourcingX writes or searches profiles** (the `profiles` table — columns written, field extraction from the Crustdata response, timestamp format, URL normalization, `original_urls` array handling, search/filter query patterns), the change must be mirrored into **Supanova AND agent-kalamata**. Flag it so the ports stay in sync. Supanova matters especially here — it owns the monthly refresh, so a read-side assumption it doesn't share is exactly how the `person_id` / `crustdata_person_id` split above happened.
+- SourcingX wins ties — it is the reference implementation. But a change here is not "done" until Supanova and agent-kalamata match.
 
 The global `~/.claude/CLAUDE.md` and each project's `CLAUDE.md` repeat this rule — keep all copies in agreement.
 
@@ -283,7 +283,7 @@ New endpoints need BOTH `Authorization: Bearer <key>` and
 | | Endpoint | Cost |
 |---|---|---|
 | ❌ legacy | `GET /screener/person/enrich` | **3 credits/profile**, flat |
-| ✅ new, sync | `POST /person/enrich` (≤25 URLs) — `sync_enrich_profile()` | **1 credit/profile** base |
+| ✅ new, sync | `POST /person/enrich` (≤25 URLs) — `sync_enrich_profile()` in `crustdata_search.py` *(added in PR #127)* | **1 credit/profile** base |
 | ✅ new, batch | `POST /batch/person/enrich` (≤10,000, async) — `batch_enrich_profiles()` | **1 credit/profile** base |
 
 Base credit covers `basic_profile` (incl. `summary`), `experience`, `education`,
@@ -307,7 +307,9 @@ credits**. The same run on the new endpoint costs **1,179**.
 
 Enrichment responses must be verified against the URL we asked for before being
 trusted — Crustdata can return a different person. Use
-`linkedin_profile_identity_matches()`, which allows LinkedIn's regional hosts
+`linkedin_profile_identity_matches()` in `crustdata_search.py` *(added in PR #127 —
+if that PR has not landed yet, the helper does not exist and this rule is the spec
+for building it)*, which allows LinkedIn's regional hosts
 (`il.`, `fr.`, …) but requires the path to begin with `/in/` and hold exactly one
 slug. **Do not compare raw URL strings** (`il.linkedin.com` vs `www.linkedin.com`
 are the same person) and **do not just search for `/in/` anywhere in the path**
