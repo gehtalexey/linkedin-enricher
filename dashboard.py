@@ -4976,6 +4976,55 @@ def fetch_raw_data_for_batch(profiles: list, raw_index: dict = None, db_client =
                 print(f"[Screening] Warning: {len(still_missing) - applied} profiles still missing raw data after DB fetch")
 
 
+# How long to wait before re-attempting Crustdata enrichment for a profile
+# that was already validated-and-saved but came back with neither skills
+# nor a summary (Codex review, PR #127, round 3, HIGH: without this, the
+# thin-profile auto-enrich step re-buys the exact same empty result on
+# every single screening run, forever — observed live, a person with 50
+# skills stored got zero skills back from one enrich call, and nothing
+# stopped the next run from paying to ask again). Long enough that a
+# normal day of screening runs against the same JD doesn't hammer
+# Crustdata for data it just told us it doesn't have; short enough that
+# if Crustdata's own data for that person improves later, we notice
+# within a day or two rather than never.
+THIN_PROFILE_REENRICH_COOLDOWN_HOURS = 24
+
+# Marker key stamped into a profile's flat enriched dict (which flows
+# straight into profiles.raw_data via save_enriched_profiles_bulk — no
+# new `profiles` column needed, matching this repo's existing
+# underscore-prefixed in-raw_data marker convention: _needs_enrichment,
+# _semantic_incomplete). NOT the same thing as the `profiles.
+# enrichment_attempted_at` COLUMN — that column exists but is not
+# populated by the current RPC-based save path (_prepare_profile_payload
+# in db.py doesn't include it, verified 2026-08-04), and db.py is off
+# limits for this PR, so a raw_data marker is the only available
+# persistence point for this signal.
+_THIN_LAST_ENRICH_ATTEMPT_KEY = '_last_enrichment_attempt'
+
+
+def _thin_profile_on_cooldown(raw: dict) -> bool:
+    """True if `raw` (a profile's raw_crustdata/raw_data dict) carries a
+    recent _last_enrichment_attempt marker — i.e. we already validated
+    and saved an enrichment attempt for this exact profile within
+    THIN_PROFILE_REENRICH_COOLDOWN_HOURS and it came back without
+    skills/summary. Returns False (never skip) when the marker is
+    missing or unparseable — a profile that's never been marked, or
+    whose marker we can't make sense of, is treated as never-attempted
+    and stays eligible for enrichment. This must never suppress a
+    genuinely never-enriched profile.
+    """
+    if not isinstance(raw, dict):
+        return False
+    marker = raw.get(_THIN_LAST_ENRICH_ATTEMPT_KEY)
+    if not marker:
+        return False
+    try:
+        attempted_at = datetime.fromisoformat(str(marker))
+    except (TypeError, ValueError):
+        return False
+    return datetime.utcnow() - attempted_at < timedelta(hours=THIN_PROFILE_REENRICH_COOLDOWN_HOURS)
+
+
 def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
                                     tracker: 'UsageTracker' = None) -> dict:
     """Top up any profile in this batch that's missing BOTH skills and a
@@ -5011,14 +5060,23 @@ def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
     path search-save already uses), so the same person is never re-enriched
     for a future JD.
 
-    Returns a stats dict for the UI: {thin_found, enriched, unmatched, unknown, credits_used}.
+    Returns a stats dict for the UI: {thin_found, enriched, unmatched, unknown,
+    on_cooldown, on_cooldown_urls, credits_used}.
     `unknown` (Codex review, PR #127, round 2, 2026-08-04) counts profiles whose
     Crustdata batch outcome couldn't be confirmed (poll/download failure after
     the job was accepted) — distinct from `unmatched` (a confirmed no-match).
     Both are screened as-is; `unknown` also flips the usage-log status to
     'error' below, since a job we lost track of may have already billed.
+    `on_cooldown` / `on_cooldown_urls` (Codex review, PR #127, round 3,
+    HIGH) count/list profiles skipped because they were already validated
+    and saved recently and STILL came back without skills/summary — see
+    THIN_PROFILE_REENRICH_COOLDOWN_HOURS. Surfaced rather than hidden so
+    someone can find and explicitly retry them later if needed.
     """
-    stats = {'thin_found': 0, 'enriched': 0, 'unmatched': 0, 'unknown': 0, 'credits_used': 0}
+    stats = {
+        'thin_found': 0, 'enriched': 0, 'unmatched': 0, 'unknown': 0,
+        'on_cooldown': 0, 'on_cooldown_urls': [], 'credits_used': 0,
+    }
 
     thin_profiles = []
     for p in profiles:
@@ -5044,6 +5102,12 @@ def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
         skills = clean_value(raw.get('skills')) or clean_value(p.get('skills'))
         summary = clean_value(raw.get('summary')) or clean_value(p.get('summary'))
         if not skills and not summary:
+            if _thin_profile_on_cooldown(raw):
+                # Already tried recently, already saved, still came back
+                # empty — don't re-buy the same answer every run.
+                stats['on_cooldown'] += 1
+                stats['on_cooldown_urls'].append(url)
+                continue
             thin_profiles.append(p)
 
     stats['thin_found'] = len(thin_profiles)
@@ -5086,6 +5150,17 @@ def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
             else:
                 stats['unmatched'] += 1
             continue
+        # Codex review, PR #127, round 3 (HIGH): the identity/content gate
+        # already confirmed this IS the right person with SOME real data —
+        # but Crustdata may still have nothing for skills/summary
+        # specifically. Stamp the cooldown marker so the NEXT screening
+        # run doesn't pay to ask again for data we just confirmed isn't
+        # there. Only stamped when still genuinely thin — a profile that
+        # came back WITH skills or a summary is not marked at all, since
+        # it's no longer thin and thin-detection won't reconsider it
+        # anyway.
+        if not (clean_value(flat.get('skills')) or clean_value(flat.get('summary'))):
+            flat[_THIN_LAST_ENRICH_ATTEMPT_KEY] = datetime.utcnow().isoformat()
         p['raw_crustdata'] = flat
         p.pop('raw_data', None)
         stats['enriched'] += 1
@@ -10024,6 +10099,19 @@ with tab_screening:
                                     f"🔎 Enriching {_enrich_stats['thin_found']} thin profiles… "
                                     f"{_enrich_stats['enriched']} filled, "
                                     f"{_enrich_stats['unmatched']} not found (screened as-is)"
+                                )
+                            if _enrich_stats.get('on_cooldown'):
+                                # Surfaced, not hidden (Codex review, PR #127, round 3):
+                                # these were validated-and-saved recently and still
+                                # came back without skills/summary, so they're
+                                # skipped for now rather than re-bought every run.
+                                # The actual URLs are in on_cooldown_urls for anyone
+                                # who wants to force a retry.
+                                st.caption(
+                                    f"⏳ {_enrich_stats['on_cooldown']} profile(s) skipped — "
+                                    f"already enriched within the last "
+                                    f"{THIN_PROFILE_REENRICH_COOLDOWN_HOURS}h and still came back "
+                                    f"without skills/summary. Screened with existing data."
                                 )
 
                         # Thread-safe progress tracking for this batch

@@ -63,7 +63,10 @@ class TestEnrichThinProfilesForBatch:
         stats = dashboard.enrich_thin_profiles_for_batch([thin, rich], api_key="test-key", db_client=None)
 
         assert captured_urls["urls"] == ["https://www.linkedin.com/in/thin"]
-        assert stats == {"thin_found": 1, "enriched": 1, "unmatched": 0, "unknown": 0, "credits_used": 1}
+        assert stats == {
+            "thin_found": 1, "enriched": 1, "unmatched": 0, "unknown": 0,
+            "on_cooldown": 0, "on_cooldown_urls": [], "credits_used": 1,
+        }
         # The already-rich profile must be untouched.
         assert rich["raw_crustdata"]["name"] == "Rich Person"
         assert rich["raw_crustdata"]["skills"] == ["Python"]
@@ -164,7 +167,10 @@ class TestEnrichThinProfilesForBatch:
         stats = dashboard.enrich_thin_profiles_for_batch([rich], api_key="test-key", db_client=None)
 
         assert called["n"] == 0
-        assert stats == {"thin_found": 0, "enriched": 0, "unmatched": 0, "unknown": 0, "credits_used": 0}
+        assert stats == {
+            "thin_found": 0, "enriched": 0, "unmatched": 0, "unknown": 0,
+            "on_cooldown": 0, "on_cooldown_urls": [], "credits_used": 0,
+        }
 
     def test_flat_top_level_skills_and_summary_prevent_false_thin_classification(self, monkeypatch):
         """Regression test for a Codex-caught bug (2026-07-20): a profile
@@ -304,6 +310,178 @@ class TestEnrichThinProfilesUnknownBillingHandling:
 
         assert len(tracker.calls) == 1
         assert tracker.calls[0]['status'] == 'success'
+
+
+def _flat_still_thin(url, name):
+    """A validated enrichment result — passed the identity/content gate,
+    so it's real data for the right person — that STILL has no
+    skills/summary. This is the exact scenario Codex observed live: a
+    person with 50 skills stored got zero skills back from one enrich
+    call."""
+    return {
+        "name": name,
+        "skills": [],
+        "summary": "",
+        "linkedin_flagship_url": url,
+        "current_employers": [{"employee_title": "Engineer", "employer_name": "Acme"}],
+        "past_employers": [],
+    }
+
+
+class TestThinProfileReenrichCooldown:
+    """Codex adversarial review of PR #127, round 3 (HIGH): a profile that
+    passes the identity/content gate (real data, right person) but still
+    has no skills/summary was being resubmitted for enrichment on every
+    single screening run forever, since thin-detection only looks at
+    current skills/summary state — which never changes. Observed live:
+    someone with 50 skills stored got zero skills back from one call.
+
+    The fix stamps a _last_enrichment_attempt marker (inside the flat
+    dict that becomes profiles.raw_data — no new column, no db.py
+    changes) on an accepted-but-still-thin result, and thin-detection
+    skips re-submitting a profile whose marker is within
+    THIN_PROFILE_REENRICH_COOLDOWN_HOURS."""
+
+    def test_still_thin_result_gets_marked(self, monkeypatch):
+        thin = _thin_profile("https://www.linkedin.com/in/thin")
+
+        def fake_batch_enrich(urls, api_key=None):
+            return {
+                "by_url": {urls[0]: _flat_still_thin(urls[0], "Thin Person")},
+                "requested": 1, "fulfilled": 1, "unmatched": [], "rejected": [],
+                "unknown": [], "unknown_diagnostics": [], "credits_used": 1,
+                "batch_ids": ["b1"],
+            }
+
+        monkeypatch.setattr(dashboard, "batch_enrich_profiles", fake_batch_enrich)
+        monkeypatch.setattr(dashboard, "save_enriched_profiles_bulk", lambda *a, **k: {"saved": 1, "errors": 0, "error_messages": []})
+
+        stats = dashboard.enrich_thin_profiles_for_batch([thin], api_key="test-key", db_client=None)
+
+        assert stats["enriched"] == 1
+        assert dashboard._THIN_LAST_ENRICH_ATTEMPT_KEY in thin["raw_crustdata"]
+
+    def test_marked_profile_not_resubmitted_within_cooldown(self, monkeypatch):
+        """Simulates the SECOND screening run: the profile's raw_crustdata
+        already carries a fresh marker (as if reloaded from the DB row
+        saved by the first run) and is still thin. Must be skipped, not
+        resubmitted."""
+        from datetime import datetime as real_datetime
+
+        url = "https://www.linkedin.com/in/thin"
+        already_tried = {
+            "linkedin_url": url,
+            "name": "Thin Person",
+            "raw_crustdata": {
+                "name": "Thin Person", "skills": [], "summary": "",
+                dashboard._THIN_LAST_ENRICH_ATTEMPT_KEY: real_datetime.utcnow().isoformat(),
+            },
+        }
+
+        called = {"n": 0}
+        monkeypatch.setattr(dashboard, "batch_enrich_profiles", lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+
+        stats = dashboard.enrich_thin_profiles_for_batch([already_tried], api_key="test-key", db_client=None)
+
+        assert called["n"] == 0, "must not call batch_enrich_profiles for a profile on cooldown"
+        assert stats["thin_found"] == 0
+        assert stats["on_cooldown"] == 1
+        assert stats["on_cooldown_urls"] == [url]
+
+    def test_marked_profile_eligible_again_after_cooldown_expires(self, monkeypatch):
+        """Same profile as above, but the marker is older than
+        THIN_PROFILE_REENRICH_COOLDOWN_HOURS — must be treated as thin
+        and eligible for re-enrichment again."""
+        from datetime import datetime as real_datetime, timedelta as real_timedelta
+
+        url = "https://www.linkedin.com/in/thin"
+        stale_timestamp = (
+            real_datetime.utcnow()
+            - real_timedelta(hours=dashboard.THIN_PROFILE_REENRICH_COOLDOWN_HOURS + 1)
+        ).isoformat()
+        expired_marker = {
+            "linkedin_url": url,
+            "name": "Thin Person",
+            "raw_crustdata": {
+                "name": "Thin Person", "skills": [], "summary": "",
+                dashboard._THIN_LAST_ENRICH_ATTEMPT_KEY: stale_timestamp,
+            },
+        }
+
+        def fake_batch_enrich(urls, api_key=None):
+            return {
+                "by_url": {urls[0]: _flat_still_thin(urls[0], "Thin Person")},
+                "requested": 1, "fulfilled": 1, "unmatched": [], "rejected": [],
+                "unknown": [], "unknown_diagnostics": [], "credits_used": 1,
+                "batch_ids": ["b1"],
+            }
+
+        monkeypatch.setattr(dashboard, "batch_enrich_profiles", fake_batch_enrich)
+        monkeypatch.setattr(dashboard, "save_enriched_profiles_bulk", lambda *a, **k: {"saved": 1, "errors": 0, "error_messages": []})
+
+        stats = dashboard.enrich_thin_profiles_for_batch([expired_marker], api_key="test-key", db_client=None)
+
+        assert stats["on_cooldown"] == 0
+        assert stats["thin_found"] == 1
+        assert stats["enriched"] == 1
+
+    def test_never_enriched_thin_profile_still_enriched_immediately(self, monkeypatch):
+        """No marker at all (genuinely never attempted) — must never be
+        held back by cooldown logic, regardless of how the gate evolves."""
+        thin = _thin_profile("https://www.linkedin.com/in/never-tried")
+        captured = {}
+
+        def fake_batch_enrich(urls, api_key=None):
+            captured["urls"] = urls
+            return {
+                "by_url": {urls[0]: _flat_enriched(urls[0], "Filled Now")},
+                "requested": 1, "fulfilled": 1, "unmatched": [], "rejected": [],
+                "unknown": [], "unknown_diagnostics": [], "credits_used": 1,
+                "batch_ids": ["b1"],
+            }
+
+        monkeypatch.setattr(dashboard, "batch_enrich_profiles", fake_batch_enrich)
+        monkeypatch.setattr(dashboard, "save_enriched_profiles_bulk", lambda *a, **k: {"saved": 1, "errors": 0, "error_messages": []})
+
+        stats = dashboard.enrich_thin_profiles_for_batch([thin], api_key="test-key", db_client=None)
+
+        assert captured["urls"] == [thin["linkedin_url"]]
+        assert stats["on_cooldown"] == 0
+        assert stats["enriched"] == 1
+
+    def test_result_with_skills_is_not_marked_at_all(self, monkeypatch):
+        """A profile that comes back WITH skills/summary must not carry
+        the cooldown marker — it's no longer thin, so there's nothing to
+        remember, and stamping it anyway would be a meaningless no-op at
+        best and confusing at worst."""
+        thin = _thin_profile("https://www.linkedin.com/in/thin")
+
+        def fake_batch_enrich(urls, api_key=None):
+            return {
+                "by_url": {urls[0]: _flat_enriched(urls[0], "Now Has Skills")},
+                "requested": 1, "fulfilled": 1, "unmatched": [], "rejected": [],
+                "unknown": [], "unknown_diagnostics": [], "credits_used": 1,
+                "batch_ids": ["b1"],
+            }
+
+        monkeypatch.setattr(dashboard, "batch_enrich_profiles", fake_batch_enrich)
+        monkeypatch.setattr(dashboard, "save_enriched_profiles_bulk", lambda *a, **k: {"saved": 1, "errors": 0, "error_messages": []})
+
+        stats = dashboard.enrich_thin_profiles_for_batch([thin], api_key="test-key", db_client=None)
+
+        assert stats["enriched"] == 1
+        assert dashboard._THIN_LAST_ENRICH_ATTEMPT_KEY not in thin["raw_crustdata"]
+
+    def test_malformed_marker_treated_as_never_attempted(self):
+        """An unparseable marker value must never suppress enrichment —
+        ambiguity here means "attempt it", not "skip it forever"."""
+        raw = {"skills": [], "summary": "", dashboard._THIN_LAST_ENRICH_ATTEMPT_KEY: "not-a-timestamp"}
+        assert dashboard._thin_profile_on_cooldown(raw) is False
+
+    def test_missing_marker_treated_as_never_attempted(self):
+        assert dashboard._thin_profile_on_cooldown({"skills": [], "summary": ""}) is False
+        assert dashboard._thin_profile_on_cooldown({}) is False
+        assert dashboard._thin_profile_on_cooldown(None) is False
 
 
 class TestSemanticSearchProfilesGetAutoFilled:
