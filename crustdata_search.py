@@ -1450,40 +1450,84 @@ def _match_confidence(match: Dict[str, Any]) -> float:
         return 0.0
 
 
+def _person_data_url(person_data: Dict[str, Any]) -> Optional[str]:
+    social_id = (person_data.get("social_handles") or {}).get("professional_network_identifier") or {}
+    return social_id.get("profile_url") or None
+
+
+def _person_data_has_real_content(person_data: Dict[str, Any]) -> bool:
+    """Content gate: a match is only "found" if it carries a real name AND
+    at least one of experience/education/skills is actually populated.
+
+    Required because Crustdata can wrap an empty shell (e.g.
+    {"basic_profile": {}}) around what is really a no-match — that shell
+    is a non-empty, truthy dict, so without this check it would sail past
+    a bare `if person_data:` guard and get written into the shared
+    profiles table as a blank/corrupted row (Codex review, PR #127,
+    2026-08-04). Deliberately strict: when in doubt, this returns False
+    and the caller returns None — a missed enrichment costs nothing
+    (Crustdata doesn't bill no-match), a wrong/blank one corrupts a row
+    four projects read.
+    """
+    basic = person_data.get("basic_profile") or {}
+    if not (basic.get("name") or "").strip():
+        return False
+    employment = (person_data.get("experience") or {}).get("employment_details") or {}
+    has_experience = bool(employment.get("current")) or bool(employment.get("past"))
+    has_education = bool((person_data.get("education") or {}).get("schools"))
+    has_skills = bool((person_data.get("skills") or {}).get("professional_network_skills"))
+    return has_experience or has_education or has_skills
+
+
 def _select_person_data_from_matches(matches: Any, requested_url: str) -> Optional[Dict[str, Any]]:
     """Pick the right `person_data` dict out of a sync-enrich record's
     `matches` list (verified shape — see _extract_sync_enrich_record()).
 
-    Ranking: highest confidence_score wins; ties are broken by matching the
-    candidate's own LinkedIn URL (social_handles.professional_network_identifier
-    .profile_url) against the URL we requested. Returns None for a missing/
-    empty `matches` list, or when no entry carries a non-empty `person_data`
-    — a genuine no-match, never a half-built profile.
+    Identity is verified on every candidate BEFORE ranking, not only as a
+    confidence tie-break (Codex review, PR #127, 2026-08-04 — the earlier
+    version let a high-confidence WRONG-person match win over a
+    lower-confidence right one). A candidate is only eligible at all if
+    its own LinkedIn URL (social_handles.professional_network_identifier
+    .profile_url) normalizes to the same URL we requested — confidence_score
+    is Crustdata's guess at relevance, not a substitute for the fact we
+    actually asked about. Eligible candidates also have to pass
+    _person_data_has_real_content() — content gate against an empty shell.
+
+    Among eligible candidates, the highest confidence_score wins (a tie
+    doesn't matter for correctness at that point, since every eligible
+    candidate already points at the same requested URL).
+
+    Returns None — never a half-built or wrong-person profile — when:
+    the requested URL itself can't be normalized, `matches` is missing/
+    empty, no candidate's own URL matches the request, or no URL-matching
+    candidate has real content.
     """
     if not isinstance(matches, list) or not matches:
         return None
 
-    candidates = [
-        m for m in matches
-        if isinstance(m, dict) and isinstance(m.get("person_data"), dict) and m["person_data"]
-    ]
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return candidates[0]["person_data"]
-
-    max_score = max(_match_confidence(m) for m in candidates)
-    top = [m for m in candidates if _match_confidence(m) == max_score]
-    if len(top) == 1:
-        return top[0]["person_data"]
-
     norm_target = normalize_linkedin_url(requested_url)
-    for m in top:
-        social_id = (m["person_data"].get("social_handles") or {}).get("professional_network_identifier") or {}
-        candidate_url = social_id.get("profile_url")
-        if candidate_url and normalize_linkedin_url(candidate_url) == norm_target:
-            return m["person_data"]
-    return top[0]["person_data"]
+    if not norm_target:
+        return None
+
+    eligible = []
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        person_data = m.get("person_data")
+        if not isinstance(person_data, dict) or not person_data:
+            continue
+        candidate_url = _person_data_url(person_data)
+        if not candidate_url or normalize_linkedin_url(candidate_url) != norm_target:
+            continue
+        if not _person_data_has_real_content(person_data):
+            continue
+        eligible.append(m)
+
+    if not eligible:
+        return None
+
+    best = max(eligible, key=_match_confidence)
+    return best["person_data"]
 
 
 @retry_with_backoff(

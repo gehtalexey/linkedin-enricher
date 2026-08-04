@@ -210,31 +210,89 @@ class TestSyncEnrichProfileResponseParsing:
 
 
 class TestSelectPersonDataFromMatches:
-    def test_higher_confidence_score_wins(self):
-        low = {"confidence_score": 0.4, "person_data": _person_data("https://www.linkedin.com/in/low", "Low")}
-        high = {"confidence_score": 0.9, "person_data": _person_data("https://www.linkedin.com/in/high", "High")}
-        result = _select_person_data_from_matches([low, high], "https://www.linkedin.com/in/high")
-        assert result["basic_profile"]["name"] == "High"
+    """Identity (requested-URL match) is verified on every candidate BEFORE
+    ranking — not only as a confidence tie-break — and content is validated
+    before trusting a match enough to translate it. A wrong or half-built
+    profile must never come back, since this feeds straight into the
+    shared Supabase `profiles` table (Codex review, PR #127, 2026-08-04)."""
 
-    def test_equal_scores_tie_broken_by_requested_url(self):
-        target_url = "https://www.linkedin.com/in/target"
-        other_url = "https://www.linkedin.com/in/other"
-        a = {"confidence_score": 0.8, "person_data": _person_data(other_url, "Other")}
-        b = {"confidence_score": 0.8, "person_data": _person_data(target_url, "Target")}
-        result = _select_person_data_from_matches([a, b], target_url)
-        assert result["basic_profile"]["name"] == "Target"
+    def test_valid_match_returns_fully_populated_profile(self):
+        url = "https://www.linkedin.com/in/jane"
+        match = {"confidence_score": 0.9, "person_data": _person_data(url, "Jane Doe")}
+        result = _select_person_data_from_matches([match], url)
+        assert result is not None
+        assert result["basic_profile"]["name"] == "Jane Doe"
+        assert result["skills"]["professional_network_skills"] == ["Python"]
 
-    def test_equal_scores_no_url_match_falls_back_to_first(self):
+    def test_wrong_url_returns_none_even_as_only_candidate(self):
+        requested = "https://www.linkedin.com/in/requested"
+        wrong = {"confidence_score": 0.99, "person_data": _person_data("https://www.linkedin.com/in/someone-else", "Someone Else")}
+        assert _select_person_data_from_matches([wrong], requested) is None
+
+    def test_empty_basic_profile_returns_none(self):
+        """{"basic_profile": {}} is a truthy dict but carries no real
+        identity/content — must not become a blank saved row."""
+        url = "https://www.linkedin.com/in/jane"
+        shell = {"confidence_score": 0.5, "person_data": {
+            "basic_profile": {},
+            "social_handles": {"professional_network_identifier": {"profile_url": url}},
+        }}
+        assert _select_person_data_from_matches([shell], url) is None
+
+    def test_person_data_with_no_name_returns_none(self):
+        """A name-less basic_profile, even with other sections present,
+        fails the content gate."""
+        url = "https://www.linkedin.com/in/jane"
+        no_name = {"confidence_score": 0.9, "person_data": {
+            "basic_profile": {"name": ""},
+            "skills": {"professional_network_skills": ["Python"]},
+            "social_handles": {"professional_network_identifier": {"profile_url": url}},
+        }}
+        assert _select_person_data_from_matches([no_name], url) is None
+
+    def test_higher_confidence_wrong_url_loses_to_lower_confidence_right_url(self):
+        """The exact scenario Codex flagged: a high-confidence match must
+        NOT win just because of its score if it's the wrong person."""
+        requested = "https://www.linkedin.com/in/right-person"
+        wrong_but_confident = {
+            "confidence_score": 0.99,
+            "person_data": _person_data("https://www.linkedin.com/in/wrong-person", "Wrong Person"),
+        }
+        right_but_less_confident = {
+            "confidence_score": 0.2,
+            "person_data": _person_data(requested, "Right Person"),
+        }
+        result = _select_person_data_from_matches(
+            [wrong_but_confident, right_but_less_confident], requested
+        )
+        assert result is not None
+        assert result["basic_profile"]["name"] == "Right Person"
+
+    def test_higher_confidence_wins_among_url_verified_candidates(self):
+        """Once identity is verified, confidence_score still breaks a
+        genuine ranking question between two records for the SAME url."""
+        url = "https://www.linkedin.com/in/jane"
+        low = {"confidence_score": 0.4, "person_data": _person_data(url, "Stale Data")}
+        high = {"confidence_score": 0.9, "person_data": _person_data(url, "Fresh Data")}
+        result = _select_person_data_from_matches([low, high], url)
+        assert result["basic_profile"]["name"] == "Fresh Data"
+
+    def test_no_candidate_matches_requested_url_returns_none(self):
         a = {"confidence_score": 0.8, "person_data": _person_data("https://www.linkedin.com/in/a", "A")}
         b = {"confidence_score": 0.8, "person_data": _person_data("https://www.linkedin.com/in/b", "B")}
         result = _select_person_data_from_matches([a, b], "https://www.linkedin.com/in/nobody")
-        assert result["basic_profile"]["name"] == "A"
+        assert result is None
 
     def test_empty_list_returns_none(self):
         assert _select_person_data_from_matches([], "https://www.linkedin.com/in/x") is None
 
     def test_none_returns_none(self):
         assert _select_person_data_from_matches(None, "https://www.linkedin.com/in/x") is None
+
+    def test_unnormalizable_requested_url_returns_none(self):
+        url = "https://www.linkedin.com/in/jane"
+        match = {"confidence_score": 0.9, "person_data": _person_data(url, "Jane Doe")}
+        assert _select_person_data_from_matches([match], "not a linkedin url") is None
 
     def test_entries_without_person_data_are_skipped(self):
         no_data = {"confidence_score": 0.99}  # missing person_data entirely
