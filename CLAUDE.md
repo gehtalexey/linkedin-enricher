@@ -248,18 +248,82 @@ These skills are NOT user-invocable. Claude should automatically read them when 
 
 ## Shared Supabase database — write/read consistency (CRITICAL)
 
-This Supabase database is shared by THREE projects:
+This Supabase database is shared by these ACTIVE projects *(list corrected 2026-08-04)*:
 - **SourcingX** (this project) — the interactive sourcing app. **This is the canonical reference** for how profiles get written and read.
-- **daily-sourcing-autopilot-e2e** — automated pipeline, pushes to GEM.
-- **smartlead-sourcing-autopilot** — automated pipeline, pushes to SmartLead.
+- **Supanova** — owns the shared `profiles` table's monthly refresh, and documents the agreed Crustdata endpoint/cost rules in its own `CLAUDE.md`. (Its growth job is stopped as of 2026-08-04.)
+- **agent-kalamata** (+ `agent-kalamata-pipeline-api`) — daily sourcing pipeline.
+
+**Retired, do NOT count these as live:** `daily-sourcing-autopilot-e2e`,
+`smartlead-sourcing-autopilot`, `israel-sourcing-autopilot`. Confirmed 2026-08-04:
+none has run a sourcing job since May 2026 and none has a scheduled workflow that
+spends credits.
 
 **The rule:** all three projects MUST write profiles to the `profiles` table the exact same way, and search/read them the exact same way. If they drift apart, one project silently corrupts or misreads another's data.
 
-- The two autopilot projects' profile-saving code (`core/db.py`: `save_enriched_profile`, `_prepare_profile_row`, `_bulk_fetch_existing_original_urls`, `save_enriched_profiles_bulk`, `SupabaseClient.upsert` / `upsert_batch`; `core/normalizers.py`: `normalize_linkedin_url`, `pick_current_employer`, `_parse_start_date_sort_key`) is a **direct port of this project's** `db.py` / `normalizers.py`.
-- **Before changing how SourcingX writes or searches profiles** (the `profiles` table — columns written, field extraction from the Crustdata response, timestamp format, URL normalization, `original_urls` array handling, search/filter query patterns), remember the change must be mirrored into both autopilot projects. Flag it so the ports stay in sync.
-- SourcingX wins ties — it is the reference implementation. But a change here is not "done" until the autopilots match.
+- The sibling projects' profile-saving code (`db_core/db.py` in Supanova, `core/db.py` in agent-kalamata: `save_enriched_profile`, `_prepare_profile_row`, `_bulk_fetch_existing_original_urls`, `save_enriched_profiles_bulk`, `SupabaseClient.upsert` / `upsert_batch`; the matching `normalizers.py`: `normalize_linkedin_url`, `pick_current_employer`, `_parse_start_date_sort_key`) is a **direct port of this project's** `db.py` / `normalizers.py`.
+- **Before changing how SourcingX writes or searches profiles** (the `profiles` table — columns written, field extraction from the Crustdata response, timestamp format, URL normalization, `original_urls` array handling, search/filter query patterns), the change must be mirrored into **Supanova AND agent-kalamata**. Flag it so the ports stay in sync. Supanova matters especially here — it owns the monthly refresh, so a read-side assumption it doesn't share is exactly how the `person_id` / `crustdata_person_id` split above happened.
+- SourcingX wins ties — it is the reference implementation. But a change here is not "done" until Supanova and agent-kalamata match.
 
-The global `~/.claude/CLAUDE.md` and each project's `CLAUDE.md` repeat this rule — keep all four copies in agreement.
+The global `~/.claude/CLAUDE.md` and each project's `CLAUDE.md` repeat this rule — keep all copies in agreement.
+
+**This rule was violated and it cost us.** SourcingX's `semantic_profile_to_legacy_shape()` writes the Crustdata id as `crustdata_person_id`; Supanova's refresh looked only for `person_id`. Result: **9,929 profiles (~5% of the table) were invisible to Supanova's refresh** and never got updated. Measured against the live DB 2026-08-04, not estimated. The shared table now holds at least four different `raw_data` dialects. **Agree key names with the other projects before adding a fifth.**
+
+## Crustdata endpoints — which to use, and what they cost
+
+**Hard deadline: all legacy `/screener/*` endpoints stop being served 2026-09-30**
+(confirmed in writing by Crustdata, 2026-07-11). Migration plan and live probe
+findings live in agent-kalamata: `docs/plans/crustdata-api-migration-plan.md`,
+`docs/crustdata/phase0-probe-findings.md`.
+
+New endpoints need BOTH `Authorization: Bearer <key>` and
+`x-api-version: 2025-11-01`. A missing version header returns 400.
+
+### Person enrichment — always the NEW endpoint (1 credit, not 3)
+
+| | Endpoint | Cost |
+|---|---|---|
+| ❌ legacy | `GET /screener/person/enrich` | **3 credits/profile**, flat |
+| ✅ new, sync | `POST /person/enrich` (≤25 URLs) — `sync_enrich_profile()` in `crustdata_search.py` *(added in PR #127)* | **1 credit/profile** base |
+| ✅ new, batch | `POST /batch/person/enrich` (≤10,000, async) — `batch_enrich_profiles()` | **1 credit/profile** base |
+
+Base credit covers `basic_profile` (incl. `summary`), `experience`, `education`,
+`skills`, `professional_network`. Add-ons are additive and charged ONLY when named
+in `fields`: +1 business email, +1 dev-platform, +2 personal emails, +2 phones
+(max 7). **Never request an add-on you don't need — `fields` drives the cost.**
+
+⚠️ **Without an explicit `fields` list the new endpoint returns only
+`basic_profile` + `social_handles`.** Skills/experience/education are covered by
+the base credit but are NOT returned unless asked for.
+
+⚠️ The sync response envelope is
+`[{match_type, matched_on, matches: [{confidence_score, person_data}]}]` — the
+profile is at `matches[].person_data`, two levels deep (verified live 2026-08-04).
+
+**Real cost of getting this wrong:** on 2026-08-04 the Upload-tab "Enrich N
+profiles" button enriched 1,179 profiles on the legacy endpoint for **3,537
+credits**. The same run on the new endpoint costs **1,179**.
+
+### Identity checking is a safety gate, not a nicety
+
+Enrichment responses must be verified against the URL we asked for before being
+trusted — Crustdata can return a different person. Use
+`linkedin_profile_identity_matches()` in `crustdata_search.py` *(added in PR #127 —
+if that PR has not landed yet, the helper does not exist and this rule is the spec
+for building it)*, which allows LinkedIn's regional hosts
+(`il.`, `fr.`, …) but requires the path to begin with `/in/` and hold exactly one
+slug. **Do not compare raw URL strings** (`il.linkedin.com` vs `www.linkedin.com`
+are the same person) and **do not just search for `/in/` anywhere in the path**
+(`/company/acme/in/target` is not a person). Both mistakes were made and caught in
+review; the first silently rejected real paid matches, the second would have let a
+non-profile URL through the wrong-person guard.
+
+### Person search
+
+Legacy `POST /screener/persondb/search` → new `POST /person/search`. Same cost
+(3 credits/100). **The new search does NOT return `skills` or `summary`** — they
+moved to enrichment. AI Screen's thin-profile detection keys on exactly those two
+fields, so a profile saved without them gets auto-enriched on every screening run
+unless the cooldown marker is respected.
 
 ## Database Schema (Supabase)
 
