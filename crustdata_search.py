@@ -28,11 +28,13 @@ Usage:
 
 import gzip
 import json
+import re
 import time
 import requests
 import pandas as pd
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
+from urllib.parse import urlparse, unquote
 
 from api_helpers import get_rate_limiter, RateLimitExceeded
 from error_handling import (
@@ -41,6 +43,7 @@ from error_handling import (
     RateLimitError,
     AuthenticationError,
     ServiceUnavailableError,
+    ValidationError,
     classify_http_error,
 )
 from normalizers import normalize_linkedin_url, clean_value, is_nan_or_none, pick_current_employer
@@ -84,6 +87,17 @@ CREDITS_PER_RESULT_V2 = 0.03  # unchanged from legacy persondb/search (3 per 100
 # results.
 CRUSTDATA_BATCH_ENRICH_ENDPOINT = "https://api.crustdata.com/batch/person/enrich"
 CRUSTDATA_BATCH_STATUS_ENDPOINT = "https://api.crustdata.com/batch"  # + f"/{batch_id}"
+
+# Synchronous single-profile enrichment (v2025-11-01) — same additive
+# pricing family as the batch endpoint above (base profile = 1 credit), but
+# answers inline instead of submit/poll/download. Use this for call sites
+# that need exactly one profile right now (e.g. a "re-enrich this URL"
+# button); use the batch endpoint above for anything that can tolerate the
+# poll/download round trip. Crustdata docs cap this endpoint at 25
+# identifiers per call (professional_network_profile_urls OR
+# business_emails, not both — verified against docs.crustdata.com
+# 2026-07-20); sync_enrich_profile() below only ever sends one.
+CRUSTDATA_SYNC_ENRICH_ENDPOINT = "https://api.crustdata.com/person/enrich"
 BATCH_ENRICH_FIELDS = [
     "basic_profile", "experience", "education",
     "skills", "professional_network", "social_handles",
@@ -1284,14 +1298,25 @@ def submit_batch_enrich(
     Submit up to 10,000 LinkedIn profile URLs to POST /batch/person/enrich.
     Returns the batch_id to poll via get_batch_status().
 
-    Raises ValueError if more than 10,000 URLs are passed — batch_enrich_profiles()
-    is the caller that splits large lists into multiple jobs; call this
-    directly only when you already know you're under the cap.
+    Raises error_handling.ValidationError if more than 10,000 URLs (or
+    zero) are passed — batch_enrich_profiles() is the caller that splits
+    large lists into multiple jobs; call this directly only when you
+    already know you're under the cap. Deliberately ValidationError, NOT
+    a bare ValueError (Codex review, PR #127, round 4, HIGH):
+    requests.exceptions.JSONDecodeError — raised below by response.json()
+    on a malformed/truncated 2xx body — is itself a ValueError subclass,
+    so _submit_definitely_never_started() must be able to tell "we never
+    even sent a request" apart from "we got a response we couldn't
+    parse, after Crustdata may have already accepted and started the
+    job" by exception TYPE, not by ValueError-ness.
     """
     if not linkedin_urls:
-        raise ValueError("submit_batch_enrich requires at least one LinkedIn URL")
+        raise ValidationError(field="linkedin_urls", message="submit_batch_enrich requires at least one LinkedIn URL")
     if len(linkedin_urls) > 10000:
-        raise ValueError(f"submit_batch_enrich accepts at most 10,000 URLs, got {len(linkedin_urls)}")
+        raise ValidationError(
+            field="linkedin_urls",
+            message=f"submit_batch_enrich accepts at most 10,000 URLs, got {len(linkedin_urls)}",
+        )
 
     if not api_key:
         api_key = _load_api_key()
@@ -1339,7 +1364,21 @@ def submit_batch_enrich(
                 response_body=response.text
             )
 
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as e:
+            # Malformed/truncated JSON on an otherwise-2xx response —
+            # Crustdata returned a success status, so it may already have
+            # accepted and started the job before the body got mangled in
+            # transit. No status_code is set here, so
+            # _submit_definitely_never_started() correctly treats this as
+            # ambiguous (unknown), not "never started" (Codex review, PR
+            # #127, round 4, HIGH).
+            raise ExternalServiceError(
+                "Crustdata",
+                message=f"Batch enrich submit returned unparseable JSON: {str(e)[:200]}"
+            )
+
         batch_id = data.get("batch_id") or data.get("id")
         if not batch_id:
             raise ExternalServiceError(
@@ -1352,6 +1391,421 @@ def submit_batch_enrich(
         raise ExternalServiceError(
             "Crustdata",
             message="Batch enrich submit timed out",
+            status_code=504
+        )
+    except requests.exceptions.ConnectionError as e:
+        raise ServiceUnavailableError(
+            "Crustdata",
+            message=f"Connection error: {str(e)[:200]}"
+        )
+
+
+def _extract_sync_enrich_record(payload: Any, requested_url: str) -> Optional[Dict[str, Any]]:
+    """Pull the single per-query record out of a sync POST /person/enrich
+    response — the ``{match_type, matched_on, matches}`` wrapper, NOT the
+    profile itself (see _select_person_data_from_matches() for that step).
+
+    VERIFIED LIVE 2026-08-04 (two real 1-credit calls against
+    POST /person/enrich): the top-level response is a plain LIST, one entry
+    per queried identifier:
+
+        [
+          {
+            "match_type": <str>,
+            "matched_on": ...,
+            "matches": [
+              {"confidence_score": <float>, "person_data": {...}},
+              ...
+            ]
+          }
+        ]
+
+    ``person_data`` is what carries basic_profile/experience/education/
+    skills/professional_network/social_handles — the shape
+    enrich_profile_to_legacy_shape() expects (that inner shape was already
+    verified separately, 2026-07-20, against the batch endpoint's download
+    file — same nested structure).
+
+    A dict-wrapped top level (keyed "results"/"profiles"/"data") is also
+    tolerated here even though it hasn't been observed live, since other
+    v2025-11-01 endpoints in this file use that shape and Crustdata's API
+    isn't perfectly consistent call to call — worst case a wrong guess here
+    is a harmless None (caller reports "not found"), never a mis-billed
+    request, since Crustdata's global no-charge-on-no-result policy means
+    we only pay for records we actually parse out.
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, list):
+        records = payload
+    elif isinstance(payload, dict):
+        records = None
+        for key in ("results", "profiles", "data"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                records = val
+                break
+        if records is None:
+            # No known wrapping key held a list — treat the dict itself as
+            # the (single, unwrapped) record.
+            records = [payload]
+    else:
+        return None
+
+    records = [r for r in records if isinstance(r, dict)]
+    if not records:
+        return None
+    if len(records) == 1:
+        return records[0]
+
+    # More than one top-level record for a 1-URL request shouldn't happen,
+    # but match by `matched_on` (the verified shape's echo of the query)
+    # defensively rather than assume ordering.
+    norm_target = normalize_linkedin_url(requested_url)
+    for rec in records:
+        matched_on = rec.get("matched_on")
+        if matched_on == requested_url or (matched_on and normalize_linkedin_url(str(matched_on)) == norm_target):
+            return rec
+    return records[0]
+
+
+def _match_confidence(match: Dict[str, Any]) -> float:
+    """Coerce a `matches[]` entry's confidence_score to a comparable float —
+    defensively, since its exact numeric type/range isn't pinned in docs."""
+    try:
+        return float(match.get("confidence_score"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# Allowlisted LinkedIn profile hosts: bare linkedin.com, www.linkedin.com,
+# or a two-letter regional subdomain (il.linkedin.com, fr.linkedin.com,
+# de.linkedin.com, ...). Deliberately an ALLOWLIST, not a loose substring/
+# pattern match — this is a security boundary, not just parsing
+# convenience (Codex review, PR #127, round 3, HIGH). Anchored on both
+# ends so lookalikes like "linkedin.com.evil.co" or "evil-linkedin.com"
+# never match: the whole hostname must equal one of these exact shapes.
+_LINKEDIN_HOST_RE = re.compile(r'^(?:[a-z]{2}\.)?(?:www\.)?linkedin\.com$')
+
+
+def _linkedin_profile_slug(url: Any) -> Optional[Tuple[str, str]]:
+    """Parse a LinkedIn profile URL into (host, slug) — but ONLY if it's
+    on an allowlisted LinkedIn host (see _LINKEDIN_HOST_RE) AND the path
+    is EXACTLY a person-profile path: `/in/<slug>` with an optional
+    trailing slash and nothing else. Returns None for anything else,
+    including lookalike hosts and non-profile paths, so callers can't
+    accidentally trust a non-LinkedIn domain or a non-person URL.
+
+    The path check is intentionally strict — require the path to BEGIN
+    with `/in/` and contain exactly one further non-empty segment — not
+    merely "contains /in/ somewhere" (Codex review, PR #127, round 4,
+    HIGH): a path like `/company/acme/in/target` would otherwise parse
+    with slug "target" and identity-match a genuine `/in/target` URL,
+    letting a malformed or adversarial profile_url from an enrichment
+    payload clear this gate even though it isn't a real person-profile
+    URL at all. That would defeat the wrong-person protection this gate
+    exists for — this repo's last line of defense against writing one
+    person's data onto another person's row in the shared profiles
+    table. Fail closed: any path shape other than exactly one slug
+    segment returns None, never a guess.
+
+    The slug is percent-decoded and lowercased for identity comparison —
+    this is a narrower "is this the same public profile" check than
+    normalize_linkedin_url() (db_core/normalizers.py, shared verbatim
+    with Supanova/the autopilots, NOT touched here), which deliberately
+    preserves case for Crustdata-internal obfuscated (ACoAA...) slugs
+    for a different purpose (canonical storage key). This function is
+    only ever used to verify identity, never to build a URL to store.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    raw = url.strip()
+    if not raw:
+        return None
+    if raw.lower().startswith('www.'):
+        raw = 'https://' + raw
+    elif not raw.lower().startswith('http'):
+        raw = 'https://' + raw
+
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return None
+
+    host = (parsed.hostname or '').lower()
+    if not _LINKEDIN_HOST_RE.match(host):
+        return None
+
+    path = parsed.path or ''
+    marker = '/in/'
+    if not path.lower().startswith(marker):
+        # Must BEGIN with /in/ — a prefix like /company/acme/in/target
+        # is a different resource entirely, not a person profile with a
+        # slug we can trust.
+        return None
+
+    remainder = path[len(marker):]
+    segments = remainder.split('/')
+    # Exactly one non-empty segment, with at most one trailing slash:
+    #   "target"      -> ["target"]           len 1
+    #   "target/"     -> ["target", ""]       len 2, second empty
+    # Anything else (a further segment, or no segment at all) is rejected:
+    #   "target/bar"  -> ["target", "bar"]    len 2, second non-empty -> reject
+    #   ""            -> [""]                 len 1, but empty        -> reject
+    if len(segments) == 1:
+        slug_raw = segments[0]
+    elif len(segments) == 2 and segments[1] == '':
+        slug_raw = segments[0]
+    else:
+        return None
+
+    if not slug_raw:
+        return None
+
+    slug = unquote(slug_raw).lower()
+    if not slug:
+        return None
+    return host, slug
+
+
+def linkedin_profile_identity_matches(url_a: Any, url_b: Any) -> bool:
+    """Compare two LinkedIn profile URLs by IDENTITY (same /in/<slug>
+    profile), not by normalize_linkedin_url()/string equality.
+
+    Why this exists (Codex review, PR #127, round 3, HIGH): normalize_
+    linkedin_url() preserves the hostname, so the SAME public profile
+    legitimately returned as https://il.linkedin.com/in/foo or
+    https://fr.linkedin.com/in/foo (LinkedIn's regional domains) compares
+    UNEQUAL to https://www.linkedin.com/in/foo under straight string/
+    normalize_linkedin_url() equality — the identity gate
+    (_person_data_matches_url() below) would then reject a genuinely
+    correct match just because Crustdata (or a user-pasted CSV row) used
+    a regional host, putting a real paid match into `rejected` and
+    counting it as zero fulfilled. This isn't theoretical for this repo:
+    Israeli-candidate sourcing routinely sees il.linkedin.com URLs.
+
+    Hosts are matched against an explicit ALLOWLIST via
+    _linkedin_profile_slug() rather than a loose pattern — lookalikes
+    like linkedin.com.evil.co or evil-linkedin.com never match, whatever
+    slug they carry.
+
+    Returns True only if both URLs are on an allowlisted LinkedIn host
+    AND resolve to the same /in/<slug>, case-insensitively, ignoring
+    trailing slashes, query strings, and percent-encoding differences.
+    """
+    a = _linkedin_profile_slug(url_a)
+    b = _linkedin_profile_slug(url_b)
+    if a is None or b is None:
+        return False
+    return a[1] == b[1]
+
+
+def _person_data_url(person_data: Dict[str, Any]) -> Optional[str]:
+    social_id = (person_data.get("social_handles") or {}).get("professional_network_identifier") or {}
+    return social_id.get("profile_url") or None
+
+
+def _person_data_has_real_content(person_data: Dict[str, Any]) -> bool:
+    """Content gate: a match is only "found" if it carries a real name AND
+    at least one of experience/education/skills is actually populated.
+
+    Required because Crustdata can wrap an empty shell (e.g.
+    {"basic_profile": {}}) around what is really a no-match — that shell
+    is a non-empty, truthy dict, so without this check it would sail past
+    a bare `if person_data:` guard and get written into the shared
+    profiles table as a blank/corrupted row (Codex review, PR #127,
+    2026-08-04). Deliberately strict: when in doubt, this returns False
+    and the caller returns None — a missed enrichment costs nothing
+    (Crustdata doesn't bill no-match), a wrong/blank one corrupts a row
+    four projects read.
+    """
+    basic = person_data.get("basic_profile") or {}
+    if not (basic.get("name") or "").strip():
+        return False
+    employment = (person_data.get("experience") or {}).get("employment_details") or {}
+    has_experience = bool(employment.get("current")) or bool(employment.get("past"))
+    has_education = bool((person_data.get("education") or {}).get("schools"))
+    has_skills = bool((person_data.get("skills") or {}).get("professional_network_skills"))
+    return has_experience or has_education or has_skills
+
+
+def _person_data_matches_url(person_data: Any, expected_url: str) -> bool:
+    """Identity check: does `person_data`'s own LinkedIn URL (via
+    social_handles.professional_network_identifier.profile_url) resolve
+    to the same PROFILE as `expected_url`?
+
+    Uses linkedin_profile_identity_matches() (host-agnostic across
+    LinkedIn's regional domains) rather than raw normalize_linkedin_url()
+    equality — see that function's docstring for why (Codex review, PR
+    #127, round 3, HIGH: the earlier straight-equality version rejected
+    genuinely correct matches on a regional host as if they were a
+    different person).
+
+    This is the identity half of _is_valid_person_data() below, split out
+    so it stays testable on its own; use _is_valid_person_data() for the
+    actual identity+content gate. Shared by BOTH the sync
+    (_select_person_data_from_matches) and batch (batch_enrich_profiles)
+    enrich paths, so this fix applies to both automatically.
+    """
+    if not isinstance(person_data, dict) or not person_data:
+        return False
+    candidate_url = _person_data_url(person_data)
+    if not candidate_url:
+        return False
+    return linkedin_profile_identity_matches(candidate_url, expected_url)
+
+
+def _is_valid_person_data(person_data: Any, expected_url: str) -> bool:
+    """THE single identity+content gate a `person_data`/`data` payload must
+    clear before it's trusted enough to translate and write into the
+    shared Supabase profiles table (four projects read that table —
+    writing another person's data onto a row, or a blank shell, is data
+    corruption, not a harmless miss).
+
+    Used by BOTH enrich paths — the sync endpoint's
+    _select_person_data_from_matches() and the batch endpoint's
+    batch_enrich_profiles() — as ONE shared standard rather than two
+    separate checks that could drift (Codex review, PR #127, round 2,
+    2026-08-04: round 1 hardened only the sync path; the batch path
+    still trusted any non-empty `data` payload that echoed the right
+    `original_identifier`, without checking the payload's OWN claimed
+    LinkedIn URL against what was actually requested — recreating the
+    exact wrong-person risk round 1 fixed for sync).
+
+    A candidate passes only if BOTH:
+      1. Its own LinkedIn URL normalizes to the same value as
+         `expected_url` (_person_data_matches_url()) — a confidence
+         score or an echoed identifier is Crustdata's claim, not
+         verification; comparing the payload's own data against what we
+         actually asked about is.
+      2. It has real content (_person_data_has_real_content()) — not an
+         empty shell.
+
+    When in doubt, this returns False: a missed enrichment costs nothing
+    (Crustdata's global no-charge-on-no-result policy), a wrongly-trusted
+    one corrupts a shared row.
+    """
+    if not _person_data_matches_url(person_data, expected_url):
+        return False
+    return _person_data_has_real_content(person_data)
+
+
+def _select_person_data_from_matches(matches: Any, requested_url: str) -> Optional[Dict[str, Any]]:
+    """Pick the right `person_data` dict out of a sync-enrich record's
+    `matches` list (verified shape — see _extract_sync_enrich_record()).
+
+    Every candidate is run through _is_valid_person_data() — identity
+    verified BEFORE ranking, not only as a confidence tie-break (Codex
+    review, PR #127, 2026-08-04 — the earlier version let a
+    high-confidence WRONG-person match win over a lower-confidence right
+    one). Among candidates that pass, the highest confidence_score wins
+    (a tie doesn't matter for correctness at that point, since every
+    eligible candidate already points at the same requested URL).
+
+    Returns None — never a half-built or wrong-person profile — when
+    `matches` is missing/empty or no candidate clears
+    _is_valid_person_data().
+    """
+    if not isinstance(matches, list) or not matches:
+        return None
+
+    eligible = [
+        m for m in matches
+        if isinstance(m, dict) and _is_valid_person_data(m.get("person_data"), requested_url)
+    ]
+    if not eligible:
+        return None
+
+    best = max(eligible, key=_match_confidence)
+    return best["person_data"]
+
+
+@retry_with_backoff(
+    max_retries=3,
+    base_delay=2.0,
+    retryable_exceptions=(RateLimitError, ServiceUnavailableError, ConnectionError, TimeoutError),
+)
+def sync_enrich_profile(
+    linkedin_url: str,
+    api_key: str = None,
+    fields: List[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Enrich ONE LinkedIn profile via the synchronous v2025-11-01
+    POST /person/enrich endpoint. Base profile = 1 credit (additive
+    pricing, same family as submit_batch_enrich() above) — for a single
+    profile this skips the async submit/poll/download round trip the batch
+    pipeline needs for volume.
+
+    Returns the same flat legacy-enrich shape as enrich_profile_to_legacy_shape()
+    (via that function), or None if Crustdata had no match for this URL —
+    never raises for a plain no-match, only for transport/HTTP failures
+    (mirrors submit_batch_enrich()'s error handling).
+
+    Response unwrap (VERIFIED live 2026-08-04 — see
+    _extract_sync_enrich_record()'s docstring for the full shape): top-level
+    list -> per-query {match_type, matched_on, matches} record -> matches[]
+    -> best-scoring match's person_data -> enrich_profile_to_legacy_shape().
+    """
+    if not linkedin_url or not str(linkedin_url).strip():
+        return None
+    if not api_key:
+        api_key = _load_api_key()
+    limiter = get_rate_limiter('crustdata')
+
+    body = {
+        "professional_network_profile_urls": [linkedin_url],
+        "fields": fields or BATCH_ENRICH_FIELDS,
+    }
+
+    try:
+        limiter.wait_if_needed()
+    except RateLimitExceeded as e:
+        raise RateLimitError("Crustdata", message=str(e))
+
+    try:
+        response = requests.post(
+            CRUSTDATA_SYNC_ENRICH_ENDPOINT,
+            json=body,
+            headers=_v2_headers(api_key),
+            timeout=60,
+        )
+        limiter.record_request()
+
+        if response.status_code == 401:
+            raise AuthenticationError("Crustdata")
+        elif response.status_code == 429:
+            retry_after = response.headers.get('Retry-After')
+            raise RateLimitError(
+                "Crustdata",
+                retry_after=float(retry_after) if retry_after else None
+            )
+        elif response.status_code >= 500:
+            raise ServiceUnavailableError(
+                "Crustdata",
+                status_code=response.status_code,
+                response_body=response.text[:500]
+            )
+        elif response.status_code >= 400:
+            raise ExternalServiceError(
+                "Crustdata",
+                message=f"Sync enrich failed: {response.text[:500]}",
+                status_code=response.status_code,
+                response_body=response.text
+            )
+
+        record = _extract_sync_enrich_record(response.json(), linkedin_url)
+        if not record:
+            return None
+        person_data = _select_person_data_from_matches(record.get("matches"), linkedin_url)
+        if not person_data:
+            return None
+        return enrich_profile_to_legacy_shape(person_data)
+
+    except requests.exceptions.Timeout:
+        raise ExternalServiceError(
+            "Crustdata",
+            message="Sync enrich request timed out",
             status_code=504
         )
     except requests.exceptions.ConnectionError as e:
@@ -1499,6 +1953,95 @@ def _download_batch_results(status_payload: Dict[str, Any], api_key: str) -> Lis
     return records
 
 
+# Possible key names for a fulfilled-count on a batch status payload — not
+# pinned in Crustdata's docs (same caveat as _is_batch_terminal()/
+# _download_batch_results() above), so checked defensively in order.
+_STATUS_FULFILLED_HINT_KEYS = ("entities_fulfilled", "fulfilled_count", "fulfilled")
+
+
+def _status_fulfilled_hint(status_payload: Dict[str, Any]) -> Optional[int]:
+    """Best-effort extraction of a fulfilled-count from a batch status
+    payload, for jobs that land in the `unknown` bucket (see
+    batch_enrich_profiles()'s docstring) — surfaced for reconciliation
+    rather than discarded, per Codex review PR #127 round 2. Returns None
+    if no known key holds a usable number."""
+    if not isinstance(status_payload, dict):
+        return None
+    for key in _STATUS_FULFILLED_HINT_KEYS:
+        val = status_payload.get(key)
+        if isinstance(val, bool):
+            continue
+        if isinstance(val, (int, float)):
+            return int(val)
+    return None
+
+
+def _submit_definitely_never_started(exc: Exception) -> bool:
+    """True ONLY for a submit_batch_enrich() failure where we can be
+    CONFIDENT the batch job never started on Crustdata's side — safe to
+    report as genuine no-spend. Everything else (a timeout or connection
+    loss during the POST, a 5xx response, a 200 with no batch_id, or any
+    exception type not specifically recognized here) is AMBIGUOUS and
+    must be routed to the `unknown` bucket instead (Codex review, PR #127,
+    round 3, HIGH): a client-side timeout/connection loss during the
+    submit POST can happen AFTER Crustdata already accepted and started
+    the job — reporting that as a clean, free no-match recreates the
+    exact spend-observability failure round 2 already fixed for the
+    post-acceptance (poll/download) window.
+
+    Deliberately a narrow ALLOWLIST, not a broad denylist:
+    - error_handling.ValidationError: submit_batch_enrich()'s own
+      client-side input validation (empty list / over 10,000 URLs) —
+      raised before any network call is even attempted. Deliberately
+      NOT a bare ValueError check (Codex review, PR #127, round 4,
+      HIGH): requests.exceptions.JSONDecodeError — raised by
+      response.json() on a malformed/truncated 2xx body, i.e. AFTER
+      Crustdata returned a success status and may already be running the
+      job — is itself a ValueError subclass. A bare `isinstance(exc,
+      ValueError)` check would misclassify that as "definitely never
+      started" and hide real spend, exactly the failure mode this
+      function exists to prevent. ValidationError has no relationship to
+      ValueError, so this allowlist entry can only ever match
+      submit_batch_enrich()'s own pre-request checks.
+    - AuthenticationError (401) / RateLimitError (429): the request was
+      rejected by Crustdata's gateway before any job processing could
+      begin.
+    - A generic 4xx (ExternalServiceError with a real 400-499
+      status_code straight off an HTTP response, excluding the 5xx-only
+      ServiceUnavailableError subclass): the same kind of explicit
+      rejection Codex's own examples named ("DNS failure, 4xx rejection,
+      auth error").
+
+    Nothing else qualifies — in particular NOT a bare requests.Timeout/
+    ConnectionError (translated by submit_batch_enrich() into
+    ExternalServiceError(status_code=504) / ServiceUnavailableError
+    respectively), NOT a genuine 5xx response, NOT malformed/unparseable
+    JSON on a 2xx response, and NOT the "200 but no batch_id in the
+    response body" case — all of those mean we simply don't know whether
+    Crustdata received and started processing the request. Any exception
+    type not explicitly recognized above also falls through to "False"
+    (ambiguous) — fail closed: when we can't prove we didn't pay, assume
+    we might have.
+
+    No client-side idempotency/request key is used here because
+    Crustdata's v2025-11-01 batch-enrich API doesn't document support
+    for one (checked docs.crustdata.com and this repo's Crustdata API
+    reference skill, 2026-08-04) — a retried submit after an ambiguous
+    failure can't be deduplicated server-side, so the caller is left
+    with the `unknown` bucket's diagnostics for manual reconciliation
+    rather than an automatic dedupe.
+    """
+    if isinstance(exc, ValidationError):
+        return True
+    if isinstance(exc, (AuthenticationError, RateLimitError)):
+        return True
+    if isinstance(exc, ExternalServiceError) and not isinstance(exc, ServiceUnavailableError):
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(status_code, int) and 400 <= status_code < 500:
+            return True
+    return False
+
+
 def batch_enrich_profiles(
     linkedin_urls: List[str],
     api_key: str = None,
@@ -1530,76 +2073,257 @@ def batch_enrich_profiles(
             "by_url": {<url>: <flat legacy-enrich-shape dict>},
             "requested": int,
             "fulfilled": int,
-            "unmatched": [urls...],
+            "unmatched": [urls...],       # no record came back, job outcome
+                                           # was otherwise fully readable
+            "rejected": [urls...],        # a record came back but failed
+                                           # identity/content validation —
+                                           # see _is_valid_person_data()
+            "unknown": [urls...],         # job was submitted/accepted but
+                                           # its outcome could NOT be read
+                                           # (poll error, poll timeout, or a
+                                           # completed job whose results we
+                                           # couldn't download) — NOT the
+                                           # same as a genuine no-match; see
+                                           # "Unknown billing" below
+            "unknown_diagnostics": [...], # {batch_id, reason, fulfilled_hint,
+                                           # last_status_payload} per job
+                                           # that landed in `unknown`
             "credits_used": fulfilled * 1,
             "batch_ids": [...],
         }
+
+    Unknown billing (Codex review, PR #127, round 2, 2026-08-04): a job
+    that was successfully SUBMITTED and ACCEPTED by Crustdata may already
+    be running (and billing) even if we then lose the ability to read its
+    outcome — a transient error while polling status, a poll timeout with
+    no terminal status ever observed, or a download/parse failure AFTER
+    Crustdata reported the job complete. The previous version collapsed
+    all three into `records = []`, which flows into `unmatched` —
+    indistinguishable from Crustdata genuinely finding nothing, and
+    reported to usage logging as a clean, free, zero-credit run. That is
+    backwards for a cost-control PR: it hides spend in exactly the
+    direction that flatters us. These three cases now land in `unknown`
+    instead, are never silently treated as free, and dashboard.py logs
+    them as an error/unknown-spend event carrying the batch_id(s) so the
+    account balance can be reconciled manually. When Crustdata's own
+    status payload happens to report a fulfilled count for a job we
+    otherwise couldn't fully read (see `_status_fulfilled_hint()`), it's
+    surfaced via
+    `unknown_diagnostics[i]["fulfilled_hint"]` rather than discarded —
+    but it is NOT folded into `credits_used`, which stays a conservative,
+    only-what-we-actually-validated number.
+
+    Deduplicates by normalized URL BEFORE submitting (Codex review, PR
+    #127, 2026-08-04): a caller-supplied list containing the same URL
+    twice (verbatim, or as two strings that normalize to the same profile)
+    previously got submitted to Crustdata unchanged — paying for and
+    fetching the same profile twice — while `requested`/`fulfilled`/
+    `credits_used` were derived from a de-duplicated set, silently
+    UNDER-counting the true spend. Only one representative raw string per
+    normalized identity is ever sent to Crustdata; `by_url` is still
+    populated under every one of the caller's original duplicate strings
+    (not just the representative), so callers indexing results against
+    their own input list — including the duplicate — still get a hit at
+    every position.
+
+    Every downloaded record is run through the SAME identity+content gate
+    as the sync path, _is_valid_person_data() (Codex review, PR #127,
+    round 2, 2026-08-04): round 1 hardened only sync_enrich_profile()'s
+    match selection; this endpoint's records were still trusted on the
+    strength of `original_identifier` alone, with no check that the
+    payload's OWN claimed LinkedIn URL actually matched what was
+    submitted for it. A record that echoes the right identifier but
+    carries a wrong person (or an empty shell) is now counted in
+    `rejected`, NOT mapped into `by_url`, and NOT counted fulfilled —
+    same standard, same reasoning: a missed enrichment costs nothing, a
+    wrongly-trusted one corrupts a row four other projects read.
     """
     linkedin_urls = [u for u in (linkedin_urls or []) if u and str(u).strip()]
     if not linkedin_urls:
-        return {"by_url": {}, "requested": 0, "fulfilled": 0, "unmatched": [], "credits_used": 0, "batch_ids": []}
+        return {
+            "by_url": {}, "requested": 0, "fulfilled": 0, "unmatched": [],
+            "rejected": [], "unknown": [], "unknown_diagnostics": [],
+            "credits_used": 0, "batch_ids": [],
+        }
 
     if not api_key:
         api_key = _load_api_key()
 
-    jobs = [linkedin_urls[i:i + 10000] for i in range(0, len(linkedin_urls), 10000)]
+    # canonical_to_inputs preserves first-seen order (dict insertion order)
+    # and maps each distinct normalized identity to every raw input string
+    # that resolves to it — including the duplicates we're about to skip
+    # submitting.
+    canonical_to_inputs: Dict[str, List[str]] = {}
+    for u in linkedin_urls:
+        norm = normalize_linkedin_url(u) or u
+        canonical_to_inputs.setdefault(norm, []).append(u)
+
+    # Secondary, host-agnostic index (identity slug -> canonical key) so a
+    # returned `original_identifier` on a different LinkedIn regional
+    # host than what we submitted (e.g. we sent il.linkedin.com/in/foo,
+    # Crustdata echoes www.linkedin.com/in/foo) still resolves to the
+    # right canonical group instead of being dropped as "never submitted"
+    # (Codex review, PR #127, round 3, HIGH — same regional-host gap as
+    # _person_data_matches_url(), one step earlier in the pipeline).
+    slug_to_canonical: Dict[str, str] = {}
+    for canon_key in canonical_to_inputs:
+        parsed = _linkedin_profile_slug(canon_key)
+        if parsed:
+            slug_to_canonical.setdefault(parsed[1], canon_key)
+
+    # One representative raw string per canonical identity — this is what
+    # actually gets billed.
+    submit_urls = [inputs[0] for inputs in canonical_to_inputs.values()]
+
+    jobs = [submit_urls[i:i + 10000] for i in range(0, len(submit_urls), 10000)]
     by_url: Dict[str, Dict[str, Any]] = {}
     batch_ids: List[str] = []
+    rejected_canonical: set = set()
+    unknown_canonical: set = set()
+    unknown_diagnostics: List[Dict[str, Any]] = []
 
     for job_urls in jobs:
+        job_norms = {normalize_linkedin_url(u) or u for u in job_urls}
+
         try:
             batch_id = submit_batch_enrich(job_urls, api_key=api_key, chunk_size=chunk_size, fields=fields)
-        except Exception:
-            # Whole job failed to submit — its URLs stay unmatched below.
+        except Exception as e:
+            if _submit_definitely_never_started(e):
+                # Confidently rejected before any job processing could
+                # begin — genuinely nothing was billed. Its URLs stay
+                # unmatched below.
+                continue
+            # Ambiguous (Codex review, PR #127, round 3): a timeout or
+            # connection loss during the submit POST itself means we
+            # don't know whether Crustdata received and started the job
+            # before we lost the response. Must not collapse to a free
+            # no-match — same "unknown" treatment as a post-acceptance
+            # poll/download failure, just with no batch_id to show for it.
+            unknown_canonical.update(job_norms)
+            unknown_diagnostics.append({
+                "batch_id": None,
+                "reason": "submit_error",
+                "fulfilled_hint": None,
+                "last_status_payload": None,
+                "error": str(e)[:300],
+            })
             continue
         batch_ids.append(batch_id)
 
+        # From here on the job WAS accepted — Crustdata may already be
+        # running (and billing) it, so any failure to read its outcome
+        # from this point on is "unknown", never silently "no match".
+
         elapsed = 0.0
         status_payload = {}
+        poll_failed = False
+        timed_out = False
         while elapsed < max_wait_s:
             try:
                 status_payload = get_batch_status(batch_id, api_key=api_key)
             except Exception:
+                poll_failed = True
                 break
             if _is_batch_terminal(status_payload):
                 break
             time.sleep(poll_interval_s)
             elapsed += poll_interval_s
+        else:
+            # Loop exhausted max_wait_s without ever hitting a `break` —
+            # i.e. we never observed a terminal status at all.
+            timed_out = True
+
+        if poll_failed or timed_out:
+            unknown_canonical.update(job_norms)
+            unknown_diagnostics.append({
+                "batch_id": batch_id,
+                "reason": "poll_error" if poll_failed else "poll_timeout",
+                "fulfilled_hint": _status_fulfilled_hint(status_payload),
+                "last_status_payload": status_payload,
+            })
+            continue
 
         if str(status_payload.get("status", "")).lower() in _BATCH_TERMINAL_FAILURE:
-            continue  # whole job failed — its URLs stay unmatched
+            # Crustdata explicitly told us the job failed — a real
+            # negative signal, not an unreadable one. Stays unmatched.
+            continue
 
         try:
             records = _download_batch_results(status_payload, api_key)
         except Exception:
-            records = []
+            # The job reached a terminal status (Crustdata's side is done,
+            # likely billed) but we couldn't retrieve/parse the results —
+            # unknown, not "no match".
+            unknown_canonical.update(job_norms)
+            unknown_diagnostics.append({
+                "batch_id": batch_id,
+                "reason": "download_error",
+                "fulfilled_hint": _status_fulfilled_hint(status_payload),
+                "last_status_payload": status_payload,
+            })
+            continue
 
         for record in records:
             data = record.get("data") or {}
             if not data:
-                continue
-            flat = enrich_profile_to_legacy_shape(data)
-            identifier = record.get("original_identifier")
-            key = identifier or flat.get("linkedin_flagship_url")
-            if not key:
-                continue
-            by_url[key] = flat
-            norm_key = normalize_linkedin_url(key)
-            if norm_key and norm_key not in by_url:
-                by_url[norm_key] = flat
+                continue  # genuinely empty payload — stays unmatched, not "rejected"
 
-    requested_set = set(linkedin_urls)
-    unmatched = sorted(
-        u for u in requested_set
-        if u not in by_url and normalize_linkedin_url(u) not in by_url
-    )
-    fulfilled = len(requested_set) - len(unmatched)
+            identifier = record.get("original_identifier")
+            if not identifier:
+                # No independent identity to verify this payload against —
+                # cannot safely trust it (see _is_valid_person_data()'s
+                # docstring). Uncounted rather than guessed at.
+                continue
+            norm_key = normalize_linkedin_url(identifier) or identifier
+            if norm_key not in canonical_to_inputs:
+                # Direct match failed — try identity-aware matching before
+                # giving up, in case Crustdata echoed a different regional
+                # host than we submitted for the same profile.
+                parsed_identifier = _linkedin_profile_slug(identifier)
+                fallback_key = slug_to_canonical.get(parsed_identifier[1]) if parsed_identifier else None
+                if fallback_key is None:
+                    # Genuinely echoes an identifier we never submitted —
+                    # ignore.
+                    continue
+                norm_key = fallback_key
+
+            if not _is_valid_person_data(data, identifier):
+                rejected_canonical.add(norm_key)
+                continue
+
+            flat = enrich_profile_to_legacy_shape(data)
+            by_url[identifier] = flat
+            if norm_key not in by_url:
+                by_url[norm_key] = flat
+            # Fan out to every original caller-supplied string that maps to
+            # this same normalized identity, so a duplicate URL in the
+            # input list resolves at every position it appeared.
+            for original_input in canonical_to_inputs.get(norm_key, []):
+                by_url.setdefault(original_input, flat)
+
+    # unknown_canonical is only ever populated at the whole-job level, for
+    # jobs whose per-record loop above never ran (every `continue` in the
+    # unknown-marking branches happens before the records loop) — so it
+    # can't overlap with by_url or rejected_canonical, which are only
+    # populated inside that loop.
+    unmatched_canonical = [
+        norm for norm in canonical_to_inputs
+        if norm not in by_url and norm not in rejected_canonical and norm not in unknown_canonical
+    ]
+    unmatched = sorted(canonical_to_inputs[norm][0] for norm in unmatched_canonical)
+    rejected = sorted(canonical_to_inputs[norm][0] for norm in rejected_canonical)
+    unknown = sorted(canonical_to_inputs[norm][0] for norm in unknown_canonical if norm in canonical_to_inputs)
+    requested = len(canonical_to_inputs)
+    fulfilled = requested - len(unmatched_canonical) - len(rejected_canonical) - len(unknown_canonical)
 
     return {
         "by_url": by_url,
-        "requested": len(requested_set),
+        "requested": requested,
         "fulfilled": fulfilled,
         "unmatched": unmatched,
+        "rejected": rejected,
+        "unknown": unknown,
+        "unknown_diagnostics": unknown_diagnostics,
         "credits_used": fulfilled * CREDITS_PER_ENRICH_PROFILE_BASE,
         "batch_ids": batch_ids,
     }
@@ -2290,11 +3014,13 @@ __all__ = [
     'submit_batch_enrich',
     'get_batch_status',
     'batch_enrich_profiles',
+    'sync_enrich_profile',
     # Normalization
     'normalize_search_result',
     'normalize_search_results_to_df',
     'semantic_profile_to_legacy_shape',
     'enrich_profile_to_legacy_shape',
+    'linkedin_profile_identity_matches',
     # Usage tracking
     'log_search_usage',
     # AI expansion

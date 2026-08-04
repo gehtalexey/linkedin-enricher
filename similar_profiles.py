@@ -14,8 +14,7 @@ plumbing so the UI code stays thin and the logic is testable.
 
 from __future__ import annotations
 
-import requests
-
+from crustdata_search import sync_enrich_profile
 from db import (
     SimilarityRPCError,
     SupabaseClient,
@@ -34,48 +33,66 @@ from geo_terms import expand_city, expand_country
 from normalizers import normalize_linkedin_url
 
 
-CRUSTDATA_ENRICH_URL = "https://api.crustdata.com/screener/person/enrich"
-
-
 class SimilarProfileError(Exception):
-    """Raised when we can't find or build an embedding to search against."""
+    """Raised when we can't find or build an embedding to search against.
+
+    ``crustdata_attempted`` / ``crustdata_fulfilled`` / ``crustdata_error``
+    let dashboard.py log Crustdata usage on this module's failure paths
+    too, without threading a UsageTracker parameter through
+    get_or_build_query_embedding()/search_similar() (Codex review, PR #127,
+    2026-08-04 — logging only the success path meant every no-match and
+    every transport error went unrecorded, defeating the point of a
+    cost-control PR). dashboard.py's tab_similar handler reads these off
+    the caught exception:
+
+    - ``crustdata_attempted=False`` (default): no Crustdata call was made
+      at all (e.g. no API key configured, or the profile was already in
+      the DB) — nothing to log.
+    - ``crustdata_attempted=True, crustdata_fulfilled=False,
+      crustdata_error=None``: a call was made and genuinely found nothing
+      — Crustdata's global no-charge-on-no-match policy means this costs
+      0 credits, so it's logged as a successful 0-credit event, not an
+      error.
+    - ``crustdata_attempted=True, crustdata_fulfilled=False,
+      crustdata_error=<message>``: a call was attempted but failed at the
+      transport/HTTP layer — logged as an error.
+    - ``crustdata_attempted=True, crustdata_fulfilled=True``: a call
+      succeeded and returned a validated profile (this module's own
+      identity/content checks already passed, since crust_data was
+      non-None) — 1 real credit was spent, even if a later step (save,
+      embed, or the similarity RPC) is what ultimately raised.
+    """
+
+    def __init__(self, message, crustdata_attempted=False, crustdata_fulfilled=False, crustdata_error=None):
+        super().__init__(message)
+        self.crustdata_attempted = crustdata_attempted
+        self.crustdata_fulfilled = crustdata_fulfilled
+        self.crustdata_error = crustdata_error
 
 
 # ---------------------------------------------------------------------------
 # Crustdata helper
 # ---------------------------------------------------------------------------
 def _crustdata_enrich(linkedin_url: str, crustdata_key: str) -> dict | None:
-    """Fetch a single profile from Crustdata.
+    """Fetch a single profile from Crustdata via the cheap v2025-11-01 sync
+    enrich endpoint (crustdata_search.sync_enrich_profile — 1 credit base),
+    NOT the legacy GET /screener/person/enrich (3 credits/profile) this used
+    before 2026-08-04.
 
-    Returns the response dict on success, or ``None`` if Crustdata had no
-    data for the URL. Raises ``SimilarProfileError`` for transport errors
-    or non-2xx HTTP responses so the caller can surface them in the UI.
+    Returns the flat legacy-enrich-shape dict on success (same shape
+    save_enriched_profile()/_prepare_profile_row() already read — see
+    crustdata_search.enrich_profile_to_legacy_shape()), or ``None`` if
+    Crustdata had no data for the URL. Raises ``SimilarProfileError`` for
+    transport errors or non-2xx HTTP responses so the caller can surface
+    them in the UI.
     """
     try:
-        response = requests.get(
-            CRUSTDATA_ENRICH_URL,
-            params={"linkedin_profile_url": linkedin_url},
-            headers={"Authorization": f"Token {crustdata_key}"},
-            timeout=120,
-        )
-    except requests.RequestException as e:
-        raise SimilarProfileError(f"Network error calling Crustdata: {e}") from e
-
-    if response.status_code >= 400:
-        body = response.text[:500] if response.text else "<empty>"
+        return sync_enrich_profile(linkedin_url, api_key=crustdata_key)
+    except Exception as e:
         raise SimilarProfileError(
-            f"Crustdata enrichment failed ({response.status_code}): {body}"
-        )
-
-    try:
-        data = response.json()
-    except ValueError as e:
-        raise SimilarProfileError(f"Crustdata returned non-JSON body: {e}") from e
-
-    result = data[0] if isinstance(data, list) and data else data
-    if not result or (isinstance(result, dict) and result.get("error")):
-        return None
-    return result if isinstance(result, dict) else None
+            f"Crustdata enrichment failed: {e}",
+            crustdata_attempted=True, crustdata_error=str(e)[:200],
+        ) from e
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +112,7 @@ def get_or_build_query_embedding(
          write it back. ``source="embedded"``.
       3. Profile is not in the DB:
            - If ``crustdata_key`` is provided, enrich via Crustdata (costs
-             ~3 credits), save, embed. ``source="enriched"``.
+             ~1 credit), save, embed. ``source="enriched"``.
            - Otherwise raise ``SimilarProfileError``.
 
     Returns:
@@ -118,10 +135,20 @@ def get_or_build_query_embedding(
 
         crust_data = _crustdata_enrich(normalized, crustdata_key)
         if not crust_data:
+            # Genuine no-match — free (Crustdata's global no-charge-on-
+            # no-result policy), so this is a successful 0-credit event,
+            # not an error.
             raise SimilarProfileError(
                 "Crustdata couldn't find this LinkedIn profile. Check the "
-                "URL is correct and reachable."
+                "URL is correct and reachable.",
+                crustdata_attempted=True, crustdata_fulfilled=False,
             )
+
+        # From here on, a real 1-credit enrichment already happened and
+        # returned a validated profile (crust_data is non-None only after
+        # sync_enrich_profile()'s own identity/content checks passed) —
+        # every raise below still tags crustdata_fulfilled=True, since the
+        # credit was genuinely spent even if a later step fails.
 
         # Crustdata uses linkedin_flagship_url on enrich responses; fall
         # back to the input URL if absent.
@@ -138,17 +165,22 @@ def get_or_build_query_embedding(
         profile = get_profile(db_client, canonical_url) or saved
         if not profile:
             raise SimilarProfileError(
-                "Profile was enriched but couldn't be reloaded from the database."
+                "Profile was enriched but couldn't be reloaded from the database.",
+                crustdata_attempted=True, crustdata_fulfilled=True,
             )
 
         text = build_embedding_text(profile)
         if not text:
             raise SimilarProfileError(
-                "This profile was enriched but has no usable text to embed."
+                "This profile was enriched but has no usable text to embed.",
+                crustdata_attempted=True, crustdata_fulfilled=True,
             )
         vector = embed_text(openai_client, text, model=EMBEDDING_MODEL)
         if not vector:
-            raise SimilarProfileError("OpenAI returned an empty embedding.")
+            raise SimilarProfileError(
+                "OpenAI returned an empty embedding.",
+                crustdata_attempted=True, crustdata_fulfilled=True,
+            )
         update_profile_embedding(
             db_client,
             profile.get("linkedin_url") or canonical_url,
@@ -237,7 +269,15 @@ def search_similar(
             city_terms=city_terms,
         )
     except SimilarityRPCError as e:
-        raise SimilarProfileError(str(e)) from e
+        # get_or_build_query_embedding() already returned successfully by
+        # this point — if source == "enriched", a real credit was already
+        # spent before the RPC failed. Propagate that so dashboard.py
+        # still logs it.
+        raise SimilarProfileError(
+            str(e),
+            crustdata_attempted=(source == "enriched"),
+            crustdata_fulfilled=(source == "enriched"),
+        ) from e
 
     if exclude_self:
         target_url = (query_profile or {}).get("linkedin_url")

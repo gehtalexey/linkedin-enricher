@@ -133,6 +133,7 @@ try:
         search_people_semantic,
         semantic_profile_to_legacy_shape,
         batch_enrich_profiles,
+        sync_enrich_profile,
         SENIORITY_LEVELS,
         HEADCOUNT_RANGES,
         FUNCTION_CATEGORIES,
@@ -3519,131 +3520,133 @@ def extract_urls(uploaded_file) -> list[str]:
 
 
 def enrich_batch(urls: list[str], api_key: str, tracker: 'UsageTracker' = None) -> list[dict]:
-    """Enrich a batch of URLs via Crust Data API."""
-    batch_str = ','.join(urls)
+    """Enrich a batch of URLs via Crustdata's cheap v2025-11-01 batch-enrich
+    pipeline (POST /batch/person/enrich, 1 credit/profile base) — NOT the
+    legacy GET /screener/person/enrich (3 credits/profile) this function used
+    before 2026-08-04. Reuses the same submit/poll/download/translate
+    machinery AI Screen's thin-profile auto-enrich step already relies on
+    (crustdata_search.batch_enrich_profiles()), so the response-mapping is
+    already proven in production rather than new integration.
+
+    Returns one dict per input URL, same order, same shape callers already
+    expect (see the "Enrich N profiles" button and its downstream
+    flatten_for_csv()/save_enriched_profiles_bulk() calls a few hundred
+    lines below):
+      - Match: the flat legacy-enrich dict (enrich_profile_to_legacy_shape())
+        plus '_original_url' set to the input URL — used to build
+        original_url_map for save_enriched_profiles_bulk, same as before.
+      - No match / rejected / unknown: {'error': ..., 'linkedin_url': url} —
+        same shape the old error path returned, read via
+        record.get('linkedin_url') downstream. The error message
+        distinguishes a confirmed no-match from a batch outcome we
+        couldn't confirm (Codex review, PR #127, round 2, 2026-08-04 —
+        see batch_enrich_profiles()'s docstring for what 'unknown' means).
+    """
     start_time = time.time()
 
-    # Build mapping from input slug to full URL
-    # Crustdata returns query_linkedin_profile_urn_or_slug which echoes our input
-    def extract_slug(url):
-        """Extract slug from LinkedIn URL (part after /in/)"""
-        if '/in/' in str(url).lower():
-            slug = str(url).lower().split('/in/')[-1].rstrip('/').split('?')[0]
-            return slug
-        return None
-
-    # Simple map: input slug -> full input URL
-    slug_to_url = {}
-    for url in urls:
-        slug = extract_slug(url)
-        if slug:
-            slug_to_url[slug.lower()] = url
-
-    # Debug: store mapping info in session state for UI display
-    import streamlit as st
-    st.session_state['_enrich_debug'] = {
-        'input_urls': len(urls),
-        'map_keys': len(slug_to_url),
-        'sample_inputs': [str(u)[:60] for u in urls[:10]],
-        'all_map_keys': list(slug_to_url.keys())[:20],
-    }
-
     try:
-        response = requests.get(
-            'https://api.crustdata.com/screener/person/enrich',
-            params={'linkedin_profile_url': batch_str},
-            headers={'Authorization': f'Token {api_key}'},
-            timeout=120
-        )
-        elapsed_ms = int((time.time() - start_time) * 1000)
-
-        if response.status_code == 200:
-            data = response.json()
-            result = data if isinstance(data, list) else [data]
-
-            # Match results using query_linkedin_profile_urn_or_slug (Crustdata echoes our input)
-            unmatched = []
-            matched_via_query_field = 0
-            matched_via_fallback = 0
-
-            for idx, item in enumerate(result):
-                if isinstance(item, dict) and 'error' not in item:
-                    matched = False
-
-                    # PRIMARY: Use query_linkedin_profile_urn_or_slug (Crustdata echoes our input!)
-                    query_slugs = item.get('query_linkedin_profile_urn_or_slug', [])
-                    if query_slugs and isinstance(query_slugs, list) and len(query_slugs) > 0:
-                        input_slug = query_slugs[0].lower() if query_slugs[0] else None
-                        if input_slug and input_slug in slug_to_url:
-                            item['_original_url'] = slug_to_url[input_slug]
-                            matched = True
-                            matched_via_query_field += 1
-
-                    # FALLBACK: Try matching via linkedin_flagship_url (for older responses or edge cases)
-                    if not matched:
-                        result_url = item.get('linkedin_flagship_url') or item.get('linkedin_url', '')
-                        result_slug = extract_slug(result_url)
-                        if result_slug and result_slug.lower() in slug_to_url:
-                            item['_original_url'] = slug_to_url[result_slug.lower()]
-                            matched = True
-                            matched_via_fallback += 1
-
-                    if not matched:
-                        result_url = item.get('linkedin_flagship_url') or item.get('linkedin_url', '')
-                        unmatched.append(extract_slug(result_url) or 'NO_SLUG')
-
-            # Store matching debug in session state
-            match_debug = {
-                'results': len(result),
-                'matched': matched_via_query_field + matched_via_fallback,
-                'matched_via_query_field': matched_via_query_field,
-                'matched_via_fallback': matched_via_fallback,
-                'unmatched_count': len(unmatched),
-                'unmatched_samples': unmatched[:5],
-                'map_keys_sample': list(slug_to_url.keys())[:10],
-                'result_samples': []
-            }
-            for i, item in enumerate(result[:5]):
-                if isinstance(item, dict):
-                    query_slug = item.get('query_linkedin_profile_urn_or_slug', ['N/A'])[0] if item.get('query_linkedin_profile_urn_or_slug') else 'N/A'
-                    match_debug['result_samples'].append({
-                        'query_slug': query_slug[:30] if query_slug else 'N/A',
-                        'flagship': (item.get('linkedin_flagship_url') or 'N/A')[:50],
-                        'matched': '_original_url' in item,
-                        'original_url': (item.get('_original_url') or 'N/A')[:50] if item.get('_original_url') else None
-                    })
-            st.session_state['_enrich_match_debug'] = match_debug
-
-            # Log successful usage
-            if tracker:
-                tracker.log_crustdata(
-                    profiles_enriched=len(urls),
-                    status='success',
-                    response_time_ms=elapsed_ms
-                )
-
-            return result
-        else:
-            # Log error
-            if tracker:
-                tracker.log_crustdata(
-                    profiles_enriched=0,
-                    status='error',
-                    error_message=f'API error {response.status_code}: {response.text[:200]}',
-                    response_time_ms=elapsed_ms
-                )
-            return [{'error': response.text, 'linkedin_url': u} for u in urls]
-
+        result = batch_enrich_profiles(urls, api_key=api_key)
     except Exception as e:
         elapsed_ms = int((time.time() - start_time) * 1000)
         if tracker:
-            tracker.log_crustdata(
-                profiles_enriched=0,
+            tracker.log_crustdata_batch_enrich(
+                requested=len(urls),
+                fulfilled=0,
                 status='error',
                 error_message=str(e)[:200],
-                response_time_ms=elapsed_ms
+                response_time_ms=elapsed_ms,
             )
         return [{'error': str(e), 'linkedin_url': u} for u in urls]
+
+    elapsed_ms = int((time.time() - start_time) * 1000)
+    by_url = result.get('by_url') or {}
+    unknown_norms = {normalize_linkedin_url(u) or u for u in (result.get('unknown') or [])}
+    rejected_norms = {normalize_linkedin_url(u) or u for u in (result.get('rejected') or [])}
+
+    output = []
+    for url in urls:
+        flat = by_url.get(url) or by_url.get(normalize_linkedin_url(url))
+        if flat:
+            item = dict(flat)
+            item['_original_url'] = url
+            output.append(item)
+        else:
+            norm_url = normalize_linkedin_url(url) or url
+            if norm_url in unknown_norms:
+                output.append({
+                    'error': 'Crustdata batch status unknown — could not confirm enrichment result (may have consumed credits)',
+                    'linkedin_url': url,
+                })
+            elif norm_url in rejected_norms:
+                output.append({
+                    'error': 'Crustdata returned data that failed identity/content validation',
+                    'linkedin_url': url,
+                })
+            else:
+                output.append({'error': 'Not found via Crustdata batch enrich', 'linkedin_url': url})
+
+    if tracker:
+        unknown_count = len(result.get('unknown') or [])
+        if unknown_count:
+            # A job whose outcome we couldn't confirm may have already
+            # billed — must not be logged as a clean, free success.
+            tracker.log_crustdata_batch_enrich(
+                requested=result.get('requested', len(urls)),
+                fulfilled=result.get('fulfilled', 0),
+                status='error',
+                error_message=(
+                    f"{unknown_count} of {result.get('requested', len(urls))} profiles have "
+                    f"unknown Crustdata billing status (batch poll/download failure) — "
+                    f"batch_ids: {result.get('batch_ids')}"
+                ),
+                response_time_ms=elapsed_ms,
+            )
+        else:
+            tracker.log_crustdata_batch_enrich(
+                requested=result.get('requested', len(urls)),
+                fulfilled=result.get('fulfilled', 0),
+                status='success',
+                response_time_ms=elapsed_ms,
+            )
+
+    return output
+
+
+def log_similar_profiles_crustdata_usage(tracker: 'UsageTracker' = None, source: str = None, error: Exception = None) -> None:
+    """Log Crustdata usage for the "Find Similar Profiles" tab's
+    on-the-fly enrich call — extracted so it's unit-testable, since the
+    tab itself is inline Streamlit UI code with no other extracted
+    function (Codex review, PR #127, 2026-08-04: this call site had no
+    usage logging at all before, defeating the point of a cost-control
+    PR). similar_profiles.search_similar() intentionally isn't threaded
+    with a UsageTracker parameter — SimilarProfileError instead carries
+    crustdata_attempted/crustdata_fulfilled/crustdata_error attributes so
+    this boundary function can log correctly even on failure paths (see
+    that class's docstring for the full contract).
+
+    Call with `source=result.get('source')` after a successful
+    search_similar() call, XOR `error=<the caught SimilarProfileError>`.
+    No-op if `tracker` is falsy, or if no Crustdata call was actually
+    attempted (source not "enriched" and error has no crustdata_attempted).
+    """
+    if not tracker:
+        return
+    if source == "enriched":
+        tracker.log_crustdata_sync_enrich(requested=1, fulfilled=1, status='success')
+        return
+    if error is not None and getattr(error, "crustdata_attempted", False):
+        error_message = getattr(error, "crustdata_error", None)
+        if error_message:
+            tracker.log_crustdata_sync_enrich(
+                requested=1, fulfilled=0, status='error',
+                error_message=error_message,
+            )
+        else:
+            tracker.log_crustdata_sync_enrich(
+                requested=1,
+                fulfilled=1 if getattr(error, "crustdata_fulfilled", False) else 0,
+                status='success',
+            )
 
 
 def normalize_crustdata_profile(record: dict) -> dict:
@@ -4973,6 +4976,55 @@ def fetch_raw_data_for_batch(profiles: list, raw_index: dict = None, db_client =
                 print(f"[Screening] Warning: {len(still_missing) - applied} profiles still missing raw data after DB fetch")
 
 
+# How long to wait before re-attempting Crustdata enrichment for a profile
+# that was already validated-and-saved but came back with neither skills
+# nor a summary (Codex review, PR #127, round 3, HIGH: without this, the
+# thin-profile auto-enrich step re-buys the exact same empty result on
+# every single screening run, forever — observed live, a person with 50
+# skills stored got zero skills back from one enrich call, and nothing
+# stopped the next run from paying to ask again). Long enough that a
+# normal day of screening runs against the same JD doesn't hammer
+# Crustdata for data it just told us it doesn't have; short enough that
+# if Crustdata's own data for that person improves later, we notice
+# within a day or two rather than never.
+THIN_PROFILE_REENRICH_COOLDOWN_HOURS = 24
+
+# Marker key stamped into a profile's flat enriched dict (which flows
+# straight into profiles.raw_data via save_enriched_profiles_bulk — no
+# new `profiles` column needed, matching this repo's existing
+# underscore-prefixed in-raw_data marker convention: _needs_enrichment,
+# _semantic_incomplete). NOT the same thing as the `profiles.
+# enrichment_attempted_at` COLUMN — that column exists but is not
+# populated by the current RPC-based save path (_prepare_profile_payload
+# in db.py doesn't include it, verified 2026-08-04), and db.py is off
+# limits for this PR, so a raw_data marker is the only available
+# persistence point for this signal.
+_THIN_LAST_ENRICH_ATTEMPT_KEY = '_last_enrichment_attempt'
+
+
+def _thin_profile_on_cooldown(raw: dict) -> bool:
+    """True if `raw` (a profile's raw_crustdata/raw_data dict) carries a
+    recent _last_enrichment_attempt marker — i.e. we already validated
+    and saved an enrichment attempt for this exact profile within
+    THIN_PROFILE_REENRICH_COOLDOWN_HOURS and it came back without
+    skills/summary. Returns False (never skip) when the marker is
+    missing or unparseable — a profile that's never been marked, or
+    whose marker we can't make sense of, is treated as never-attempted
+    and stays eligible for enrichment. This must never suppress a
+    genuinely never-enriched profile.
+    """
+    if not isinstance(raw, dict):
+        return False
+    marker = raw.get(_THIN_LAST_ENRICH_ATTEMPT_KEY)
+    if not marker:
+        return False
+    try:
+        attempted_at = datetime.fromisoformat(str(marker))
+    except (TypeError, ValueError):
+        return False
+    return datetime.utcnow() - attempted_at < timedelta(hours=THIN_PROFILE_REENRICH_COOLDOWN_HOURS)
+
+
 def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
                                     tracker: 'UsageTracker' = None) -> dict:
     """Top up any profile in this batch that's missing BOTH skills and a
@@ -5008,9 +5060,23 @@ def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
     path search-save already uses), so the same person is never re-enriched
     for a future JD.
 
-    Returns a stats dict for the UI: {thin_found, enriched, unmatched, credits_used}.
+    Returns a stats dict for the UI: {thin_found, enriched, unmatched, unknown,
+    on_cooldown, on_cooldown_urls, credits_used}.
+    `unknown` (Codex review, PR #127, round 2, 2026-08-04) counts profiles whose
+    Crustdata batch outcome couldn't be confirmed (poll/download failure after
+    the job was accepted) — distinct from `unmatched` (a confirmed no-match).
+    Both are screened as-is; `unknown` also flips the usage-log status to
+    'error' below, since a job we lost track of may have already billed.
+    `on_cooldown` / `on_cooldown_urls` (Codex review, PR #127, round 3,
+    HIGH) count/list profiles skipped because they were already validated
+    and saved recently and STILL came back without skills/summary — see
+    THIN_PROFILE_REENRICH_COOLDOWN_HOURS. Surfaced rather than hidden so
+    someone can find and explicitly retry them later if needed.
     """
-    stats = {'thin_found': 0, 'enriched': 0, 'unmatched': 0, 'credits_used': 0}
+    stats = {
+        'thin_found': 0, 'enriched': 0, 'unmatched': 0, 'unknown': 0,
+        'on_cooldown': 0, 'on_cooldown_urls': [], 'credits_used': 0,
+    }
 
     thin_profiles = []
     for p in profiles:
@@ -5036,6 +5102,12 @@ def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
         skills = clean_value(raw.get('skills')) or clean_value(p.get('skills'))
         summary = clean_value(raw.get('summary')) or clean_value(p.get('summary'))
         if not skills and not summary:
+            if _thin_profile_on_cooldown(raw):
+                # Already tried recently, already saved, still came back
+                # empty — don't re-buy the same answer every run.
+                stats['on_cooldown'] += 1
+                stats['on_cooldown_urls'].append(url)
+                continue
             thin_profiles.append(p)
 
     stats['thin_found'] = len(thin_profiles)
@@ -5058,6 +5130,11 @@ def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
         return stats
 
     by_url = result.get('by_url') or {}
+    # Representative urls whose Crustdata batch outcome is indeterminate
+    # (poll/download failure after the job was accepted) — see
+    # batch_enrich_profiles()'s docstring. Distinct from a confirmed
+    # no-match: the job may have already billed.
+    unknown_norms = {normalize_linkedin_url(u) or u for u in (result.get('unknown') or [])}
     newly_enriched = []  # flat Crustdata-shaped dicts — passed directly to
                           # save_enriched_profiles_bulk(), NOT wrapped, since
                           # that function (via _prepare_profile_row) reads
@@ -5068,8 +5145,22 @@ def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
         url = p['linkedin_url']
         flat = by_url.get(url) or by_url.get(normalize_linkedin_url(url))
         if not flat:
-            stats['unmatched'] += 1
+            if (normalize_linkedin_url(url) or url) in unknown_norms:
+                stats['unknown'] += 1
+            else:
+                stats['unmatched'] += 1
             continue
+        # Codex review, PR #127, round 3 (HIGH): the identity/content gate
+        # already confirmed this IS the right person with SOME real data —
+        # but Crustdata may still have nothing for skills/summary
+        # specifically. Stamp the cooldown marker so the NEXT screening
+        # run doesn't pay to ask again for data we just confirmed isn't
+        # there. Only stamped when still genuinely thin — a profile that
+        # came back WITH skills or a summary is not marked at all, since
+        # it's no longer thin and thin-detection won't reconsider it
+        # anyway.
+        if not (clean_value(flat.get('skills')) or clean_value(flat.get('summary'))):
+            flat[_THIN_LAST_ENRICH_ATTEMPT_KEY] = datetime.utcnow().isoformat()
         p['raw_crustdata'] = flat
         p.pop('raw_data', None)
         stats['enriched'] += 1
@@ -5081,11 +5172,27 @@ def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
     stats['credits_used'] = result.get('credits_used', 0)
 
     if tracker:
-        tracker.log_crustdata_batch_enrich(
-            requested=result.get('requested', len(urls)),
-            fulfilled=result.get('fulfilled', 0),
-            status='success',
-        )
+        unknown_count = len(result.get('unknown') or [])
+        if unknown_count:
+            # A job whose outcome we couldn't confirm may have already
+            # billed — must not be logged as a clean, free success (Codex
+            # review, PR #127, round 2, 2026-08-04).
+            tracker.log_crustdata_batch_enrich(
+                requested=result.get('requested', len(urls)),
+                fulfilled=result.get('fulfilled', 0),
+                status='error',
+                error_message=(
+                    f"{unknown_count} of {result.get('requested', len(urls))} profiles have "
+                    f"unknown Crustdata billing status (batch poll/download failure) — "
+                    f"batch_ids: {result.get('batch_ids')}"
+                ),
+            )
+        else:
+            tracker.log_crustdata_batch_enrich(
+                requested=result.get('requested', len(urls)),
+                fulfilled=result.get('fulfilled', 0),
+                status='success',
+            )
 
     if newly_enriched and db_client:
         try:
@@ -9993,6 +10100,19 @@ with tab_screening:
                                     f"{_enrich_stats['enriched']} filled, "
                                     f"{_enrich_stats['unmatched']} not found (screened as-is)"
                                 )
+                            if _enrich_stats.get('on_cooldown'):
+                                # Surfaced, not hidden (Codex review, PR #127, round 3):
+                                # these were validated-and-saved recently and still
+                                # came back without skills/summary, so they're
+                                # skipped for now rather than re-bought every run.
+                                # The actual URLs are in on_cooldown_urls for anyone
+                                # who wants to force a retry.
+                                st.caption(
+                                    f"⏳ {_enrich_stats['on_cooldown']} profile(s) skipped — "
+                                    f"already enriched within the last "
+                                    f"{THIN_PROFILE_REENRICH_COOLDOWN_HOURS}h and still came back "
+                                    f"without skills/summary. Screened with existing data."
+                                )
 
                         # Thread-safe progress tracking for this batch
                         batch_progress = {'completed': 0, 'strong': 0, 'good': 0, 'partial': 0, 'error': 0}
@@ -12006,64 +12126,73 @@ with tab_database:
                         st.error("Crustdata API key not configured")
                     else:
                         with st.spinner("Fetching fresh data from Crustdata..."):
+                            # Cheap v2025-11-01 sync enrich (1 credit base) — NOT the
+                            # legacy GET /screener/person/enrich (3 credits) this
+                            # button used before 2026-08-04. Also the first time this
+                            # button logs usage at all (it never did before).
+                            _reenrich_tracker = get_usage_tracker()
+                            _reenrich_start = time.time()
                             try:
-                                # Call Crustdata API
-                                response = requests.get(
-                                    'https://api.crustdata.com/screener/person/enrich',
-                                    params={'linkedin_profile_url': reenrich_url},
-                                    headers={'Authorization': f'Token {api_key}'},
-                                    timeout=120
-                                )
+                                result = sync_enrich_profile(reenrich_url, api_key=api_key)
+                                _reenrich_elapsed_ms = int((time.time() - _reenrich_start) * 1000)
 
-                                if response.status_code == 200:
-                                    data = response.json()
-                                    result = data[0] if isinstance(data, list) else data
-
-                                    if 'error' in result:
-                                        st.error(f"Crustdata error: {result.get('error')}")
-                                    else:
-                                        # Extract LinkedIn URL from response
-                                        linkedin_url = result.get('linkedin_flagship_url') or result.get('linkedin_url')
-                                        if linkedin_url:
-                                            # Save to database
-                                            saved = save_enriched_profile(db_client, linkedin_url, result, reenrich_url)
-                                            if saved:
-                                                st.success(f"Profile re-enriched and saved!")
-
-                                                # Show what was updated
-                                                name = result.get('name', 'Unknown')
-                                                all_titles = result.get('all_titles', [])
-                                                all_employers = result.get('all_employers', [])
-                                                skills = result.get('skills', [])
-
-                                                st.markdown(f"**{name}**")
-                                                st.markdown(f"**Titles:** {', '.join(all_titles[:5]) if all_titles else 'N/A'}")
-                                                st.markdown(f"**Employers:** {', '.join(all_employers[:5]) if all_employers else 'N/A'}")
-                                                st.markdown(f"**Skills:** {', '.join(skills[:10]) if skills else 'N/A'}...")
-
-                                                # Show work history
-                                                current_employers = result.get('current_employers', [])
-                                                past_employers = result.get('past_employers', [])
-                                                all_positions = current_employers + past_employers
-                                                if all_positions:
-                                                    with st.expander("Full Work History", expanded=True):
-                                                        for emp in all_positions[:10]:
-                                                            title = emp.get('employee_title', '')
-                                                            company = emp.get('employer_name', '')
-                                                            start = emp.get('start_date', '')[:7] if emp.get('start_date') else '?'
-                                                            end = emp.get('end_date', '')[:7] if emp.get('end_date') else 'Present'
-                                                            st.markdown(f"- **{title}** at {company} ({start} - {end})")
-                                            else:
-                                                st.error("Failed to save to database")
-                                        else:
-                                            st.error("Could not extract LinkedIn URL from response")
-                                elif response.status_code == 404:
+                                if not result:
+                                    if _reenrich_tracker:
+                                        _reenrich_tracker.log_crustdata_sync_enrich(
+                                            requested=1, fulfilled=0, status='success',
+                                            response_time_ms=_reenrich_elapsed_ms,
+                                        )
                                     st.error("Profile not found on Crustdata")
                                 else:
-                                    st.error(f"Crustdata API error: {response.status_code}")
-                            except requests.exceptions.Timeout:
-                                st.error("Request timed out. Try again.")
+                                    if _reenrich_tracker:
+                                        _reenrich_tracker.log_crustdata_sync_enrich(
+                                            requested=1, fulfilled=1, status='success',
+                                            response_time_ms=_reenrich_elapsed_ms,
+                                        )
+
+                                    # Extract LinkedIn URL from response
+                                    linkedin_url = result.get('linkedin_flagship_url') or result.get('linkedin_url')
+                                    if linkedin_url:
+                                        # Save to database
+                                        saved = save_enriched_profile(db_client, linkedin_url, result, reenrich_url)
+                                        if saved:
+                                            st.success(f"Profile re-enriched and saved!")
+
+                                            # Show what was updated
+                                            name = result.get('name', 'Unknown')
+                                            all_titles = result.get('all_titles', [])
+                                            all_employers = result.get('all_employers', [])
+                                            skills = result.get('skills', [])
+
+                                            st.markdown(f"**{name}**")
+                                            st.markdown(f"**Titles:** {', '.join(all_titles[:5]) if all_titles else 'N/A'}")
+                                            st.markdown(f"**Employers:** {', '.join(all_employers[:5]) if all_employers else 'N/A'}")
+                                            st.markdown(f"**Skills:** {', '.join(skills[:10]) if skills else 'N/A'}...")
+
+                                            # Show work history
+                                            current_employers = result.get('current_employers', [])
+                                            past_employers = result.get('past_employers', [])
+                                            all_positions = current_employers + past_employers
+                                            if all_positions:
+                                                with st.expander("Full Work History", expanded=True):
+                                                    for emp in all_positions[:10]:
+                                                        title = emp.get('employee_title', '')
+                                                        company = emp.get('employer_name', '')
+                                                        start = emp.get('start_date', '')[:7] if emp.get('start_date') else '?'
+                                                        end = emp.get('end_date', '')[:7] if emp.get('end_date') else 'Present'
+                                                        st.markdown(f"- **{title}** at {company} ({start} - {end})")
+                                        else:
+                                            st.error("Failed to save to database")
+                                    else:
+                                        st.error("Could not extract LinkedIn URL from response")
                             except Exception as e:
+                                _reenrich_elapsed_ms = int((time.time() - _reenrich_start) * 1000)
+                                if _reenrich_tracker:
+                                    _reenrich_tracker.log_crustdata_sync_enrich(
+                                        requested=1, fulfilled=0, status='error',
+                                        error_message=str(e)[:200],
+                                        response_time_ms=_reenrich_elapsed_ms,
+                                    )
                                 st.error(f"Error: {e}")
 
         except Exception as e:
@@ -12170,9 +12299,10 @@ with tab_similar:
                         st.session_state["similar_last_result"] = result
                         source = result.get("source")
                         if source == "enriched":
+                            log_similar_profiles_crustdata_usage(get_usage_tracker(), source=source)
                             st.info(
                                 "This profile wasn't in our database. We enriched it via "
-                                "Crustdata (~3 credits), saved it, and embedded it. Future "
+                                "Crustdata (~1 credit), saved it, and embedded it. Future "
                                 "searches for the same URL are free."
                             )
                         elif source == "embedded":
@@ -12182,6 +12312,7 @@ with tab_similar:
                             )
 
                 except SimilarProfileError as e:
+                    log_similar_profiles_crustdata_usage(get_usage_tracker(), error=e)
                     st.warning(str(e))
                 except Exception as e:
                     st.error(f"Similar search failed: {e}")
