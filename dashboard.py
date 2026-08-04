@@ -3535,8 +3535,12 @@ def enrich_batch(urls: list[str], api_key: str, tracker: 'UsageTracker' = None) 
       - Match: the flat legacy-enrich dict (enrich_profile_to_legacy_shape())
         plus '_original_url' set to the input URL — used to build
         original_url_map for save_enriched_profiles_bulk, same as before.
-      - No match: {'error': ..., 'linkedin_url': url} — same shape the old
-        error path returned, read via record.get('linkedin_url') downstream.
+      - No match / rejected / unknown: {'error': ..., 'linkedin_url': url} —
+        same shape the old error path returned, read via
+        record.get('linkedin_url') downstream. The error message
+        distinguishes a confirmed no-match from a batch outcome we
+        couldn't confirm (Codex review, PR #127, round 2, 2026-08-04 —
+        see batch_enrich_profiles()'s docstring for what 'unknown' means).
     """
     start_time = time.time()
 
@@ -3556,6 +3560,8 @@ def enrich_batch(urls: list[str], api_key: str, tracker: 'UsageTracker' = None) 
 
     elapsed_ms = int((time.time() - start_time) * 1000)
     by_url = result.get('by_url') or {}
+    unknown_norms = {normalize_linkedin_url(u) or u for u in (result.get('unknown') or [])}
+    rejected_norms = {normalize_linkedin_url(u) or u for u in (result.get('rejected') or [])}
 
     output = []
     for url in urls:
@@ -3565,15 +3571,43 @@ def enrich_batch(urls: list[str], api_key: str, tracker: 'UsageTracker' = None) 
             item['_original_url'] = url
             output.append(item)
         else:
-            output.append({'error': 'Not found via Crustdata batch enrich', 'linkedin_url': url})
+            norm_url = normalize_linkedin_url(url) or url
+            if norm_url in unknown_norms:
+                output.append({
+                    'error': 'Crustdata batch status unknown — could not confirm enrichment result (may have consumed credits)',
+                    'linkedin_url': url,
+                })
+            elif norm_url in rejected_norms:
+                output.append({
+                    'error': 'Crustdata returned data that failed identity/content validation',
+                    'linkedin_url': url,
+                })
+            else:
+                output.append({'error': 'Not found via Crustdata batch enrich', 'linkedin_url': url})
 
     if tracker:
-        tracker.log_crustdata_batch_enrich(
-            requested=result.get('requested', len(urls)),
-            fulfilled=result.get('fulfilled', 0),
-            status='success',
-            response_time_ms=elapsed_ms,
-        )
+        unknown_count = len(result.get('unknown') or [])
+        if unknown_count:
+            # A job whose outcome we couldn't confirm may have already
+            # billed — must not be logged as a clean, free success.
+            tracker.log_crustdata_batch_enrich(
+                requested=result.get('requested', len(urls)),
+                fulfilled=result.get('fulfilled', 0),
+                status='error',
+                error_message=(
+                    f"{unknown_count} of {result.get('requested', len(urls))} profiles have "
+                    f"unknown Crustdata billing status (batch poll/download failure) — "
+                    f"batch_ids: {result.get('batch_ids')}"
+                ),
+                response_time_ms=elapsed_ms,
+            )
+        else:
+            tracker.log_crustdata_batch_enrich(
+                requested=result.get('requested', len(urls)),
+                fulfilled=result.get('fulfilled', 0),
+                status='success',
+                response_time_ms=elapsed_ms,
+            )
 
     return output
 
@@ -4977,9 +5011,14 @@ def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
     path search-save already uses), so the same person is never re-enriched
     for a future JD.
 
-    Returns a stats dict for the UI: {thin_found, enriched, unmatched, credits_used}.
+    Returns a stats dict for the UI: {thin_found, enriched, unmatched, unknown, credits_used}.
+    `unknown` (Codex review, PR #127, round 2, 2026-08-04) counts profiles whose
+    Crustdata batch outcome couldn't be confirmed (poll/download failure after
+    the job was accepted) — distinct from `unmatched` (a confirmed no-match).
+    Both are screened as-is; `unknown` also flips the usage-log status to
+    'error' below, since a job we lost track of may have already billed.
     """
-    stats = {'thin_found': 0, 'enriched': 0, 'unmatched': 0, 'credits_used': 0}
+    stats = {'thin_found': 0, 'enriched': 0, 'unmatched': 0, 'unknown': 0, 'credits_used': 0}
 
     thin_profiles = []
     for p in profiles:
@@ -5027,6 +5066,11 @@ def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
         return stats
 
     by_url = result.get('by_url') or {}
+    # Representative urls whose Crustdata batch outcome is indeterminate
+    # (poll/download failure after the job was accepted) — see
+    # batch_enrich_profiles()'s docstring. Distinct from a confirmed
+    # no-match: the job may have already billed.
+    unknown_norms = {normalize_linkedin_url(u) or u for u in (result.get('unknown') or [])}
     newly_enriched = []  # flat Crustdata-shaped dicts — passed directly to
                           # save_enriched_profiles_bulk(), NOT wrapped, since
                           # that function (via _prepare_profile_row) reads
@@ -5037,7 +5081,10 @@ def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
         url = p['linkedin_url']
         flat = by_url.get(url) or by_url.get(normalize_linkedin_url(url))
         if not flat:
-            stats['unmatched'] += 1
+            if (normalize_linkedin_url(url) or url) in unknown_norms:
+                stats['unknown'] += 1
+            else:
+                stats['unmatched'] += 1
             continue
         p['raw_crustdata'] = flat
         p.pop('raw_data', None)
@@ -5050,11 +5097,27 @@ def enrich_thin_profiles_for_batch(profiles: list, api_key: str, db_client=None,
     stats['credits_used'] = result.get('credits_used', 0)
 
     if tracker:
-        tracker.log_crustdata_batch_enrich(
-            requested=result.get('requested', len(urls)),
-            fulfilled=result.get('fulfilled', 0),
-            status='success',
-        )
+        unknown_count = len(result.get('unknown') or [])
+        if unknown_count:
+            # A job whose outcome we couldn't confirm may have already
+            # billed — must not be logged as a clean, free success (Codex
+            # review, PR #127, round 2, 2026-08-04).
+            tracker.log_crustdata_batch_enrich(
+                requested=result.get('requested', len(urls)),
+                fulfilled=result.get('fulfilled', 0),
+                status='error',
+                error_message=(
+                    f"{unknown_count} of {result.get('requested', len(urls))} profiles have "
+                    f"unknown Crustdata billing status (batch poll/download failure) — "
+                    f"batch_ids: {result.get('batch_ids')}"
+                ),
+            )
+        else:
+            tracker.log_crustdata_batch_enrich(
+                requested=result.get('requested', len(urls)),
+                fulfilled=result.get('fulfilled', 0),
+                status='success',
+            )
 
     if newly_enriched and db_client:
         try:

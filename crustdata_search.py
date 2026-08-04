@@ -1797,6 +1797,29 @@ def _download_batch_results(status_payload: Dict[str, Any], api_key: str) -> Lis
     return records
 
 
+# Possible key names for a fulfilled-count on a batch status payload — not
+# pinned in Crustdata's docs (same caveat as _is_batch_terminal()/
+# _download_batch_results() above), so checked defensively in order.
+_STATUS_FULFILLED_HINT_KEYS = ("entities_fulfilled", "fulfilled_count", "fulfilled")
+
+
+def _status_fulfilled_hint(status_payload: Dict[str, Any]) -> Optional[int]:
+    """Best-effort extraction of a fulfilled-count from a batch status
+    payload, for jobs that land in the `unknown` bucket (see
+    batch_enrich_profiles()'s docstring) — surfaced for reconciliation
+    rather than discarded, per Codex review PR #127 round 2. Returns None
+    if no known key holds a usable number."""
+    if not isinstance(status_payload, dict):
+        return None
+    for key in _STATUS_FULFILLED_HINT_KEYS:
+        val = status_payload.get(key)
+        if isinstance(val, bool):
+            continue
+        if isinstance(val, (int, float)):
+            return int(val)
+    return None
+
+
 def batch_enrich_profiles(
     linkedin_urls: List[str],
     api_key: str = None,
@@ -1828,13 +1851,45 @@ def batch_enrich_profiles(
             "by_url": {<url>: <flat legacy-enrich-shape dict>},
             "requested": int,
             "fulfilled": int,
-            "unmatched": [urls...],       # no record came back at all
+            "unmatched": [urls...],       # no record came back, job outcome
+                                           # was otherwise fully readable
             "rejected": [urls...],        # a record came back but failed
                                            # identity/content validation —
                                            # see _is_valid_person_data()
+            "unknown": [urls...],         # job was submitted/accepted but
+                                           # its outcome could NOT be read
+                                           # (poll error, poll timeout, or a
+                                           # completed job whose results we
+                                           # couldn't download) — NOT the
+                                           # same as a genuine no-match; see
+                                           # "Unknown billing" below
+            "unknown_diagnostics": [...], # {batch_id, reason, fulfilled_hint,
+                                           # last_status_payload} per job
+                                           # that landed in `unknown`
             "credits_used": fulfilled * 1,
             "batch_ids": [...],
         }
+
+    Unknown billing (Codex review, PR #127, round 2, 2026-08-04): a job
+    that was successfully SUBMITTED and ACCEPTED by Crustdata may already
+    be running (and billing) even if we then lose the ability to read its
+    outcome — a transient error while polling status, a poll timeout with
+    no terminal status ever observed, or a download/parse failure AFTER
+    Crustdata reported the job complete. The previous version collapsed
+    all three into `records = []`, which flows into `unmatched` —
+    indistinguishable from Crustdata genuinely finding nothing, and
+    reported to usage logging as a clean, free, zero-credit run. That is
+    backwards for a cost-control PR: it hides spend in exactly the
+    direction that flatters us. These three cases now land in `unknown`
+    instead, are never silently treated as free, and dashboard.py logs
+    them as an error/unknown-spend event carrying the batch_id(s) so the
+    account balance can be reconciled manually. When Crustdata's own
+    status payload happens to report a fulfilled count for a job we
+    otherwise couldn't fully read (see `_status_fulfilled_hint()`), it's
+    surfaced via
+    `unknown_diagnostics[i]["fulfilled_hint"]` rather than discarded —
+    but it is NOT folded into `credits_used`, which stays a conservative,
+    only-what-we-actually-validated number.
 
     Deduplicates by normalized URL BEFORE submitting (Codex review, PR
     #127, 2026-08-04): a caller-supplied list containing the same URL
@@ -1863,7 +1918,11 @@ def batch_enrich_profiles(
     """
     linkedin_urls = [u for u in (linkedin_urls or []) if u and str(u).strip()]
     if not linkedin_urls:
-        return {"by_url": {}, "requested": 0, "fulfilled": 0, "unmatched": [], "credits_used": 0, "batch_ids": []}
+        return {
+            "by_url": {}, "requested": 0, "fulfilled": 0, "unmatched": [],
+            "rejected": [], "unknown": [], "unknown_diagnostics": [],
+            "credits_used": 0, "batch_ids": [],
+        }
 
     if not api_key:
         api_key = _load_api_key()
@@ -1885,34 +1944,72 @@ def batch_enrich_profiles(
     by_url: Dict[str, Dict[str, Any]] = {}
     batch_ids: List[str] = []
     rejected_canonical: set = set()
+    unknown_canonical: set = set()
+    unknown_diagnostics: List[Dict[str, Any]] = []
 
     for job_urls in jobs:
         try:
             batch_id = submit_batch_enrich(job_urls, api_key=api_key, chunk_size=chunk_size, fields=fields)
         except Exception:
-            # Whole job failed to submit — its URLs stay unmatched below.
+            # Job never got accepted by Crustdata — genuinely nothing was
+            # billed, so this is a real "no results", not unknown billing.
+            # Its URLs stay unmatched below.
             continue
         batch_ids.append(batch_id)
 
+        # From here on the job WAS accepted — Crustdata may already be
+        # running (and billing) it, so any failure to read its outcome
+        # from this point on is "unknown", never silently "no match".
+        job_norms = {normalize_linkedin_url(u) or u for u in job_urls}
+
         elapsed = 0.0
         status_payload = {}
+        poll_failed = False
+        timed_out = False
         while elapsed < max_wait_s:
             try:
                 status_payload = get_batch_status(batch_id, api_key=api_key)
             except Exception:
+                poll_failed = True
                 break
             if _is_batch_terminal(status_payload):
                 break
             time.sleep(poll_interval_s)
             elapsed += poll_interval_s
+        else:
+            # Loop exhausted max_wait_s without ever hitting a `break` —
+            # i.e. we never observed a terminal status at all.
+            timed_out = True
+
+        if poll_failed or timed_out:
+            unknown_canonical.update(job_norms)
+            unknown_diagnostics.append({
+                "batch_id": batch_id,
+                "reason": "poll_error" if poll_failed else "poll_timeout",
+                "fulfilled_hint": _status_fulfilled_hint(status_payload),
+                "last_status_payload": status_payload,
+            })
+            continue
 
         if str(status_payload.get("status", "")).lower() in _BATCH_TERMINAL_FAILURE:
-            continue  # whole job failed — its URLs stay unmatched
+            # Crustdata explicitly told us the job failed — a real
+            # negative signal, not an unreadable one. Stays unmatched.
+            continue
 
         try:
             records = _download_batch_results(status_payload, api_key)
         except Exception:
-            records = []
+            # The job reached a terminal status (Crustdata's side is done,
+            # likely billed) but we couldn't retrieve/parse the results —
+            # unknown, not "no match".
+            unknown_canonical.update(job_norms)
+            unknown_diagnostics.append({
+                "batch_id": batch_id,
+                "reason": "download_error",
+                "fulfilled_hint": _status_fulfilled_hint(status_payload),
+                "last_status_payload": status_payload,
+            })
+            continue
 
         for record in records:
             data = record.get("data") or {}
@@ -1944,14 +2041,20 @@ def batch_enrich_profiles(
             for original_input in canonical_to_inputs.get(norm_key, []):
                 by_url.setdefault(original_input, flat)
 
+    # unknown_canonical is only ever populated at the whole-job level, for
+    # jobs whose per-record loop above never ran (every `continue` in the
+    # unknown-marking branches happens before the records loop) — so it
+    # can't overlap with by_url or rejected_canonical, which are only
+    # populated inside that loop.
     unmatched_canonical = [
         norm for norm in canonical_to_inputs
-        if norm not in by_url and norm not in rejected_canonical
+        if norm not in by_url and norm not in rejected_canonical and norm not in unknown_canonical
     ]
     unmatched = sorted(canonical_to_inputs[norm][0] for norm in unmatched_canonical)
     rejected = sorted(canonical_to_inputs[norm][0] for norm in rejected_canonical)
+    unknown = sorted(canonical_to_inputs[norm][0] for norm in unknown_canonical if norm in canonical_to_inputs)
     requested = len(canonical_to_inputs)
-    fulfilled = requested - len(unmatched_canonical) - len(rejected_canonical)
+    fulfilled = requested - len(unmatched_canonical) - len(rejected_canonical) - len(unknown_canonical)
 
     return {
         "by_url": by_url,
@@ -1959,6 +2062,8 @@ def batch_enrich_profiles(
         "fulfilled": fulfilled,
         "unmatched": unmatched,
         "rejected": rejected,
+        "unknown": unknown,
+        "unknown_diagnostics": unknown_diagnostics,
         "credits_used": fulfilled * CREDITS_PER_ENRICH_PROFILE_BASE,
         "batch_ids": batch_ids,
     }

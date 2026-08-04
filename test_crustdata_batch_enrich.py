@@ -26,6 +26,7 @@ from crustdata_search import (
     batch_enrich_profiles,
     enrich_profile_to_legacy_shape,
     _download_batch_results,
+    _status_fulfilled_hint,
     CRUSTDATA_BATCH_ENRICH_ENDPOINT,
     CRUSTDATA_API_VERSION,
 )
@@ -174,6 +175,11 @@ class TestBatchEnrichProfilesOrchestrator:
         # whatever data is available (Alexey's decision, 2026-07-20).
 
     def test_poll_timeout_returns_done_so_far_no_exception(self, monkeypatch):
+        """A job accepted by Crustdata that never reaches a terminal status
+        within max_wait_s is UNKNOWN billing, not a genuine no-match (Codex
+        review, PR #127, round 2, 2026-08-04) — it may already be running
+        (and billing) on Crustdata's side. Still doesn't raise (screening
+        proceeds as-is), but must not be reported as free/successful."""
         monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
         urls = ["https://www.linkedin.com/in/a"]
         with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
@@ -183,7 +189,11 @@ class TestBatchEnrichProfilesOrchestrator:
             result = batch_enrich_profiles(urls, api_key="test-key", poll_interval_s=1, max_wait_s=3)
 
         assert result["fulfilled"] == 0
-        assert result["unmatched"] == urls  # not an exception — screened as-is
+        assert result["unmatched"] == []  # NOT reported as a genuine no-match
+        assert result["unknown"] == urls
+        assert len(result["unknown_diagnostics"]) == 1
+        assert result["unknown_diagnostics"][0]["reason"] == "poll_timeout"
+        assert result["unknown_diagnostics"][0]["batch_id"] == "batch1"
 
     def test_over_10000_urls_splits_into_multiple_jobs(self, monkeypatch):
         monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
@@ -210,7 +220,11 @@ class TestBatchEnrichProfilesOrchestrator:
         with patch("crustdata_search.submit_batch_enrich") as mock_submit:
             result = batch_enrich_profiles([], api_key="test-key")
         mock_submit.assert_not_called()
-        assert result == {"by_url": {}, "requested": 0, "fulfilled": 0, "unmatched": [], "credits_used": 0, "batch_ids": []}
+        assert result == {
+            "by_url": {}, "requested": 0, "fulfilled": 0, "unmatched": [],
+            "rejected": [], "unknown": [], "unknown_diagnostics": [],
+            "credits_used": 0, "batch_ids": [],
+        }
 
 
 class TestBatchEnrichProfilesDedup:
@@ -443,6 +457,151 @@ class TestBatchEnrichProfilesIdentityValidation:
         assert result["rejected"] == [wrong_person_url]
         assert result["unmatched"] == [no_match_url]
         assert result["credits_used"] == 1
+
+
+class TestStatusFulfilledHint:
+    def test_known_key_extracted(self):
+        assert _status_fulfilled_hint({"entities_fulfilled": 7}) == 7
+        assert _status_fulfilled_hint({"fulfilled_count": 3}) == 3
+        assert _status_fulfilled_hint({"fulfilled": 5}) == 5
+
+    def test_first_matching_key_wins(self):
+        assert _status_fulfilled_hint({"entities_fulfilled": 7, "fulfilled": 99}) == 7
+
+    def test_no_known_key_returns_none(self):
+        assert _status_fulfilled_hint({"status": "processing"}) is None
+
+    def test_non_numeric_value_ignored(self):
+        assert _status_fulfilled_hint({"entities_fulfilled": "seven"}) is None
+
+    def test_bool_value_ignored(self):
+        """bool is technically an int subclass in Python — must not be
+        mistaken for a real count."""
+        assert _status_fulfilled_hint({"entities_fulfilled": True}) is None
+
+    def test_non_dict_payload_returns_none(self):
+        assert _status_fulfilled_hint(None) is None
+        assert _status_fulfilled_hint("not a dict") is None
+
+
+class TestBatchEnrichProfilesUnknownBilling:
+    """Codex adversarial review of PR #127, round 2 (2026-08-04, HIGH):
+    a job accepted by Crustdata (and possibly already billing) whose
+    outcome we then fail to read — a poll error, a poll timeout, or a
+    download failure after the job completed — was previously collapsed
+    into `records = []`, reported as `fulfilled=0` and logged as a clean,
+    free, successful run. That hides real spend in exactly the direction
+    that flatters the whole point of this PR. These cases must land in
+    the distinct `unknown` bucket, never silently treated as a genuine
+    no-match."""
+
+    def test_polling_error_after_acceptance_is_unknown_not_fulfilled_zero(self, monkeypatch):
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url = "https://www.linkedin.com/in/a"
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", side_effect=Exception("network blip")):
+            result = batch_enrich_profiles([url], api_key="test-key")
+
+        assert result["fulfilled"] == 0
+        assert result["unmatched"] == []  # NOT a genuine no-match
+        assert result["unknown"] == [url]
+        assert result["unknown_diagnostics"][0]["reason"] == "poll_error"
+        assert result["unknown_diagnostics"][0]["batch_id"] == "batch1"
+        assert result["credits_used"] == 0  # conservative — never guessed positive
+
+    def test_download_failure_after_completed_job_is_unknown(self, monkeypatch):
+        """The job reached a terminal 'completed' status (Crustdata's side
+        is done, plausibly billed) but we couldn't fetch/parse the results
+        file — this is NOT the same as Crustdata finding nothing."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url = "https://www.linkedin.com/in/a"
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", side_effect=Exception("s3 fetch failed")):
+            result = batch_enrich_profiles([url], api_key="test-key")
+
+        assert result["fulfilled"] == 0
+        assert result["unmatched"] == []
+        assert result["unknown"] == [url]
+        assert result["unknown_diagnostics"][0]["reason"] == "download_error"
+        assert result["unknown_diagnostics"][0]["last_status_payload"] == {"status": "completed"}
+
+    def test_status_payload_fulfilled_count_is_surfaced_not_discarded(self, monkeypatch):
+        """When Crustdata's own status payload carries a fulfilled count
+        for a job we otherwise couldn't fully read, it must be surfaced
+        (fulfilled_hint) rather than thrown away — even though it doesn't
+        get folded into the conservative credits_used number."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url = "https://www.linkedin.com/in/a"
+        status_with_count = {"status": "completed", "entities_requested": 1, "entities_fulfilled": 1}
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value=status_with_count), \
+             patch("crustdata_search._download_batch_results", side_effect=Exception("s3 fetch failed")):
+            result = batch_enrich_profiles([url], api_key="test-key")
+
+        assert result["unknown_diagnostics"][0]["fulfilled_hint"] == 1
+        assert result["unknown_diagnostics"][0]["last_status_payload"] == status_with_count
+        # Still conservative: not silently added to the billed count.
+        assert result["credits_used"] == 0
+
+    def test_genuine_no_match_still_distinct_from_unknown(self, monkeypatch):
+        """A job that completed and downloaded cleanly with zero matching
+        records is a REAL no-match — must stay in `unmatched`, and
+        `unknown` must stay empty. The two states must never blur."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url = "https://www.linkedin.com/in/ghost"
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[]):
+            result = batch_enrich_profiles([url], api_key="test-key")
+
+        assert result["fulfilled"] == 0
+        assert result["unmatched"] == [url]
+        assert result["unknown"] == []
+        assert result["unknown_diagnostics"] == []
+        assert result["credits_used"] == 0
+
+    def test_mixed_jobs_one_unknown_one_fulfilled(self, monkeypatch):
+        """Multiple jobs (>10,000 URLs splits into separate jobs) can have
+        independent outcomes — one job's poll failure must not contaminate
+        another job's genuinely fulfilled result. The first 10,000 URLs
+        land in one job (which fails to poll), the 10,001st alone in a
+        second job (which succeeds)."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        urls = [f"https://www.linkedin.com/in/u{i}" for i in range(10001)]
+        good_url = urls[10000]  # alone in the second, single-URL job
+        good_record = {
+            "original_identifier": good_url,
+            "data": {
+                "basic_profile": {"name": "Good"},
+                "skills": {"professional_network_skills": ["Python"]},
+                "social_handles": {"professional_network_identifier": {"profile_url": good_url}},
+            },
+        }
+
+        def fake_get_batch_status(batch_id, api_key=None):
+            if batch_id == "batchGood":
+                return {"status": "completed"}
+            raise Exception("network blip")
+
+        def fake_submit(job_urls, api_key=None, chunk_size=None, fields=None):
+            return "batchGood" if job_urls == [good_url] else "batchBad"
+
+        def fake_download(status_payload, api_key):
+            return [good_record]
+
+        with patch("crustdata_search.submit_batch_enrich", side_effect=fake_submit), \
+             patch("crustdata_search.get_batch_status", side_effect=fake_get_batch_status), \
+             patch("crustdata_search._download_batch_results", side_effect=fake_download):
+            result = batch_enrich_profiles(urls, api_key="test-key")
+
+        assert result["by_url"][good_url]["name"] == "Good"
+        assert result["fulfilled"] == 1
+        assert good_url not in result["unknown"]
+        assert len(result["unknown"]) == 10000  # the whole failed-poll job
+        assert len(result["unknown_diagnostics"]) == 1
+        assert result["unknown_diagnostics"][0]["reason"] == "poll_error"
+        assert result["unknown_diagnostics"][0]["batch_id"] == "batchBad"
 
 
 # ---------------------------------------------------------------------------

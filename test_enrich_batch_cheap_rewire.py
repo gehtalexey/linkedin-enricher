@@ -161,6 +161,98 @@ class TestEnrichBatchCheapRewire:
         assert result[0]['_original_url'] == raw_url
 
 
+class TestEnrichBatchUnknownAndRejectedHandling:
+    """Codex adversarial review of PR #127, round 2 (2026-08-04, HIGH):
+    batch_enrich_profiles() can now return `unknown` (job accepted but
+    outcome unreadable — may have already billed) and `rejected` (data
+    came back but failed identity/content validation) alongside the
+    existing `unmatched`. dashboard.enrich_batch() must not crash on
+    these new keys, must produce a distinct error message per case, and
+    — critically — must never log an `unknown` batch as a clean,
+    zero-credit success."""
+
+    def test_unknown_url_gets_distinct_error_message_and_error_log(self, monkeypatch):
+        urls = ["https://www.linkedin.com/in/a"]
+
+        def fake_batch_enrich(u, api_key=None):
+            return {
+                "by_url": {}, "requested": 1, "fulfilled": 0,
+                "unmatched": [], "rejected": [], "unknown": [u[0]],
+                "unknown_diagnostics": [{"batch_id": "b1", "reason": "poll_timeout"}],
+                "credits_used": 0, "batch_ids": ["b1"],
+            }
+
+        monkeypatch.setattr(dashboard, "batch_enrich_profiles", fake_batch_enrich)
+        tracker = FakeTracker()
+
+        result = dashboard.enrich_batch(urls, "test-key", tracker=tracker)
+
+        assert len(result) == 1
+        assert 'error' in result[0]
+        assert 'unknown' in result[0]['error'].lower()
+        assert result[0]['linkedin_url'] == urls[0]
+
+        # Must be logged as an ERROR, never a clean success — a job we
+        # lost track of may have already consumed real credits.
+        assert len(tracker.batch_enrich_calls) == 1
+        assert tracker.batch_enrich_calls[0]['status'] == 'error'
+        assert 'unknown' in tracker.batch_enrich_calls[0]['error_message'].lower()
+        assert 'b1' in tracker.batch_enrich_calls[0]['error_message']
+
+    def test_rejected_url_gets_distinct_error_message_but_normal_success_log(self, monkeypatch):
+        """Rejected (identity/content validation failure) is a CONFIRMED
+        outcome — Crustdata answered, we just don't trust the answer — so
+        unlike `unknown` it doesn't need to flip the log to 'error'."""
+        urls = ["https://www.linkedin.com/in/a"]
+
+        def fake_batch_enrich(u, api_key=None):
+            return {
+                "by_url": {}, "requested": 1, "fulfilled": 0,
+                "unmatched": [], "rejected": [u[0]], "unknown": [],
+                "unknown_diagnostics": [], "credits_used": 0, "batch_ids": ["b1"],
+            }
+
+        monkeypatch.setattr(dashboard, "batch_enrich_profiles", fake_batch_enrich)
+        tracker = FakeTracker()
+
+        result = dashboard.enrich_batch(urls, "test-key", tracker=tracker)
+
+        assert 'error' in result[0]
+        assert 'validation' in result[0]['error'].lower()
+        assert tracker.batch_enrich_calls[0]['status'] == 'success'
+
+    def test_mixed_matched_unknown_and_unmatched_each_handled_distinctly(self, monkeypatch):
+        urls = [
+            "https://www.linkedin.com/in/matched",
+            "https://www.linkedin.com/in/unknown-one",
+            "https://www.linkedin.com/in/truly-missing",
+        ]
+
+        def fake_batch_enrich(u, api_key=None):
+            return {
+                "by_url": {u[0]: _flat(u[0], "Matched")},
+                "requested": 3, "fulfilled": 1,
+                "unmatched": [u[2]], "rejected": [], "unknown": [u[1]],
+                "unknown_diagnostics": [{"batch_id": "b1", "reason": "download_error"}],
+                "credits_used": 1, "batch_ids": ["b1"],
+            }
+
+        monkeypatch.setattr(dashboard, "batch_enrich_profiles", fake_batch_enrich)
+        tracker = FakeTracker()
+
+        result = dashboard.enrich_batch(urls, "test-key", tracker=tracker)
+
+        by_input_url = {r.get('linkedin_url') or r.get('_original_url'): r for r in result}
+        assert 'error' not in by_input_url[urls[0]]
+        assert 'unknown' in by_input_url[urls[1]]['error'].lower()
+        assert by_input_url[urls[2]]['error'] == 'Not found via Crustdata batch enrich'
+
+        # Any unknown at all flips the whole batch's log to error, even
+        # though most of it resolved cleanly.
+        assert tracker.batch_enrich_calls[0]['status'] == 'error'
+        assert tracker.batch_enrich_calls[0]['fulfilled'] == 1
+
+
 class TestLogCrustdataSyncEnrich:
     """The new usage_tracker method for the sync single-profile call sites
     (dashboard's Re-Enrich Profile button, similar_profiles._crustdata_enrich)."""

@@ -63,7 +63,7 @@ class TestEnrichThinProfilesForBatch:
         stats = dashboard.enrich_thin_profiles_for_batch([thin, rich], api_key="test-key", db_client=None)
 
         assert captured_urls["urls"] == ["https://www.linkedin.com/in/thin"]
-        assert stats == {"thin_found": 1, "enriched": 1, "unmatched": 0, "credits_used": 1}
+        assert stats == {"thin_found": 1, "enriched": 1, "unmatched": 0, "unknown": 0, "credits_used": 1}
         # The already-rich profile must be untouched.
         assert rich["raw_crustdata"]["name"] == "Rich Person"
         assert rich["raw_crustdata"]["skills"] == ["Python"]
@@ -164,7 +164,7 @@ class TestEnrichThinProfilesForBatch:
         stats = dashboard.enrich_thin_profiles_for_batch([rich], api_key="test-key", db_client=None)
 
         assert called["n"] == 0
-        assert stats == {"thin_found": 0, "enriched": 0, "unmatched": 0, "credits_used": 0}
+        assert stats == {"thin_found": 0, "enriched": 0, "unmatched": 0, "unknown": 0, "credits_used": 0}
 
     def test_flat_top_level_skills_and_summary_prevent_false_thin_classification(self, monkeypatch):
         """Regression test for a Codex-caught bug (2026-07-20): a profile
@@ -222,6 +222,88 @@ class TestEnrichThinProfilesForBatch:
         }
         stats = dashboard.enrich_thin_profiles_for_batch([partial], api_key="test-key", db_client=None)
         assert stats["thin_found"] == 0
+
+
+class _FakeTracker:
+    """Records log_crustdata_batch_enrich() calls without a real
+    db_client, so tests can assert exactly what got logged."""
+
+    def __init__(self):
+        self.calls = []
+
+    def log_crustdata_batch_enrich(self, requested, fulfilled, status='success', error_message=None, response_time_ms=None):
+        self.calls.append({'requested': requested, 'fulfilled': fulfilled, 'status': status, 'error_message': error_message})
+
+
+class TestEnrichThinProfilesUnknownBillingHandling:
+    """Codex adversarial review of PR #127, round 2 (2026-08-04, HIGH):
+    batch_enrich_profiles() can return `unknown` — a job accepted by
+    Crustdata whose outcome we couldn't confirm (poll/download failure),
+    which may have already billed. This must count separately from
+    `unmatched` and must flip the usage log to 'error', never a clean
+    zero-credit success — the whole point of this pipeline existing is
+    accurate spend tracking."""
+
+    def test_unknown_profile_counted_separately_from_unmatched(self, monkeypatch):
+        thin = _thin_profile("https://www.linkedin.com/in/thin")
+
+        def fake_batch_enrich(urls, api_key=None):
+            return {
+                "by_url": {}, "requested": 1, "fulfilled": 0,
+                "unmatched": [], "rejected": [], "unknown": [urls[0]],
+                "unknown_diagnostics": [{"batch_id": "b1", "reason": "poll_error"}],
+                "credits_used": 0, "batch_ids": ["b1"],
+            }
+
+        monkeypatch.setattr(dashboard, "batch_enrich_profiles", fake_batch_enrich)
+
+        stats = dashboard.enrich_thin_profiles_for_batch([thin], api_key="test-key", db_client=None)
+
+        assert stats["unknown"] == 1
+        assert stats["unmatched"] == 0
+        assert stats["enriched"] == 0
+        # Left as-is — still screenable, not dropped from the caller's list.
+        assert thin["raw_crustdata"]["skills"] == []
+
+    def test_unknown_batch_logs_as_error_not_clean_success(self, monkeypatch):
+        thin = _thin_profile("https://www.linkedin.com/in/thin")
+        tracker = _FakeTracker()
+
+        def fake_batch_enrich(urls, api_key=None):
+            return {
+                "by_url": {}, "requested": 1, "fulfilled": 0,
+                "unmatched": [], "rejected": [], "unknown": [urls[0]],
+                "unknown_diagnostics": [{"batch_id": "b1", "reason": "download_error"}],
+                "credits_used": 0, "batch_ids": ["b1"],
+            }
+
+        monkeypatch.setattr(dashboard, "batch_enrich_profiles", fake_batch_enrich)
+
+        dashboard.enrich_thin_profiles_for_batch([thin], api_key="test-key", db_client=None, tracker=tracker)
+
+        assert len(tracker.calls) == 1
+        assert tracker.calls[0]['status'] == 'error'
+        assert 'unknown' in tracker.calls[0]['error_message'].lower()
+        assert 'b1' in tracker.calls[0]['error_message']
+
+    def test_no_unknown_still_logs_success(self, monkeypatch):
+        thin = _thin_profile("https://www.linkedin.com/in/thin")
+        tracker = _FakeTracker()
+
+        def fake_batch_enrich(urls, api_key=None):
+            return {
+                "by_url": {urls[0]: _flat_enriched(urls[0], "Thin Person")},
+                "requested": 1, "fulfilled": 1, "unmatched": [], "rejected": [],
+                "unknown": [], "unknown_diagnostics": [], "credits_used": 1,
+                "batch_ids": ["b1"],
+            }
+
+        monkeypatch.setattr(dashboard, "batch_enrich_profiles", fake_batch_enrich)
+
+        dashboard.enrich_thin_profiles_for_batch([thin], api_key="test-key", db_client=None, tracker=tracker)
+
+        assert len(tracker.calls) == 1
+        assert tracker.calls[0]['status'] == 'success'
 
 
 class TestSemanticSearchProfilesGetAutoFilled:
