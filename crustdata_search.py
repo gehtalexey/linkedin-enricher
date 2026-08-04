@@ -1283,10 +1283,22 @@ def search_people_db_v2(
 # Distinct from the legacy enrich_batch() in dashboard.py (25 URLs/call,
 # 3 credits/profile, no rate limiter/retry) — do not confuse the two.
 
+# Retry allowlist deliberately narrow: RateLimitError (429) only. This
+# is a POST to Crustdata's PAID /batch/person/enrich — once the request
+# leaves this process, we can no longer tell "rejected" apart from
+# "accepted and started" for anything except a gateway-level 429. A
+# connection loss, a client-side timeout, a genuine 5xx, or an
+# unparseable 2xx body can all happen AFTER Crustdata already accepted
+# and started the job; auto-retrying any of those resubmits the SAME
+# URLs as a SECOND paid batch job (double-charge fix, 2026-08-04). This
+# list is intentionally kept in lockstep with the allowlist in
+# _submit_definitely_never_started() below — anything ambiguous is
+# treated as possibly-paid and left for the caller/human to reconcile,
+# not silently retried.
 @retry_with_backoff(
     max_retries=3,
     base_delay=2.0,
-    retryable_exceptions=(RateLimitError, ServiceUnavailableError, ConnectionError, TimeoutError),
+    retryable_exceptions=(RateLimitError,),
 )
 def submit_batch_enrich(
     linkedin_urls: List[str],

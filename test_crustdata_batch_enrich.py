@@ -19,6 +19,7 @@ import pytest
 
 import gzip
 import json
+import requests
 
 from crustdata_search import (
     submit_batch_enrich,
@@ -134,6 +135,80 @@ class TestSubmitBatchEnrich:
             with pytest.raises(ExternalServiceError) as exc:
                 submit_batch_enrich(["https://www.linkedin.com/in/foo"], api_key="test-key")
             assert exc.value.status_code is None
+
+
+class TestSubmitBatchEnrichNoRetryOnAmbiguousFailure:
+    """Double-charge fix, 2026-08-04: submit_batch_enrich() POSTs to
+    Crustdata's PAID /batch/person/enrich. The @retry_with_backoff
+    decorator on it used to retry on ServiceUnavailableError/
+    ConnectionError/TimeoutError as well as RateLimitError — but a
+    connection loss, a client-side timeout, or a genuine 5xx can all
+    happen AFTER Crustdata already accepted and started the job, so
+    auto-retrying any of them resubmits the SAME URLs as a SECOND paid
+    batch job. The allowlist is now RateLimitError only, matching
+    _submit_definitely_never_started()'s allowlist. These tests assert
+    on the underlying requests.post call count, not just the raised
+    exception type, so a regression that widens the allowlist again
+    would fail here even if the exception classification stayed correct."""
+
+    def test_5xx_response_not_retried_single_post_call(self):
+        from error_handling import ServiceUnavailableError
+
+        with patch("crustdata_search.requests.post") as mock_post:
+            mock_post.return_value = _mock_response(status_code=503, text="upstream down")
+            with pytest.raises(ServiceUnavailableError):
+                submit_batch_enrich(["https://www.linkedin.com/in/foo"], api_key="test-key")
+            assert mock_post.call_count == 1
+
+    def test_connection_error_not_retried_single_post_call(self):
+        """requests.exceptions.ConnectionError during the POST is
+        translated to ServiceUnavailableError — must not be retried,
+        since the connection could have dropped after Crustdata already
+        received and started the job."""
+        from error_handling import ServiceUnavailableError
+
+        with patch("crustdata_search.requests.post") as mock_post:
+            mock_post.side_effect = requests.exceptions.ConnectionError("connection refused")
+            with pytest.raises(ServiceUnavailableError):
+                submit_batch_enrich(["https://www.linkedin.com/in/foo"], api_key="test-key")
+            assert mock_post.call_count == 1
+
+    def test_client_side_timeout_not_retried_single_post_call(self):
+        from error_handling import ExternalServiceError
+
+        with patch("crustdata_search.requests.post") as mock_post:
+            mock_post.side_effect = requests.exceptions.Timeout("timed out")
+            with pytest.raises(ExternalServiceError) as exc:
+                submit_batch_enrich(["https://www.linkedin.com/in/foo"], api_key="test-key")
+            assert exc.value.status_code == 504
+            assert mock_post.call_count == 1
+
+    def test_rate_limit_error_still_retried_until_success(self, monkeypatch):
+        """429 is a genuine gateway-level rejection before any job could
+        start — the one case still safe to auto-retry."""
+        monkeypatch.setattr("error_handling.time.sleep", lambda s: None)
+
+        with patch("crustdata_search.requests.post") as mock_post:
+            mock_post.side_effect = [
+                _mock_response(status_code=429, text="slow down"),
+                _mock_response(status_code=200, json_data={"batch_id": "b1"}),
+            ]
+            batch_id = submit_batch_enrich(["https://www.linkedin.com/in/foo"], api_key="test-key")
+
+        assert batch_id == "b1"
+        assert mock_post.call_count == 2
+
+    def test_rate_limit_error_exhausts_retries_and_raises(self, monkeypatch):
+        from error_handling import RateLimitError
+
+        monkeypatch.setattr("error_handling.time.sleep", lambda s: None)
+
+        with patch("crustdata_search.requests.post") as mock_post:
+            mock_post.return_value = _mock_response(status_code=429, text="slow down")
+            with pytest.raises(RateLimitError):
+                submit_batch_enrich(["https://www.linkedin.com/in/foo"], api_key="test-key")
+            # max_retries=3 -> 1 initial attempt + 3 retries = 4 calls
+            assert mock_post.call_count == 4
 
 
 class TestGetBatchStatus:
