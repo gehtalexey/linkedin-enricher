@@ -176,6 +176,38 @@ class UsageTracker:
             metadata={'requested': requested, 'fulfilled': fulfilled, 'unmatched': requested - fulfilled},
         )
 
+    def log_crustdata_sync_enrich(
+        self,
+        requested: int,
+        fulfilled: int,
+        status: str = 'success',
+        error_message: str = None,
+        response_time_ms: int = None,
+    ) -> Optional[dict]:
+        """Log usage for the synchronous v2025-11-01 enrich endpoint
+        (POST /person/enrich) — same additive pricing as
+        log_crustdata_batch_enrich() (base profile = 1 credit), distinct
+        operation name since this is a single inline call, not an async
+        batch job. Do NOT reuse log_crustdata() for this; it hardcodes the
+        wrong (3 credits/profile, legacy-endpoint) per-profile cost.
+
+        Billed on `fulfilled`, not `requested` — Crustdata's global no-charge-
+        on-no-match policy means an unmatched profile costs nothing.
+        """
+        credits = fulfilled * CRUSTDATA_PRICING_V2_ENRICH['credits_per_profile_base']
+        cost_usd = credits * CRUSTDATA_PRICING['cost_per_credit']
+        return self.log_usage(
+            provider='crustdata',
+            operation='sync_enrich',
+            request_count=1,
+            credits_used=credits,
+            cost_usd=cost_usd,
+            status=status,
+            error_message=error_message,
+            response_time_ms=response_time_ms,
+            metadata={'requested': requested, 'fulfilled': fulfilled, 'unmatched': requested - fulfilled},
+        )
+
     def log_salesql(
         self,
         lookups: int = 1,

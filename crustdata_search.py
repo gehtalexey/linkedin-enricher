@@ -84,6 +84,17 @@ CREDITS_PER_RESULT_V2 = 0.03  # unchanged from legacy persondb/search (3 per 100
 # results.
 CRUSTDATA_BATCH_ENRICH_ENDPOINT = "https://api.crustdata.com/batch/person/enrich"
 CRUSTDATA_BATCH_STATUS_ENDPOINT = "https://api.crustdata.com/batch"  # + f"/{batch_id}"
+
+# Synchronous single-profile enrichment (v2025-11-01) — same additive
+# pricing family as the batch endpoint above (base profile = 1 credit), but
+# answers inline instead of submit/poll/download. Use this for call sites
+# that need exactly one profile right now (e.g. a "re-enrich this URL"
+# button); use the batch endpoint above for anything that can tolerate the
+# poll/download round trip. Crustdata docs cap this endpoint at 25
+# identifiers per call (professional_network_profile_urls OR
+# business_emails, not both — verified against docs.crustdata.com
+# 2026-07-20); sync_enrich_profile() below only ever sends one.
+CRUSTDATA_SYNC_ENRICH_ENDPOINT = "https://api.crustdata.com/person/enrich"
 BATCH_ENRICH_FIELDS = [
     "basic_profile", "experience", "education",
     "skills", "professional_network", "social_handles",
@@ -1361,6 +1372,151 @@ def submit_batch_enrich(
         )
 
 
+def _extract_sync_enrich_record(payload: Any, requested_url: str) -> Optional[Dict[str, Any]]:
+    """Pull the single profile record out of a sync POST /person/enrich
+    response.
+
+    The inner `data` payload shape (basic_profile/experience/education/...)
+    IS verified live — see enrich_profile_to_legacy_shape() and its test
+    coverage, captured against a real /person/enrich response 2026-07-20.
+    What is NOT independently confirmed is the OUTER envelope this specific
+    synchronous endpoint wraps that data in (a plain list? a dict keyed
+    "results"/"profiles"/"data"? a single unwrapped record for a 1-URL
+    request?) — Crustdata's docs don't pin it down as of 2026-08-04, and the
+    batch endpoint's file-download envelope (which IS verified) is a
+    different code path (see _download_batch_results()). This handles every
+    shape used elsewhere by Crustdata's v2025-11-01 API family rather than
+    assuming one, so a documented-but-unverified envelope doesn't hard-fail
+    the call — worst case here is a harmless None (caller reports "not
+    found"), never a mis-billed request, since Crustdata's global
+    no-charge-on-no-result policy means we only pay for records we actually
+    parse out.
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, list):
+        records = payload
+    elif isinstance(payload, dict):
+        records = None
+        for key in ("results", "profiles", "data"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                records = val
+                break
+        if records is None:
+            # No known wrapping key held a list — treat the dict itself as
+            # the (single, unwrapped) record.
+            records = [payload]
+    else:
+        return None
+
+    if not records:
+        return None
+    if len(records) == 1:
+        return records[0]
+
+    # More than one record for a 1-URL request shouldn't happen, but match
+    # by identifier defensively rather than assume ordering.
+    norm_target = normalize_linkedin_url(requested_url)
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        ident = rec.get("original_identifier")
+        if ident == requested_url or (ident and normalize_linkedin_url(ident) == norm_target):
+            return rec
+    return records[0]
+
+
+@retry_with_backoff(
+    max_retries=3,
+    base_delay=2.0,
+    retryable_exceptions=(RateLimitError, ServiceUnavailableError, ConnectionError, TimeoutError),
+)
+def sync_enrich_profile(
+    linkedin_url: str,
+    api_key: str = None,
+    fields: List[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Enrich ONE LinkedIn profile via the synchronous v2025-11-01
+    POST /person/enrich endpoint. Base profile = 1 credit (additive
+    pricing, same family as submit_batch_enrich() above) — for a single
+    profile this skips the async submit/poll/download round trip the batch
+    pipeline needs for volume.
+
+    Returns the same flat legacy-enrich shape as enrich_profile_to_legacy_shape()
+    (via that function), or None if Crustdata had no match for this URL —
+    never raises for a plain no-match, only for transport/HTTP failures
+    (mirrors submit_batch_enrich()'s error handling).
+    """
+    if not linkedin_url or not str(linkedin_url).strip():
+        return None
+    if not api_key:
+        api_key = _load_api_key()
+    limiter = get_rate_limiter('crustdata')
+
+    body = {
+        "professional_network_profile_urls": [linkedin_url],
+        "fields": fields or BATCH_ENRICH_FIELDS,
+    }
+
+    try:
+        limiter.wait_if_needed()
+    except RateLimitExceeded as e:
+        raise RateLimitError("Crustdata", message=str(e))
+
+    try:
+        response = requests.post(
+            CRUSTDATA_SYNC_ENRICH_ENDPOINT,
+            json=body,
+            headers=_v2_headers(api_key),
+            timeout=60,
+        )
+        limiter.record_request()
+
+        if response.status_code == 401:
+            raise AuthenticationError("Crustdata")
+        elif response.status_code == 429:
+            retry_after = response.headers.get('Retry-After')
+            raise RateLimitError(
+                "Crustdata",
+                retry_after=float(retry_after) if retry_after else None
+            )
+        elif response.status_code >= 500:
+            raise ServiceUnavailableError(
+                "Crustdata",
+                status_code=response.status_code,
+                response_body=response.text[:500]
+            )
+        elif response.status_code >= 400:
+            raise ExternalServiceError(
+                "Crustdata",
+                message=f"Sync enrich failed: {response.text[:500]}",
+                status_code=response.status_code,
+                response_body=response.text
+            )
+
+        record = _extract_sync_enrich_record(response.json(), linkedin_url)
+        if not record:
+            return None
+        data = record.get("data") if isinstance(record, dict) and "data" in record else record
+        if not data:
+            return None
+        return enrich_profile_to_legacy_shape(data)
+
+    except requests.exceptions.Timeout:
+        raise ExternalServiceError(
+            "Crustdata",
+            message="Sync enrich request timed out",
+            status_code=504
+        )
+    except requests.exceptions.ConnectionError as e:
+        raise ServiceUnavailableError(
+            "Crustdata",
+            message=f"Connection error: {str(e)[:200]}"
+        )
+
+
 @retry_with_backoff(
     max_retries=3,
     base_delay=2.0,
@@ -2290,6 +2446,7 @@ __all__ = [
     'submit_batch_enrich',
     'get_batch_status',
     'batch_enrich_profiles',
+    'sync_enrich_profile',
     # Normalization
     'normalize_search_result',
     'normalize_search_results_to_df',
