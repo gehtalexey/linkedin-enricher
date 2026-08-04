@@ -78,14 +78,20 @@ class TestSubmitBatchEnrich:
             assert mock_post.call_args.kwargs["json"]["chunk_size"] == 1000
 
     def test_over_10000_urls_raises_without_calling_api(self):
+        """error_handling.ValidationError, not a bare ValueError (Codex
+        review, PR #127, round 4, HIGH) — see
+        TestSubmitBatchEnrichFailureClassification for why bare ValueError
+        can no longer mean "definitely no spend"."""
+        from error_handling import ValidationError
         with patch("crustdata_search.requests.post") as mock_post:
-            with pytest.raises(ValueError):
+            with pytest.raises(ValidationError):
                 submit_batch_enrich(["u"] * 10001, api_key="test-key")
             mock_post.assert_not_called()
 
     def test_empty_list_raises_without_calling_api(self):
+        from error_handling import ValidationError
         with patch("crustdata_search.requests.post") as mock_post:
-            with pytest.raises(ValueError):
+            with pytest.raises(ValidationError):
                 submit_batch_enrich([], api_key="test-key")
             mock_post.assert_not_called()
 
@@ -102,6 +108,32 @@ class TestSubmitBatchEnrich:
             mock_post.return_value = _mock_response(status_code=401)
             with pytest.raises(AuthenticationError):
                 submit_batch_enrich(["https://www.linkedin.com/in/foo"], api_key="bad-key")
+
+    def test_malformed_json_on_2xx_raises_external_service_error_no_status_code(self):
+        """Codex review, PR #127, round 4 (HIGH): a truncated/invalid JSON
+        body on an otherwise-successful response must be wrapped so the
+        caller can tell it apart from a confirmed rejection — no
+        status_code set means _submit_definitely_never_started()
+        correctly treats it as ambiguous, not "never started"."""
+        import json
+        from error_handling import ExternalServiceError
+
+        with patch("crustdata_search.requests.post") as mock_post:
+            resp = _mock_response(status_code=200)
+            resp.json.side_effect = json.JSONDecodeError("Expecting value", "", 0)
+            mock_post.return_value = resp
+            with pytest.raises(ExternalServiceError) as exc:
+                submit_batch_enrich(["https://www.linkedin.com/in/foo"], api_key="test-key")
+            assert exc.value.status_code is None
+
+    def test_2xx_with_no_batch_id_raises_external_service_error_no_status_code(self):
+        from error_handling import ExternalServiceError
+
+        with patch("crustdata_search.requests.post") as mock_post:
+            mock_post.return_value = _mock_response(status_code=200, json_data={"unexpected": "shape"})
+            with pytest.raises(ExternalServiceError) as exc:
+                submit_batch_enrich(["https://www.linkedin.com/in/foo"], api_key="test-key")
+            assert exc.value.status_code is None
 
 
 class TestGetBatchStatus:
@@ -716,8 +748,30 @@ class TestSubmitBatchEnrichFailureClassification:
     `unknown`. Directly exercises the classifier, then confirms
     batch_enrich_profiles() routes each case correctly end-to-end."""
 
-    def test_value_error_is_unambiguous(self):
-        assert _submit_definitely_never_started(ValueError("bad input")) is True
+    def test_validation_error_is_unambiguous(self):
+        """error_handling.ValidationError — submit_batch_enrich()'s own
+        pre-request input validation — is the ONLY ValueError-family
+        exception that's safe to call "never started"."""
+        from error_handling import ValidationError
+        assert _submit_definitely_never_started(ValidationError(field="linkedin_urls", message="bad input")) is True
+
+    def test_bare_value_error_is_ambiguous(self):
+        """Codex review, PR #127, round 4 (HIGH): requests.exceptions.
+        JSONDecodeError — raised by response.json() on a malformed 2xx
+        body, i.e. AFTER Crustdata may have already accepted and started
+        the job — IS a ValueError subclass. A bare ValueError (or
+        anything that happens to subclass it, JSONDecodeError included)
+        must NOT be treated as "definitely never started", or a
+        malformed success response gets silently reported as free."""
+        assert _submit_definitely_never_started(ValueError("bad input")) is False
+
+    def test_json_decode_error_is_ambiguous(self):
+        """The concrete case: json.JSONDecodeError is a real ValueError
+        subclass that response.json() can raise."""
+        import json
+        exc = json.JSONDecodeError("Expecting value", "", 0)
+        assert isinstance(exc, ValueError)
+        assert _submit_definitely_never_started(exc) is False
 
     def test_auth_error_is_unambiguous(self):
         from error_handling import AuthenticationError
@@ -780,13 +834,33 @@ class TestSubmitBatchEnrichFailureClassification:
         assert result["unknown_diagnostics"][0]["reason"] == "submit_error"
 
     def test_end_to_end_unambiguous_submit_failure_lands_in_unmatched(self, monkeypatch):
+        from error_handling import ValidationError
         monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
         url = "https://www.linkedin.com/in/a"
-        with patch("crustdata_search.submit_batch_enrich", side_effect=ValueError("bad input")):
+        with patch("crustdata_search.submit_batch_enrich", side_effect=ValidationError(field="linkedin_urls", message="bad input")):
             result = batch_enrich_profiles([url], api_key="test-key")
 
         assert result["unmatched"] == [url]
         assert result["unknown"] == []
+
+    def test_end_to_end_malformed_json_submit_response_lands_in_unknown(self, monkeypatch):
+        """Codex review, PR #127, round 4 (HIGH) — the exact scenario:
+        submit_batch_enrich() raises a ValueError-family exception
+        (JSONDecodeError, via response.json()) AFTER a successful POST.
+        Must land in `unknown`, not `unmatched`."""
+        import json
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        url = "https://www.linkedin.com/in/a"
+        with patch(
+            "crustdata_search.submit_batch_enrich",
+            side_effect=json.JSONDecodeError("Expecting value", "", 0),
+        ):
+            result = batch_enrich_profiles([url], api_key="test-key")
+
+        assert result["unmatched"] == []
+        assert result["unknown"] == [url]
+        assert result["credits_used"] == 0
+        assert result["unknown_diagnostics"][0]["reason"] == "submit_error"
 
 
 # ---------------------------------------------------------------------------

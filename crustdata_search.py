@@ -43,6 +43,7 @@ from error_handling import (
     RateLimitError,
     AuthenticationError,
     ServiceUnavailableError,
+    ValidationError,
     classify_http_error,
 )
 from normalizers import normalize_linkedin_url, clean_value, is_nan_or_none, pick_current_employer
@@ -1297,14 +1298,25 @@ def submit_batch_enrich(
     Submit up to 10,000 LinkedIn profile URLs to POST /batch/person/enrich.
     Returns the batch_id to poll via get_batch_status().
 
-    Raises ValueError if more than 10,000 URLs are passed — batch_enrich_profiles()
-    is the caller that splits large lists into multiple jobs; call this
-    directly only when you already know you're under the cap.
+    Raises error_handling.ValidationError if more than 10,000 URLs (or
+    zero) are passed — batch_enrich_profiles() is the caller that splits
+    large lists into multiple jobs; call this directly only when you
+    already know you're under the cap. Deliberately ValidationError, NOT
+    a bare ValueError (Codex review, PR #127, round 4, HIGH):
+    requests.exceptions.JSONDecodeError — raised below by response.json()
+    on a malformed/truncated 2xx body — is itself a ValueError subclass,
+    so _submit_definitely_never_started() must be able to tell "we never
+    even sent a request" apart from "we got a response we couldn't
+    parse, after Crustdata may have already accepted and started the
+    job" by exception TYPE, not by ValueError-ness.
     """
     if not linkedin_urls:
-        raise ValueError("submit_batch_enrich requires at least one LinkedIn URL")
+        raise ValidationError(field="linkedin_urls", message="submit_batch_enrich requires at least one LinkedIn URL")
     if len(linkedin_urls) > 10000:
-        raise ValueError(f"submit_batch_enrich accepts at most 10,000 URLs, got {len(linkedin_urls)}")
+        raise ValidationError(
+            field="linkedin_urls",
+            message=f"submit_batch_enrich accepts at most 10,000 URLs, got {len(linkedin_urls)}",
+        )
 
     if not api_key:
         api_key = _load_api_key()
@@ -1352,7 +1364,21 @@ def submit_batch_enrich(
                 response_body=response.text
             )
 
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as e:
+            # Malformed/truncated JSON on an otherwise-2xx response —
+            # Crustdata returned a success status, so it may already have
+            # accepted and started the job before the body got mangled in
+            # transit. No status_code is set here, so
+            # _submit_definitely_never_started() correctly treats this as
+            # ambiguous (unknown), not "never started" (Codex review, PR
+            # #127, round 4, HIGH).
+            raise ExternalServiceError(
+                "Crustdata",
+                message=f"Batch enrich submit returned unparseable JSON: {str(e)[:200]}"
+            )
+
         batch_id = data.get("batch_id") or data.get("id")
         if not batch_id:
             raise ExternalServiceError(
@@ -1930,9 +1956,19 @@ def _submit_definitely_never_started(exc: Exception) -> bool:
     post-acceptance (poll/download) window.
 
     Deliberately a narrow ALLOWLIST, not a broad denylist:
-    - ValueError: submit_batch_enrich()'s own client-side input
-      validation (empty list / over 10,000 URLs) — raised before any
-      network call is even attempted.
+    - error_handling.ValidationError: submit_batch_enrich()'s own
+      client-side input validation (empty list / over 10,000 URLs) —
+      raised before any network call is even attempted. Deliberately
+      NOT a bare ValueError check (Codex review, PR #127, round 4,
+      HIGH): requests.exceptions.JSONDecodeError — raised by
+      response.json() on a malformed/truncated 2xx body, i.e. AFTER
+      Crustdata returned a success status and may already be running the
+      job — is itself a ValueError subclass. A bare `isinstance(exc,
+      ValueError)` check would misclassify that as "definitely never
+      started" and hide real spend, exactly the failure mode this
+      function exists to prevent. ValidationError has no relationship to
+      ValueError, so this allowlist entry can only ever match
+      submit_batch_enrich()'s own pre-request checks.
     - AuthenticationError (401) / RateLimitError (429): the request was
       rejected by Crustdata's gateway before any job processing could
       begin.
@@ -1945,10 +1981,13 @@ def _submit_definitely_never_started(exc: Exception) -> bool:
     Nothing else qualifies — in particular NOT a bare requests.Timeout/
     ConnectionError (translated by submit_batch_enrich() into
     ExternalServiceError(status_code=504) / ServiceUnavailableError
-    respectively), NOT a genuine 5xx response, and NOT the "200 but no
-    batch_id in the response body" case — all of those mean we simply
-    don't know whether Crustdata received and started processing the
-    request.
+    respectively), NOT a genuine 5xx response, NOT malformed/unparseable
+    JSON on a 2xx response, and NOT the "200 but no batch_id in the
+    response body" case — all of those mean we simply don't know whether
+    Crustdata received and started processing the request. Any exception
+    type not explicitly recognized above also falls through to "False"
+    (ambiguous) — fail closed: when we can't prove we didn't pay, assume
+    we might have.
 
     No client-side idempotency/request key is used here because
     Crustdata's v2025-11-01 batch-enrich API doesn't document support
@@ -1958,7 +1997,7 @@ def _submit_definitely_never_started(exc: Exception) -> bool:
     with the `unknown` bucket's diagnostics for manual reconciliation
     rather than an automatic dedupe.
     """
-    if isinstance(exc, ValueError):
+    if isinstance(exc, ValidationError):
         return True
     if isinstance(exc, (AuthenticationError, RateLimitError)):
         return True
