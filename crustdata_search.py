@@ -28,11 +28,13 @@ Usage:
 
 import gzip
 import json
+import re
 import time
 import requests
 import pandas as pd
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
+from urllib.parse import urlparse, unquote
 
 from api_helpers import get_rate_limiter, RateLimitExceeded
 from error_handling import (
@@ -1450,6 +1452,94 @@ def _match_confidence(match: Dict[str, Any]) -> float:
         return 0.0
 
 
+# Allowlisted LinkedIn profile hosts: bare linkedin.com, www.linkedin.com,
+# or a two-letter regional subdomain (il.linkedin.com, fr.linkedin.com,
+# de.linkedin.com, ...). Deliberately an ALLOWLIST, not a loose substring/
+# pattern match — this is a security boundary, not just parsing
+# convenience (Codex review, PR #127, round 3, HIGH). Anchored on both
+# ends so lookalikes like "linkedin.com.evil.co" or "evil-linkedin.com"
+# never match: the whole hostname must equal one of these exact shapes.
+_LINKEDIN_HOST_RE = re.compile(r'^(?:[a-z]{2}\.)?(?:www\.)?linkedin\.com$')
+
+
+def _linkedin_profile_slug(url: Any) -> Optional[Tuple[str, str]]:
+    """Parse a LinkedIn profile URL into (host, slug) — but ONLY if it's
+    on an allowlisted LinkedIn host (see _LINKEDIN_HOST_RE) and has a
+    /in/<slug> path. Returns None for anything else, including lookalike
+    hosts, so callers can't accidentally trust a non-LinkedIn domain.
+
+    The slug is percent-decoded and lowercased for identity comparison —
+    this is a narrower "is this the same public profile" check than
+    normalize_linkedin_url() (db_core/normalizers.py, shared verbatim
+    with Supanova/the autopilots, NOT touched here), which deliberately
+    preserves case for Crustdata-internal obfuscated (ACoAA...) slugs
+    for a different purpose (canonical storage key). This function is
+    only ever used to verify identity, never to build a URL to store.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    raw = url.strip()
+    if not raw:
+        return None
+    if raw.lower().startswith('www.'):
+        raw = 'https://' + raw
+    elif not raw.lower().startswith('http'):
+        raw = 'https://' + raw
+
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return None
+
+    host = (parsed.hostname or '').lower()
+    if not _LINKEDIN_HOST_RE.match(host):
+        return None
+
+    path = parsed.path or ''
+    path_lower = path.lower()
+    marker = '/in/'
+    if marker not in path_lower:
+        return None
+    slug = path[path_lower.index(marker) + len(marker):]
+    slug = slug.split('/')[0]  # drop anything past a further path segment
+    slug = unquote(slug).rstrip('/').lower()
+    if not slug:
+        return None
+    return host, slug
+
+
+def linkedin_profile_identity_matches(url_a: Any, url_b: Any) -> bool:
+    """Compare two LinkedIn profile URLs by IDENTITY (same /in/<slug>
+    profile), not by normalize_linkedin_url()/string equality.
+
+    Why this exists (Codex review, PR #127, round 3, HIGH): normalize_
+    linkedin_url() preserves the hostname, so the SAME public profile
+    legitimately returned as https://il.linkedin.com/in/foo or
+    https://fr.linkedin.com/in/foo (LinkedIn's regional domains) compares
+    UNEQUAL to https://www.linkedin.com/in/foo under straight string/
+    normalize_linkedin_url() equality — the identity gate
+    (_person_data_matches_url() below) would then reject a genuinely
+    correct match just because Crustdata (or a user-pasted CSV row) used
+    a regional host, putting a real paid match into `rejected` and
+    counting it as zero fulfilled. This isn't theoretical for this repo:
+    Israeli-candidate sourcing routinely sees il.linkedin.com URLs.
+
+    Hosts are matched against an explicit ALLOWLIST via
+    _linkedin_profile_slug() rather than a loose pattern — lookalikes
+    like linkedin.com.evil.co or evil-linkedin.com never match, whatever
+    slug they carry.
+
+    Returns True only if both URLs are on an allowlisted LinkedIn host
+    AND resolve to the same /in/<slug>, case-insensitively, ignoring
+    trailing slashes, query strings, and percent-encoding differences.
+    """
+    a = _linkedin_profile_slug(url_a)
+    b = _linkedin_profile_slug(url_b)
+    if a is None or b is None:
+        return False
+    return a[1] == b[1]
+
+
 def _person_data_url(person_data: Dict[str, Any]) -> Optional[str]:
     social_id = (person_data.get("social_handles") or {}).get("professional_network_identifier") or {}
     return social_id.get("profile_url") or None
@@ -1481,22 +1571,28 @@ def _person_data_has_real_content(person_data: Dict[str, Any]) -> bool:
 
 def _person_data_matches_url(person_data: Any, expected_url: str) -> bool:
     """Identity check: does `person_data`'s own LinkedIn URL (via
-    social_handles.professional_network_identifier.profile_url) normalize
-    to the same value as `expected_url`?
+    social_handles.professional_network_identifier.profile_url) resolve
+    to the same PROFILE as `expected_url`?
+
+    Uses linkedin_profile_identity_matches() (host-agnostic across
+    LinkedIn's regional domains) rather than raw normalize_linkedin_url()
+    equality — see that function's docstring for why (Codex review, PR
+    #127, round 3, HIGH: the earlier straight-equality version rejected
+    genuinely correct matches on a regional host as if they were a
+    different person).
 
     This is the identity half of _is_valid_person_data() below, split out
     so it stays testable on its own; use _is_valid_person_data() for the
-    actual identity+content gate.
+    actual identity+content gate. Shared by BOTH the sync
+    (_select_person_data_from_matches) and batch (batch_enrich_profiles)
+    enrich paths, so this fix applies to both automatically.
     """
     if not isinstance(person_data, dict) or not person_data:
-        return False
-    norm_expected = normalize_linkedin_url(expected_url)
-    if not norm_expected:
         return False
     candidate_url = _person_data_url(person_data)
     if not candidate_url:
         return False
-    return normalize_linkedin_url(candidate_url) == norm_expected
+    return linkedin_profile_identity_matches(candidate_url, expected_url)
 
 
 def _is_valid_person_data(person_data: Any, expected_url: str) -> bool:
@@ -1989,6 +2085,19 @@ def batch_enrich_profiles(
         norm = normalize_linkedin_url(u) or u
         canonical_to_inputs.setdefault(norm, []).append(u)
 
+    # Secondary, host-agnostic index (identity slug -> canonical key) so a
+    # returned `original_identifier` on a different LinkedIn regional
+    # host than what we submitted (e.g. we sent il.linkedin.com/in/foo,
+    # Crustdata echoes www.linkedin.com/in/foo) still resolves to the
+    # right canonical group instead of being dropped as "never submitted"
+    # (Codex review, PR #127, round 3, HIGH — same regional-host gap as
+    # _person_data_matches_url(), one step earlier in the pipeline).
+    slug_to_canonical: Dict[str, str] = {}
+    for canon_key in canonical_to_inputs:
+        parsed = _linkedin_profile_slug(canon_key)
+        if parsed:
+            slug_to_canonical.setdefault(parsed[1], canon_key)
+
     # One representative raw string per canonical identity — this is what
     # actually gets billed.
     submit_urls = [inputs[0] for inputs in canonical_to_inputs.values()]
@@ -2094,8 +2203,16 @@ def batch_enrich_profiles(
                 continue
             norm_key = normalize_linkedin_url(identifier) or identifier
             if norm_key not in canonical_to_inputs:
-                # Echoes an identifier we never actually submitted — ignore.
-                continue
+                # Direct match failed — try identity-aware matching before
+                # giving up, in case Crustdata echoed a different regional
+                # host than we submitted for the same profile.
+                parsed_identifier = _linkedin_profile_slug(identifier)
+                fallback_key = slug_to_canonical.get(parsed_identifier[1]) if parsed_identifier else None
+                if fallback_key is None:
+                    # Genuinely echoes an identifier we never submitted —
+                    # ignore.
+                    continue
+                norm_key = fallback_key
 
             if not _is_valid_person_data(data, identifier):
                 rejected_canonical.add(norm_key)
@@ -2830,6 +2947,7 @@ __all__ = [
     'normalize_search_results_to_df',
     'semantic_profile_to_legacy_shape',
     'enrich_profile_to_legacy_shape',
+    'linkedin_profile_identity_matches',
     # Usage tracking
     'log_search_usage',
     # AI expansion

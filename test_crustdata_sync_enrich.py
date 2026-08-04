@@ -162,6 +162,23 @@ class TestSyncEnrichProfileResponseParsing:
         assert flat["linkedin_flagship_url"] == url
         assert flat["title"] == "Engineer"
 
+    def test_regional_host_person_data_still_matches_and_returns_profile(self):
+        """Codex review, PR #127, round 3 (HIGH): we requested a
+        www.linkedin.com URL, but Crustdata's response echoes the
+        person's own profile URL on an il.linkedin.com (regional) host —
+        must still be recognized as the same person, not rejected."""
+        requested_url = "https://www.linkedin.com/in/foo"
+        regional_url = "https://il.linkedin.com/in/foo"
+        with patch("crustdata_search.requests.post") as mock_post:
+            mock_post.return_value = _mock_response(
+                json_data=_real_shape_response(regional_url, name="Israeli Candidate")
+            )
+            flat = sync_enrich_profile(requested_url, api_key="test-key")
+
+        assert flat is not None
+        assert flat["name"] == "Israeli Candidate"
+        assert flat["skills"] == ["Python"]
+
     def test_empty_matches_returns_none(self):
         url = "https://www.linkedin.com/in/ghost"
         with patch("crustdata_search.requests.post") as mock_post:

@@ -482,6 +482,83 @@ class TestBatchEnrichProfilesIdentityValidation:
         assert result["credits_used"] == 1
 
 
+class TestBatchEnrichProfilesRegionalHostIdentity:
+    """Codex adversarial review of PR #127, round 3 (2026-08-04, HIGH):
+    the identity gate compared normalize_linkedin_url() output for exact
+    string equality, which preserves the hostname — so a genuinely
+    correct match returned on a LinkedIn regional domain (il., fr., ...)
+    was rejected as if it were a different person. This matters
+    specifically for this user's Israeli-candidate sourcing workflow.
+    Covers the batch path; test_linkedin_identity_matching.py and
+    test_crustdata_sync_enrich.py cover the shared helper and the sync
+    path respectively."""
+
+    def _record_with_url(self, identifier, data_url, name="Someone"):
+        data = {
+            "basic_profile": {"name": name, "current_title": "Engineer", "headline": "", "summary": ""},
+            "experience": {"employment_details": {"current": [], "past": []}},
+            "education": {"schools": []},
+            "skills": {"professional_network_skills": ["Python"]},
+            "social_handles": {"professional_network_identifier": {"profile_url": data_url}},
+        }
+        return {"original_identifier": identifier, "internal_id": 1, "data": data}
+
+    def test_person_data_on_regional_host_still_counted_fulfilled(self, monkeypatch):
+        """We submitted (and Crustdata echoed back) a www.linkedin.com
+        identifier, but the payload's own claimed URL is on
+        il.linkedin.com — same person, must still be accepted."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        requested_url = "https://www.linkedin.com/in/israeli-candidate"
+        regional_url = "https://il.linkedin.com/in/israeli-candidate"
+        record = self._record_with_url(identifier=requested_url, data_url=regional_url, name="Israeli Candidate")
+
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[record]):
+            result = batch_enrich_profiles([requested_url], api_key="test-key")
+
+        assert result["by_url"][requested_url]["name"] == "Israeli Candidate"
+        assert result["fulfilled"] == 1
+        assert result["rejected"] == []
+        assert result["credits_used"] == 1
+
+    def test_echoed_identifier_on_regional_host_still_resolves_to_submitted_url(self, monkeypatch):
+        """We submitted an il.linkedin.com URL; Crustdata's
+        original_identifier echo (and the payload's own URL) come back
+        on www.linkedin.com — must still resolve to what we submitted,
+        not be dropped as "never requested"."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        submitted_url = "https://il.linkedin.com/in/israeli-candidate"
+        echoed_url = "https://www.linkedin.com/in/israeli-candidate"
+        record = self._record_with_url(identifier=echoed_url, data_url=echoed_url, name="Israeli Candidate")
+
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[record]):
+            result = batch_enrich_profiles([submitted_url], api_key="test-key")
+
+        assert result["by_url"][submitted_url]["name"] == "Israeli Candidate"
+        assert result["fulfilled"] == 1
+        assert result["unmatched"] == []
+
+    def test_lookalike_host_in_payload_still_rejected(self, monkeypatch):
+        """The regional-host fix must not weaken the security boundary —
+        a lookalike domain never counts as a match."""
+        monkeypatch.setattr("crustdata_search.time.sleep", lambda s: None)
+        requested_url = "https://www.linkedin.com/in/foo"
+        evil_url = "https://linkedin.com.evil.co/in/foo"
+        record = self._record_with_url(identifier=requested_url, data_url=evil_url, name="Impostor")
+
+        with patch("crustdata_search.submit_batch_enrich", return_value="batch1"), \
+             patch("crustdata_search.get_batch_status", return_value={"status": "completed"}), \
+             patch("crustdata_search._download_batch_results", return_value=[record]):
+            result = batch_enrich_profiles([requested_url], api_key="test-key")
+
+        assert result["by_url"].get(requested_url) is None
+        assert result["fulfilled"] == 0
+        assert result["rejected"] == [requested_url]
+
+
 class TestStatusFulfilledHint:
     def test_known_key_extracted(self):
         assert _status_fulfilled_hint({"entities_fulfilled": 7}) == 7
