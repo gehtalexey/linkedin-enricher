@@ -8,14 +8,37 @@ a cheap path that doesn't pay for the async batch pipeline's poll/download
 round trip, and doesn't pay the legacy GET /screener/person/enrich's flat
 3-credits/profile rate.
 
-No real network calls — requests.post is mocked throughout. The inner
-`data` -> flat-legacy-shape translation is exercised via
+No real network calls — requests.post is mocked throughout. The response
+envelope fixtures below match the REAL shape confirmed via two live 1-credit
+calls against POST /person/enrich, 2026-08-04:
+
+    [
+      {
+        "match_type": <str>,
+        "matched_on": ...,
+        "matches": [
+          {"confidence_score": <float>, "person_data": {...}},
+          ...
+        ]
+      }
+    ]
+
+(An earlier version of this helper/test file assumed a
+{"original_identifier", "data"} envelope like the batch endpoint's download
+file — that assumption was WRONG for this sync endpoint and would have
+silently broken the "Re-Enrich Profile" button and Find Similar Profiles
+in production: the wrapper has no `basic_profile` at its own level, so the
+old parser fed an empty dict into enrich_profile_to_legacy_shape() every
+time. Fixed same day, before either call site shipped.)
+
+The inner `person_data` -> flat-legacy-shape translation is exercised via
 enrich_profile_to_legacy_shape(), already covered end-to-end in
 test_crustdata_batch_enrich.py against a REAL captured /person/enrich
-response; this file focuses on sync_enrich_profile()'s own request
-construction, header/auth handling, and its defensive parsing of the
-sync endpoint's outer response envelope (NOT independently verified live —
-see _extract_sync_enrich_record()'s docstring).
+`data` payload (same nested shape person_data uses); this file focuses on
+sync_enrich_profile()'s own request construction, header/auth handling, and
+unwrapping the verified real envelope (list -> record -> matches ->
+person_data), including match-ranking when more than one candidate comes
+back.
 """
 
 from unittest.mock import MagicMock, patch
@@ -25,6 +48,7 @@ import pytest
 from crustdata_search import (
     sync_enrich_profile,
     _extract_sync_enrich_record,
+    _select_person_data_from_matches,
     CRUSTDATA_SYNC_ENRICH_ENDPOINT,
     CRUSTDATA_API_VERSION,
     BATCH_ENRICH_FIELDS,
@@ -40,9 +64,10 @@ def _mock_response(status_code=200, json_data=None, text=""):
     return resp
 
 
-def _data_record(url, name="Jane Doe"):
-    """One profile's `data` payload, same nested shape verified live for
-    the batch endpoint (crustdata_search.py's _REAL_ENRICH_RESPONSE)."""
+def _person_data(url, name="Jane Doe"):
+    """One profile's `person_data` payload — same nested shape verified
+    live for the batch endpoint (crustdata_search.py's _REAL_ENRICH_RESPONSE
+    in test_crustdata_batch_enrich.py)."""
     return {
         "basic_profile": {"name": name, "current_title": "Engineer", "headline": "", "summary": "Builds things."},
         "experience": {"employment_details": {"current": [], "past": []}},
@@ -52,10 +77,24 @@ def _data_record(url, name="Jane Doe"):
     }
 
 
+def _real_shape_response(url, name="Jane Doe", confidence_score=0.98, match_type="exact"):
+    """The verified top-level response shape for a single-URL sync enrich
+    call: a list with one {match_type, matched_on, matches} record."""
+    return [
+        {
+            "match_type": match_type,
+            "matched_on": url,
+            "matches": [
+                {"confidence_score": confidence_score, "person_data": _person_data(url, name)},
+            ],
+        }
+    ]
+
+
 class TestSyncEnrichProfileRequest:
     def test_sends_bearer_auth_and_version_header(self):
         with patch("crustdata_search.requests.post") as mock_post:
-            mock_post.return_value = _mock_response(json_data=[{"original_identifier": "u", "data": _data_record("u")}])
+            mock_post.return_value = _mock_response(json_data=_real_shape_response("https://www.linkedin.com/in/foo"))
             sync_enrich_profile("https://www.linkedin.com/in/foo", api_key="test-key")
             headers = mock_post.call_args.kwargs["headers"]
             assert headers["Authorization"] == "Bearer test-key"
@@ -106,58 +145,114 @@ class TestSyncEnrichProfileRequest:
 
 
 class TestSyncEnrichProfileResponseParsing:
-    def test_bare_list_response_returns_flat_shape(self):
+    """Against the VERIFIED real envelope: list -> {match_type, matched_on,
+    matches} -> matches[].person_data."""
+
+    def test_real_shape_returns_correctly_populated_profile(self):
         url = "https://www.linkedin.com/in/foo"
         with patch("crustdata_search.requests.post") as mock_post:
-            mock_post.return_value = _mock_response(
-                json_data=[{"original_identifier": url, "internal_id": 1, "data": _data_record(url)}]
-            )
+            mock_post.return_value = _mock_response(json_data=_real_shape_response(url, name="David Hsu"))
             flat = sync_enrich_profile(url, api_key="test-key")
+
         assert flat is not None
-        assert flat["name"] == "Jane Doe"
+        # Assert on real fields actually coming through, not just "not None"
+        # — a parser that returns {} must fail this test.
+        assert flat["name"] == "David Hsu"
         assert flat["skills"] == ["Python"]
         assert flat["linkedin_flagship_url"] == url
+        assert flat["title"] == "Engineer"
 
-    def test_results_key_wrapped_response_returns_flat_shape(self):
-        url = "https://www.linkedin.com/in/foo"
+    def test_empty_matches_returns_none(self):
+        url = "https://www.linkedin.com/in/ghost"
         with patch("crustdata_search.requests.post") as mock_post:
             mock_post.return_value = _mock_response(
-                json_data={"results": [{"original_identifier": url, "data": _data_record(url)}]}
+                json_data=[{"match_type": "none", "matched_on": url, "matches": []}]
             )
-            flat = sync_enrich_profile(url, api_key="test-key")
-        assert flat["name"] == "Jane Doe"
+            assert sync_enrich_profile(url, api_key="test-key") is None
 
-    def test_single_unwrapped_record_returns_flat_shape(self):
-        """Some v2025-11-01 endpoints answer a 1-item request with a bare
-        record instead of a 1-element list — handle that too."""
-        url = "https://www.linkedin.com/in/foo"
+    def test_missing_matches_key_returns_none(self):
+        url = "https://www.linkedin.com/in/ghost"
         with patch("crustdata_search.requests.post") as mock_post:
             mock_post.return_value = _mock_response(
-                json_data={"original_identifier": url, "data": _data_record(url)}
+                json_data=[{"match_type": "none", "matched_on": url}]
             )
-            flat = sync_enrich_profile(url, api_key="test-key")
-        assert flat["name"] == "Jane Doe"
+            assert sync_enrich_profile(url, api_key="test-key") is None
 
-    def test_empty_list_returns_none(self):
+    def test_empty_top_level_list_returns_none(self):
         with patch("crustdata_search.requests.post") as mock_post:
             mock_post.return_value = _mock_response(json_data=[])
             assert sync_enrich_profile("https://www.linkedin.com/in/ghost", api_key="test-key") is None
 
-    def test_empty_dict_returns_none(self):
+    def test_wrapper_with_no_person_data_anywhere_returns_none_not_half_built(self):
+        """A match entry present but with no usable person_data must never
+        produce a half-built profile — same "genuine no-match" outcome as
+        an empty matches list."""
+        url = "https://www.linkedin.com/in/ghost"
         with patch("crustdata_search.requests.post") as mock_post:
-            mock_post.return_value = _mock_response(json_data={})
-            assert sync_enrich_profile("https://www.linkedin.com/in/ghost", api_key="test-key") is None
+            mock_post.return_value = _mock_response(
+                json_data=[{
+                    "match_type": "none", "matched_on": url,
+                    "matches": [{"confidence_score": 0.1, "person_data": {}}],
+                }]
+            )
+            assert sync_enrich_profile(url, api_key="test-key") is None
+
+    def test_dict_wrapped_top_level_still_tolerated(self):
+        """Defensive-only tolerance for a dict-keyed top level (not observed
+        live, but other v2025-11-01 endpoints in this file use it)."""
+        url = "https://www.linkedin.com/in/foo"
+        with patch("crustdata_search.requests.post") as mock_post:
+            mock_post.return_value = _mock_response(
+                json_data={"results": _real_shape_response(url, name="Wrapped")}
+            )
+            flat = sync_enrich_profile(url, api_key="test-key")
+        assert flat["name"] == "Wrapped"
+
+
+class TestSelectPersonDataFromMatches:
+    def test_higher_confidence_score_wins(self):
+        low = {"confidence_score": 0.4, "person_data": _person_data("https://www.linkedin.com/in/low", "Low")}
+        high = {"confidence_score": 0.9, "person_data": _person_data("https://www.linkedin.com/in/high", "High")}
+        result = _select_person_data_from_matches([low, high], "https://www.linkedin.com/in/high")
+        assert result["basic_profile"]["name"] == "High"
+
+    def test_equal_scores_tie_broken_by_requested_url(self):
+        target_url = "https://www.linkedin.com/in/target"
+        other_url = "https://www.linkedin.com/in/other"
+        a = {"confidence_score": 0.8, "person_data": _person_data(other_url, "Other")}
+        b = {"confidence_score": 0.8, "person_data": _person_data(target_url, "Target")}
+        result = _select_person_data_from_matches([a, b], target_url)
+        assert result["basic_profile"]["name"] == "Target"
+
+    def test_equal_scores_no_url_match_falls_back_to_first(self):
+        a = {"confidence_score": 0.8, "person_data": _person_data("https://www.linkedin.com/in/a", "A")}
+        b = {"confidence_score": 0.8, "person_data": _person_data("https://www.linkedin.com/in/b", "B")}
+        result = _select_person_data_from_matches([a, b], "https://www.linkedin.com/in/nobody")
+        assert result["basic_profile"]["name"] == "A"
+
+    def test_empty_list_returns_none(self):
+        assert _select_person_data_from_matches([], "https://www.linkedin.com/in/x") is None
+
+    def test_none_returns_none(self):
+        assert _select_person_data_from_matches(None, "https://www.linkedin.com/in/x") is None
+
+    def test_entries_without_person_data_are_skipped(self):
+        no_data = {"confidence_score": 0.99}  # missing person_data entirely
+        empty_data = {"confidence_score": 0.99, "person_data": {}}
+        real = {"confidence_score": 0.1, "person_data": _person_data("https://www.linkedin.com/in/real", "Real")}
+        result = _select_person_data_from_matches([no_data, empty_data, real], "https://www.linkedin.com/in/real")
+        assert result["basic_profile"]["name"] == "Real"
 
 
 class TestExtractSyncEnrichRecord:
-    def test_multiple_records_matched_by_original_identifier(self):
+    def test_multiple_records_matched_by_matched_on(self):
         url = "https://www.linkedin.com/in/target"
         payload = [
-            {"original_identifier": "https://www.linkedin.com/in/other", "data": {}},
-            {"original_identifier": url, "data": {"name": "target"}},
+            {"match_type": "exact", "matched_on": "https://www.linkedin.com/in/other", "matches": []},
+            {"match_type": "exact", "matched_on": url, "matches": [{"confidence_score": 1.0, "person_data": {"marker": "target"}}]},
         ]
         record = _extract_sync_enrich_record(payload, url)
-        assert record["data"]["name"] == "target"
+        assert record["matched_on"] == url
 
     def test_none_payload_returns_none(self):
         assert _extract_sync_enrich_record(None, "https://www.linkedin.com/in/x") is None

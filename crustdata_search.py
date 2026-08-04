@@ -1373,24 +1373,38 @@ def submit_batch_enrich(
 
 
 def _extract_sync_enrich_record(payload: Any, requested_url: str) -> Optional[Dict[str, Any]]:
-    """Pull the single profile record out of a sync POST /person/enrich
-    response.
+    """Pull the single per-query record out of a sync POST /person/enrich
+    response — the ``{match_type, matched_on, matches}`` wrapper, NOT the
+    profile itself (see _select_person_data_from_matches() for that step).
 
-    The inner `data` payload shape (basic_profile/experience/education/...)
-    IS verified live — see enrich_profile_to_legacy_shape() and its test
-    coverage, captured against a real /person/enrich response 2026-07-20.
-    What is NOT independently confirmed is the OUTER envelope this specific
-    synchronous endpoint wraps that data in (a plain list? a dict keyed
-    "results"/"profiles"/"data"? a single unwrapped record for a 1-URL
-    request?) — Crustdata's docs don't pin it down as of 2026-08-04, and the
-    batch endpoint's file-download envelope (which IS verified) is a
-    different code path (see _download_batch_results()). This handles every
-    shape used elsewhere by Crustdata's v2025-11-01 API family rather than
-    assuming one, so a documented-but-unverified envelope doesn't hard-fail
-    the call — worst case here is a harmless None (caller reports "not
-    found"), never a mis-billed request, since Crustdata's global
-    no-charge-on-no-result policy means we only pay for records we actually
-    parse out.
+    VERIFIED LIVE 2026-08-04 (two real 1-credit calls against
+    POST /person/enrich): the top-level response is a plain LIST, one entry
+    per queried identifier:
+
+        [
+          {
+            "match_type": <str>,
+            "matched_on": ...,
+            "matches": [
+              {"confidence_score": <float>, "person_data": {...}},
+              ...
+            ]
+          }
+        ]
+
+    ``person_data`` is what carries basic_profile/experience/education/
+    skills/professional_network/social_handles — the shape
+    enrich_profile_to_legacy_shape() expects (that inner shape was already
+    verified separately, 2026-07-20, against the batch endpoint's download
+    file — same nested structure).
+
+    A dict-wrapped top level (keyed "results"/"profiles"/"data") is also
+    tolerated here even though it hasn't been observed live, since other
+    v2025-11-01 endpoints in this file use that shape and Crustdata's API
+    isn't perfectly consistent call to call — worst case a wrong guess here
+    is a harmless None (caller reports "not found"), never a mis-billed
+    request, since Crustdata's global no-charge-on-no-result policy means
+    we only pay for records we actually parse out.
     """
     if payload is None:
         return None
@@ -1410,21 +1424,66 @@ def _extract_sync_enrich_record(payload: Any, requested_url: str) -> Optional[Di
     else:
         return None
 
+    records = [r for r in records if isinstance(r, dict)]
     if not records:
         return None
     if len(records) == 1:
         return records[0]
 
-    # More than one record for a 1-URL request shouldn't happen, but match
-    # by identifier defensively rather than assume ordering.
+    # More than one top-level record for a 1-URL request shouldn't happen,
+    # but match by `matched_on` (the verified shape's echo of the query)
+    # defensively rather than assume ordering.
     norm_target = normalize_linkedin_url(requested_url)
     for rec in records:
-        if not isinstance(rec, dict):
-            continue
-        ident = rec.get("original_identifier")
-        if ident == requested_url or (ident and normalize_linkedin_url(ident) == norm_target):
+        matched_on = rec.get("matched_on")
+        if matched_on == requested_url or (matched_on and normalize_linkedin_url(str(matched_on)) == norm_target):
             return rec
     return records[0]
+
+
+def _match_confidence(match: Dict[str, Any]) -> float:
+    """Coerce a `matches[]` entry's confidence_score to a comparable float —
+    defensively, since its exact numeric type/range isn't pinned in docs."""
+    try:
+        return float(match.get("confidence_score"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _select_person_data_from_matches(matches: Any, requested_url: str) -> Optional[Dict[str, Any]]:
+    """Pick the right `person_data` dict out of a sync-enrich record's
+    `matches` list (verified shape — see _extract_sync_enrich_record()).
+
+    Ranking: highest confidence_score wins; ties are broken by matching the
+    candidate's own LinkedIn URL (social_handles.professional_network_identifier
+    .profile_url) against the URL we requested. Returns None for a missing/
+    empty `matches` list, or when no entry carries a non-empty `person_data`
+    — a genuine no-match, never a half-built profile.
+    """
+    if not isinstance(matches, list) or not matches:
+        return None
+
+    candidates = [
+        m for m in matches
+        if isinstance(m, dict) and isinstance(m.get("person_data"), dict) and m["person_data"]
+    ]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]["person_data"]
+
+    max_score = max(_match_confidence(m) for m in candidates)
+    top = [m for m in candidates if _match_confidence(m) == max_score]
+    if len(top) == 1:
+        return top[0]["person_data"]
+
+    norm_target = normalize_linkedin_url(requested_url)
+    for m in top:
+        social_id = (m["person_data"].get("social_handles") or {}).get("professional_network_identifier") or {}
+        candidate_url = social_id.get("profile_url")
+        if candidate_url and normalize_linkedin_url(candidate_url) == norm_target:
+            return m["person_data"]
+    return top[0]["person_data"]
 
 
 @retry_with_backoff(
@@ -1448,6 +1507,11 @@ def sync_enrich_profile(
     (via that function), or None if Crustdata had no match for this URL —
     never raises for a plain no-match, only for transport/HTTP failures
     (mirrors submit_batch_enrich()'s error handling).
+
+    Response unwrap (VERIFIED live 2026-08-04 — see
+    _extract_sync_enrich_record()'s docstring for the full shape): top-level
+    list -> per-query {match_type, matched_on, matches} record -> matches[]
+    -> best-scoring match's person_data -> enrich_profile_to_legacy_shape().
     """
     if not linkedin_url or not str(linkedin_url).strip():
         return None
@@ -1499,10 +1563,10 @@ def sync_enrich_profile(
         record = _extract_sync_enrich_record(response.json(), linkedin_url)
         if not record:
             return None
-        data = record.get("data") if isinstance(record, dict) and "data" in record else record
-        if not data:
+        person_data = _select_person_data_from_matches(record.get("matches"), linkedin_url)
+        if not person_data:
             return None
-        return enrich_profile_to_legacy_shape(data)
+        return enrich_profile_to_legacy_shape(person_data)
 
     except requests.exceptions.Timeout:
         raise ExternalServiceError(
