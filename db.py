@@ -2729,7 +2729,12 @@ def get_usage_logs(client: SupabaseClient, provider: str = None, days: int = Non
             params['offset'] = offset
 
         url = f"{client.url}/rest/v1/api_usage_logs"
-        response = requests.get(url, headers=client.headers, params=params, timeout=30)
+        # A GET -- retried unconditionally, same as select()/count(). This
+        # function's `except` below turns any failure into an empty list, so
+        # without the retry a one-second blip silently renders an empty usage
+        # table as if there were no usage.
+        response = _request_with_retry('GET', url, what='/api_usage_logs',
+                                       headers=client.headers, params=params, timeout=30)
         response.raise_for_status()
         return response.json() if response.text else []
     except Exception as e:
@@ -3000,7 +3005,11 @@ def get_search_history(client: SupabaseClient, agent_id: str = None) -> list:
         if agent_id:
             params['agent_id'] = f'eq.{agent_id}'
         url = f"{client.url}/rest/v1/search_history"
-        response = requests.get(url, headers=client.headers, params=params, timeout=30)
+        # A GET -- retried unconditionally, same as select()/count(). As with
+        # get_usage_logs above, the `except` below would otherwise turn a
+        # transient blip into "no search history".
+        response = _request_with_retry('GET', url, what='/search_history',
+                                       headers=client.headers, params=params, timeout=30)
         response.raise_for_status()
         return response.json() if response.text else []
     except Exception as e:

@@ -124,6 +124,37 @@ def test_count_retries_too(monkeypatch, slept):
     assert len(calls) == 2
 
 
+def test_get_usage_logs_retries(monkeypatch, slept):
+    """Codex round 1 [P2]: this module-level read called requests.get directly
+    and so bypassed the layer. It matters more than most, because its own
+    `except` turns any failure into an empty list -- a one-second blip would
+    render an empty usage table as if there had been no usage."""
+    calls = _script(monkeypatch, [_ssl_drop(), _FakeResponse(200, [{'id': 7}])])
+    assert sx_db.get_usage_logs(_client()) == [{'id': 7}]
+    assert len(calls) == 2
+
+
+def test_get_search_history_retries(monkeypatch, slept):
+    """Same [P2], same swallow-into-empty-list shape."""
+    calls = _script(monkeypatch, [_read_timeout(), _FakeResponse(200, [{'id': 9}])])
+    assert sx_db.get_search_history(_client()) == [{'id': 9}]
+    assert len(calls) == 2
+
+
+def test_every_supabase_read_in_this_module_goes_through_the_retry_helper():
+    """Structural guard so a NEW read added later cannot quietly bypass the
+    layer the way these two did. Writes are exempt on purpose -- they must not
+    replay (see the block comment in db.py)."""
+    import inspect
+    src = inspect.getsource(sx_db)
+    stray = [
+        line.strip()
+        for line in src.splitlines()
+        if 'requests.get(' in line and not line.strip().startswith('#')
+    ]
+    assert stray == [], f"read(s) bypassing _request_with_retry: {stray}"
+
+
 def test_the_attempt_budget_is_three_and_then_it_re_raises(monkeypatch, slept):
     calls = _script(monkeypatch, [_ssl_drop(), _ssl_drop(), _ssl_drop()])
     with pytest.raises(requests.exceptions.SSLError):
