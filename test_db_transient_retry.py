@@ -141,6 +141,85 @@ def test_get_search_history_retries(monkeypatch, slept):
     assert len(calls) == 2
 
 
+def test_the_read_only_rpcs_retry_even_though_they_are_posts(monkeypatch, slept):
+    """Codex round 2 [P2]. PostgREST exposes read-only Postgres functions over
+    POST, so "POST means write" is not true here. These three are read-only --
+    verified against their migrations, not their names -- so a replay cannot
+    change server state, and without the retry one blip silently truncated a
+    search or skipped a whole matching batch."""
+    calls = _script(monkeypatch, [_ssl_drop(), _FakeResponse(200, [{'linkedin_url': 'u'}])])
+    assert sx_db.search_profiles_fulltext(_client(), 'python', limit=10)
+    assert len(calls) == 2
+
+
+def test_the_embedding_rpc_retries(monkeypatch, slept):
+    calls = _script(monkeypatch, [_ssl_drop(), _FakeResponse(200, [{'linkedin_url': 'u'}])])
+    sx_db.find_similar_profiles_rpc(_client(), [0.0] * 1536)
+    assert len(calls) == 2
+
+
+def test_the_embedding_rpc_keeps_its_error_contract_through_the_retries(monkeypatch, slept):
+    """Retrying must not change what this function raises: once the budget is
+    spent the helper re-raises the same requests exception, which this
+    function's own handler turns into SimilarityRPCError. Asserting the
+    attempt count too, so this cannot pass with the retry removed."""
+    calls = _script(monkeypatch, [_ssl_drop()] * 3)
+    with pytest.raises(sx_db.SimilarityRPCError):
+        sx_db.find_similar_profiles_rpc(_client(), [0.0] * 1536)
+    assert len(calls) == 3
+
+
+def test_a_4xx_from_the_embedding_rpc_is_not_retried_and_still_raises(monkeypatch, slept):
+    calls = _script(monkeypatch, [_FakeResponse(400, text='column does not exist')])
+    with pytest.raises(sx_db.SimilarityRPCError):
+        sx_db.find_similar_profiles_rpc(_client(), [0.0] * 1536)
+    assert len(calls) == 1
+
+
+def test_a_404_on_the_exact_match_rpc_still_reaches_the_fallback(monkeypatch, slept):
+    """404 is not in the retryable set, so the helper hands it straight back
+    and the exact -> fuzzy fallback branch still sees it on attempt one."""
+    calls = _script(monkeypatch, [
+        _FakeResponse(404),                       # exact function missing
+        _FakeResponse(200, []),                   # fuzzy fallback answers
+    ])
+    sx_db.match_profiles_by_urls_rpc(_client(), ['https://linkedin.com/in/x'])
+    assert len(calls) == 2
+    assert 'match_profiles_by_urls_exact' in calls[0]['url']
+    assert calls[1]['url'].endswith('/rpc/match_profiles_by_urls')
+
+
+def test_generic_writes_still_do_not_retry_after_the_rpc_change(monkeypatch, slept):
+    """The read-only RPCs above are an explicit, verified exception. The
+    generic write paths -- upsert, upsert_batch and the arbitrary-function
+    rpc() -- must stay on one attempt: their idempotency depends on the body,
+    which this layer cannot know.
+
+    These three call requests.post directly rather than requests.request, so
+    the post is patched here as well. That difference is itself the point: if
+    one of them were ever routed through the helper, it would show up as a
+    second attempt below."""
+    posts = []
+
+    def fake_post(url, **kwargs):
+        posts.append(url)
+        raise _ssl_drop()
+
+    monkeypatch.setattr(sx_db.requests, 'post', fake_post)
+    monkeypatch.setattr(sx_db.requests, 'request', fake_post)
+
+    for call in (
+        lambda: _client().upsert('profiles', {'linkedin_url': 'x'}),
+        lambda: _client().upsert_batch('profiles', [{'linkedin_url': 'x'}]),
+        lambda: _client().rpc('some_unknown_function', {}),
+    ):
+        posts.clear()
+        with pytest.raises(requests.exceptions.SSLError):
+            call()
+        assert len(posts) == 1, f"expected exactly one attempt, got {len(posts)}"
+    assert slept == []
+
+
 def test_every_supabase_read_in_this_module_goes_through_the_retry_helper():
     """Structural guard so a NEW read added later cannot quietly bypass the
     layer the way these two did. Writes are exempt on purpose -- they must not

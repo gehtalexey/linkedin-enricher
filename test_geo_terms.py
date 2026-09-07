@@ -224,11 +224,15 @@ def test_rpc_includes_term_groups_in_payload(monkeypatch):
         def json(self):
             return []
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    # Patches requests.request, not requests.post: find_similar_profiles_rpc
+    # routes through db._request_with_retry (so a transient blip on this
+    # read-only RPC no longer loses the result), and that helper calls
+    # requests.request, whose first positional argument is the method.
+    def fake_request(method, url, headers=None, json=None, timeout=None):
         captured["json"] = json
         return FakeResponse()
 
-    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(requests, "request", fake_request)
 
     client = SimpleNamespace(url="https://fake.supabase.co", headers={})
     db.find_similar_profiles_rpc(
@@ -251,9 +255,10 @@ def test_rpc_defaults_term_groups_to_empty_lists(monkeypatch):
         def json(self):
             return []
 
+    # See the note in the test above: requests.request, method first.
     monkeypatch.setattr(
-        requests, "post",
-        lambda url, headers=None, json=None, timeout=None: (
+        requests, "request",
+        lambda method, url, headers=None, json=None, timeout=None: (
             captured.__setitem__("json", json) or FakeResponse()
         ),
     )

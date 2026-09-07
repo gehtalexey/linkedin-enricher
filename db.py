@@ -1683,19 +1683,35 @@ def match_profiles_by_urls_rpc(
 
             # Use exact matching (safer - no name reversal or hyphen removal)
             # Falls back to fuzzy matching if exact function doesn't exist
-            response = requests.post(
-                f"{client.url}/rest/v1/rpc/match_profiles_by_urls_exact",
+            #
+            # Retried despite being a POST: these two RPCs are READ-ONLY, so a
+            # replay cannot change server state. Verified against their own
+            # definitions, not assumed from their names --
+            # migrations/015_exact_url_matching.sql and
+            # migrations/013_match_profiles_by_urls.sql contain no INSERT,
+            # UPDATE, DELETE or TRUNCATE. This is the ONLY reason a POST is
+            # allowed through the helper; anything whose read-only-ness is not
+            # provable from its migration stays on a bare requests.post.
+            # Without this, one transient blip silently skipped a whole
+            # matching batch -- and the caller reads that as "these profiles
+            # are not in the database" (Codex round 2, P2).
+            response = _request_with_retry(
+                'POST', f"{client.url}/rest/v1/rpc/match_profiles_by_urls_exact",
+                what='/rpc/match_profiles_by_urls_exact',
                 headers=client.headers,
                 json=payload,
-                timeout=60  # Longer timeout for large batches
+                timeout=60,  # Longer timeout for large batches
             )
-            # If exact function doesn't exist, fall back to original
+            # If exact function doesn't exist, fall back to original. 404 is
+            # not in _RETRY_STATUS_CODES, so the helper hands it straight back
+            # and this branch still sees it on the first attempt.
             if response.status_code == 404:
-                response = requests.post(
-                    f"{client.url}/rest/v1/rpc/match_profiles_by_urls",
+                response = _request_with_retry(
+                    'POST', f"{client.url}/rest/v1/rpc/match_profiles_by_urls",
+                    what='/rpc/match_profiles_by_urls',
                     headers=client.headers,
                     json=payload,
-                    timeout=60
+                    timeout=60,
                 )
             response.raise_for_status()
             batch_results = response.json()
@@ -1888,11 +1904,17 @@ def search_profiles_fulltext(client: SupabaseClient, query: str, limit: int = 50
             remaining = limit - len(all_results)
             batch_size = min(page_size, remaining)
 
-            response = requests.post(
-                f"{client.url}/rest/v1/rpc/search_profiles_text",
+            # Retried despite being a POST: search_profiles_text is READ-ONLY
+            # -- migrations/012_fulltext_search_pagination.sql defines it as a
+            # bare `SELECT ... FROM profiles`, so a replay cannot change server
+            # state. Without this, a transient blip on one page silently
+            # truncated the search results (Codex round 2, P2).
+            response = _request_with_retry(
+                'POST', f"{client.url}/rest/v1/rpc/search_profiles_text",
+                what='/rpc/search_profiles_text',
                 headers=client.headers,
                 json={"query": query, "p_limit": batch_size, "p_offset": offset},
-                timeout=30
+                timeout=30,
             )
             response.raise_for_status()
             batch = response.json()
@@ -3389,8 +3411,21 @@ def find_similar_profiles_rpc(
     "RPC succeeded, zero matches" case.
     """
     try:
-        response = requests.post(
-            f"{client.url}/rest/v1/rpc/match_profiles_by_embedding",
+        # Retried despite being a POST: match_profiles_by_embedding is
+        # READ-ONLY -- migrations/021_similar_profiles_location_filter.sql
+        # defines it as a bare `SELECT ... FROM profiles p`, so a replay
+        # cannot change server state. Codex round 2 named two such RPCs "for
+        # example"; this is the same case and is routed with them rather than
+        # left as the one inconsistent read.
+        #
+        # The error contract below is unchanged. The helper re-raises the same
+        # requests exception once its budget is spent, so the
+        # `except requests.RequestException` still fires; and a >= 400 status
+        # is handed straight back, so the SimilarityRPCError branch still sees
+        # it (429/5xx simply get retried first).
+        response = _request_with_retry(
+            'POST', f"{client.url}/rest/v1/rpc/match_profiles_by_embedding",
+            what='/rpc/match_profiles_by_embedding',
             headers=client.headers,
             json={
                 "query_embedding": query_embedding,
