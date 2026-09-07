@@ -9,6 +9,9 @@ import os
 import json
 import re
 import hashlib
+import random
+import sys
+import time
 import requests
 from datetime import datetime, timedelta
 from typing import Optional
@@ -19,6 +22,211 @@ from normalizers import normalize_linkedin_url, pick_current_employer, _parse_st
 
 # Refresh threshold for re-enriching stale profiles
 ENRICHMENT_REFRESH_MONTHS = 3
+
+
+# ===========================================================================
+# Transient-failure retry for Supabase HTTP calls
+# ===========================================================================
+# MIRROR OF agent-kalamata's core/db.py. That project and this one share ONE
+# Supabase database (see CLAUDE.md's shared-database rule), and this file is
+# the canonical one the others were ported from -- so the retry layer has to
+# behave identically here, not merely similarly. Change one, change both.
+#
+# WHY IT EXISTS: every `requests` call in this module is a single attempt with
+# no retry, so ONE dropped TLS connection loses whatever that call was doing.
+# On 2026-09-07 that cost agent-kalamata a whole run: a job that had ALREADY
+# finished its real work (4 openers written, 4 leads pushed) failed to persist
+# its own completion --
+#
+#   HTTPSConnectionPool(host='...supabase.co', port=443): Max retries exceeded
+#   (Caused by SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING]
+#   EOF occurred in violation of protocol (_ssl.c:1077)')))
+#
+# -- and the caller's `except Exception` swallowed it. One 0.5s retry would
+# have prevented all of it. This module is exposed to exactly the same blip.
+#
+# WHY NOT error_handling.retry_with_backoff, which this repo already has:
+# it cannot do this job, for three checked reasons, not stylistic ones.
+#   1. It only catches exceptions, never inspects a Response, so it cannot
+#      retry a 429/503. This module calls raise_for_status() AFTER the
+#      request, turning a 500 into requests.exceptions.HTTPError -- and
+#      adding HTTPError to its retryable set would wrongly retry every 4xx.
+#   2. Its default retryable_exceptions are the BUILTIN ConnectionError and
+#      TimeoutError. requests.exceptions.ConnectionError does not subclass
+#      the builtin (verified: its MRO is ConnectionError -> RequestException
+#      -> OSError), so the decorator would not even catch the SSLEOFError
+#      above -- the exact failure this layer exists for.
+#   3. It decorates a whole function, so it cannot express "reads retry,
+#      writes only when the call site opts in", nor cap a retry's own
+#      `timeout=` to the budget left.
+# It stays the right tool for the API-client call sites it already serves.
+#
+# WHAT IS RETRIED, AND NOTHING ELSE:
+#   * Transport failures -- connection reset, TLS drop, read/connect timeout
+#     (requests raises SSLError as a subclass of ConnectionError).
+#   * 429 and 5xx responses.
+#
+# WHAT IS NEVER RETRIED: a 4xx that is a real logical answer. The retryable
+# set is an explicit allowlist, never "anything >= 400".
+#
+# The helper can only ever TRY AGAIN. On its final attempt it hands back
+# exactly what a single attempt hands back today: the same Response object
+# (whatever its status -- the caller keeps its own status handling), or the
+# same re-raised exception. It never converts one outcome into another.
+#
+# READS vs WRITES -- why writes are opt-in:
+#   Reads are GETs. Replaying one cannot change server state, so they retry
+#   unconditionally. Writes default to OFF and are opted in per call site via
+#   `retry_transient=True`, because a TLS drop while READING a response is
+#   indistinguishable from one while SENDING the request -- the write may
+#   already have been applied server-side. A replay is only safe when the
+#   statement is idempotent AND the caller reads no meaning into an empty
+#   result. TODAY NO CALL SITE IN THIS REPO OPTS IN, deliberately: the write
+#   that needed it in agent-kalamata is that project's job-completion PATCH
+#   (pipeline_api/jobs.py _finish_job), and this repo has no durable job
+#   table and no equivalent write. insert() would duplicate a row on replay;
+#   upsert()/upsert_batch()/rpc() depend on the body for idempotency. The
+#   keyword exists so the two files keep the same shape and so a future call
+#   site can opt in without re-deriving any of this.
+
+_RETRY_MAX_ATTEMPTS = 3            # 1 initial attempt + at most 2 retries
+_RETRY_BASE_DELAY_SECONDS = 0.5
+_RETRY_MAX_DELAY_SECONDS = 4.0
+# Budget for the RETRYING this helper adds -- its sleeps and its extra
+# attempts. Read that scope literally; it is not a hard wall around the whole
+# call.
+#
+# WHAT IT DOES BOUND: the work this layer adds on top of one plain request.
+# It is enforced in two places, because checking it only before sleeping is
+# not enough: a 90s read started just under the deadline would run 90s past
+# it. So a retry is ALSO refused before it starts, and its per-attempt
+# `timeout=` is capped to the time actually left.
+#
+# WHAT IT DOES NOT BOUND: any single attempt's own duration. `requests`'
+# `timeout=` is per-socket-operation, not a whole-call stopwatch -- it resets
+# every time bytes arrive -- so a peer that dribbles a response can keep ONE
+# attempt alive past this number, and no arrangement of these constants can
+# stop it. That is not a regression this layer introduces: a plain
+# requests.request(..., timeout=90) has exactly the same property today.
+# Truly bounding it needs a cancellable worker outside `requests`, which
+# cannot be done safely in-thread in Python (a future.result(timeout=...)
+# returns to the caller but does not cancel the request, leaking the thread
+# and its socket).
+#
+# The FIRST attempt is never touched -- it keeps the caller's own timeout
+# (90s on _request, 30s on count), so a call that succeeds or fails first
+# time behaves exactly as it did before this layer existed.
+_RETRY_DEADLINE_SECONDS = 120.0
+# Don't start a retry we cannot give a fair chance -- below this much budget
+# left, stop and report the failure we already have instead of burning a
+# request on a near-zero timeout.
+_RETRY_MIN_ATTEMPT_SECONDS = 5.0
+_RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+_RETRYABLE_EXCEPTIONS = (
+    requests.exceptions.ConnectionError,       # incl. SSLError, ConnectTimeout, ProxyError
+    requests.exceptions.Timeout,               # incl. ReadTimeout
+    requests.exceptions.ChunkedEncodingError,  # response truncated mid-stream
+)
+
+
+def _retry_after_seconds(response) -> Optional[float]:
+    """Parse a `Retry-After` header holding delta-seconds, if present and
+    usable. The HTTP-date form is ignored on purpose -- the backoff below is
+    already correct without it, and a malformed or absurd value must never be
+    allowed to stretch the wait."""
+    if response is None:
+        return None
+    try:
+        raw = response.headers.get('Retry-After')
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _retry_delay_seconds(attempt: int, response=None) -> float:
+    """Exponential backoff with jitter, capped at _RETRY_MAX_DELAY_SECONDS.
+
+    Jitter matters here: several callers hit one Supabase project at once, so
+    an un-jittered backoff would march them all back in lockstep and re-create
+    the burst that triggered a 429. A server-supplied Retry-After raises the
+    floor but is still capped, so a mistaken header can never stall a run.
+    """
+    delay = min(_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+                _RETRY_MAX_DELAY_SECONDS)
+    retry_after = _retry_after_seconds(response)
+    if retry_after is not None:
+        delay = max(delay, min(retry_after, _RETRY_MAX_DELAY_SECONDS))
+    return delay + random.uniform(0.0, 0.25 * delay)
+
+
+def _timeout_capped_to(kwargs: dict, remaining: float) -> dict:
+    """Return `kwargs` with its numeric `timeout` lowered to `remaining` when
+    that is tighter. Returns the SAME dict object when nothing needs changing,
+    so the common path allocates nothing. A tuple timeout (requests'
+    (connect, read) form) is left alone -- nothing in this module uses one,
+    and silently reshaping it would be worse than leaving the budget loose.
+    """
+    timeout = kwargs.get('timeout')
+    if not isinstance(timeout, (int, float)) or timeout <= remaining:
+        return kwargs
+    capped = dict(kwargs)
+    capped['timeout'] = remaining
+    return capped
+
+
+def _request_with_retry(method: str, url: str, *, what: str = None, **kwargs):
+    """Perform ONE logical Supabase HTTP call, retrying only transient
+    failures (see the block comment above for the full contract).
+
+    Returns the final `requests.Response` regardless of its status code, or
+    re-raises the last transport exception once the attempt or deadline
+    budget is spent. Callers keep their own existing status handling, so a
+    caller cannot tell a first-attempt success from a retried one.
+    """
+    deadline = time.monotonic() + _RETRY_DEADLINE_SECONDS
+    last_exc = None
+    response = None
+    for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
+        attempt_kwargs = kwargs
+        if attempt > 1:
+            # Checked BEFORE the attempt, not only before the sleep, so an
+            # attempt cannot start inside the budget and finish far outside it.
+            remaining = deadline - time.monotonic()
+            if remaining < _RETRY_MIN_ATTEMPT_SECONDS:
+                break
+            attempt_kwargs = _timeout_capped_to(kwargs, remaining)
+        last_exc = None
+        response = None
+        try:
+            response = requests.request(method, url, **attempt_kwargs)
+        except _RETRYABLE_EXCEPTIONS as exc:
+            last_exc = exc
+        if last_exc is None and response.status_code not in _RETRY_STATUS_CODES:
+            return response
+        if attempt >= _RETRY_MAX_ATTEMPTS:
+            break
+        delay = _retry_delay_seconds(attempt, response)
+        if time.monotonic() + delay >= deadline:
+            break
+        reason = (f"{type(last_exc).__name__}: {last_exc}" if last_exc is not None
+                  else f"HTTP {response.status_code}")
+        # Only the endpoint is logged -- never headers (which carry the
+        # service key) and never the query string (which carries filter
+        # values such as candidate LinkedIn URLs).
+        print(f"[db] transient failure on {method} {what or url} "
+              f"(attempt {attempt}/{_RETRY_MAX_ATTEMPTS}): {reason} -- "
+              f"retrying in {delay:.1f}s", file=sys.stderr)
+        time.sleep(delay)
+
+    if last_exc is not None:
+        raise last_exc
+    return response
 
 SCREENING_COLUMNS = (
     'screening_score',
@@ -63,17 +271,27 @@ class SupabaseClient:
             'Prefer': 'return=representation'
         }
 
-    def _request(self, method: str, endpoint: str, params: dict = None, json_data: dict = None) -> dict:
-        """Make a request to Supabase REST API."""
+    def _request(self, method: str, endpoint: str, params: dict = None, json_data: dict = None,
+                 *, retry_transient: bool = False) -> dict:
+        """Make a request to Supabase REST API.
+
+        Transient-failure retry (see the block comment at the top of this
+        file). A GET retries unconditionally -- it is a pure read, and select()
+        reaches this method for every page it fetches, so replaying one can
+        never change server state. Anything else is a write and does NOT retry
+        unless the call site passes `retry_transient=True`, which no call site
+        in this repo does yet. In particular insert() lands here as a POST and
+        must never replay, or it duplicates the row.
+
+        `retry_transient` is keyword-only so no existing positional caller can
+        turn it on by accident.
+        """
         url = f"{self.url}/rest/v1/{endpoint}"
-        response = requests.request(
-            method,
-            url,
-            headers=self.headers,
-            params=params,
-            json=json_data,
-            timeout=90
-        )
+        kwargs = dict(headers=self.headers, params=params, json=json_data, timeout=90)
+        if method.upper() == 'GET' or retry_transient:
+            response = _request_with_retry(method, url, what=f"/{endpoint}", **kwargs)
+        else:
+            response = requests.request(method, url, **kwargs)
         response.raise_for_status()
         if response.text:
             return response.json()
@@ -233,12 +451,21 @@ class SupabaseClient:
             return response.json()
         return None
 
-    def update(self, table: str, data: dict, filters: dict) -> list:
-        """Update rows matching filters."""
+    def update(self, table: str, data: dict, filters: dict,
+               *, retry_transient: bool = False) -> list:
+        """Update rows matching filters.
+
+        `retry_transient` defaults to False -- identical to today for every
+        existing caller, and no caller in this repo passes True. Turn it on
+        only for a statement that is idempotent AND whose caller reads no
+        meaning into an empty result. Never for a claim-style update, where an
+        empty result IS the answer that another contender won the race.
+        """
         params = {}
         for key, value in filters.items():
             params[key] = f'eq.{value}'
-        return self._request('PATCH', table, params=params, json_data=data)
+        return self._request('PATCH', table, params=params, json_data=data,
+                             retry_transient=retry_transient)
 
     def delete(self, table: str, filters: dict) -> list:
         """Delete rows matching filters."""
@@ -257,7 +484,9 @@ class SupabaseClient:
         if filters:
             for key, value in filters.items():
                 params[key] = value
-        response = requests.get(url, headers=headers, params=params, timeout=30)
+        # A GET -- retried unconditionally for the same reason as select().
+        response = _request_with_retry('GET', url, what=f'/{table}', headers=headers,
+                                       params=params, timeout=30)
         response.raise_for_status()
         content_range = response.headers.get('Content-Range', '*/0')
         total = content_range.split('/')[-1]
@@ -1454,19 +1683,35 @@ def match_profiles_by_urls_rpc(
 
             # Use exact matching (safer - no name reversal or hyphen removal)
             # Falls back to fuzzy matching if exact function doesn't exist
-            response = requests.post(
-                f"{client.url}/rest/v1/rpc/match_profiles_by_urls_exact",
+            #
+            # Retried despite being a POST: these two RPCs are READ-ONLY, so a
+            # replay cannot change server state. Verified against their own
+            # definitions, not assumed from their names --
+            # migrations/015_exact_url_matching.sql and
+            # migrations/013_match_profiles_by_urls.sql contain no INSERT,
+            # UPDATE, DELETE or TRUNCATE. This is the ONLY reason a POST is
+            # allowed through the helper; anything whose read-only-ness is not
+            # provable from its migration stays on a bare requests.post.
+            # Without this, one transient blip silently skipped a whole
+            # matching batch -- and the caller reads that as "these profiles
+            # are not in the database" (Codex round 2, P2).
+            response = _request_with_retry(
+                'POST', f"{client.url}/rest/v1/rpc/match_profiles_by_urls_exact",
+                what='/rpc/match_profiles_by_urls_exact',
                 headers=client.headers,
                 json=payload,
-                timeout=60  # Longer timeout for large batches
+                timeout=60,  # Longer timeout for large batches
             )
-            # If exact function doesn't exist, fall back to original
+            # If exact function doesn't exist, fall back to original. 404 is
+            # not in _RETRY_STATUS_CODES, so the helper hands it straight back
+            # and this branch still sees it on the first attempt.
             if response.status_code == 404:
-                response = requests.post(
-                    f"{client.url}/rest/v1/rpc/match_profiles_by_urls",
+                response = _request_with_retry(
+                    'POST', f"{client.url}/rest/v1/rpc/match_profiles_by_urls",
+                    what='/rpc/match_profiles_by_urls',
                     headers=client.headers,
                     json=payload,
-                    timeout=60
+                    timeout=60,
                 )
             response.raise_for_status()
             batch_results = response.json()
@@ -1659,11 +1904,17 @@ def search_profiles_fulltext(client: SupabaseClient, query: str, limit: int = 50
             remaining = limit - len(all_results)
             batch_size = min(page_size, remaining)
 
-            response = requests.post(
-                f"{client.url}/rest/v1/rpc/search_profiles_text",
+            # Retried despite being a POST: search_profiles_text is READ-ONLY
+            # -- migrations/012_fulltext_search_pagination.sql defines it as a
+            # bare `SELECT ... FROM profiles`, so a replay cannot change server
+            # state. Without this, a transient blip on one page silently
+            # truncated the search results (Codex round 2, P2).
+            response = _request_with_retry(
+                'POST', f"{client.url}/rest/v1/rpc/search_profiles_text",
+                what='/rpc/search_profiles_text',
                 headers=client.headers,
                 json={"query": query, "p_limit": batch_size, "p_offset": offset},
-                timeout=30
+                timeout=30,
             )
             response.raise_for_status()
             batch = response.json()
@@ -2500,7 +2751,12 @@ def get_usage_logs(client: SupabaseClient, provider: str = None, days: int = Non
             params['offset'] = offset
 
         url = f"{client.url}/rest/v1/api_usage_logs"
-        response = requests.get(url, headers=client.headers, params=params, timeout=30)
+        # A GET -- retried unconditionally, same as select()/count(). This
+        # function's `except` below turns any failure into an empty list, so
+        # without the retry a one-second blip silently renders an empty usage
+        # table as if there were no usage.
+        response = _request_with_retry('GET', url, what='/api_usage_logs',
+                                       headers=client.headers, params=params, timeout=30)
         response.raise_for_status()
         return response.json() if response.text else []
     except Exception as e:
@@ -2771,7 +3027,11 @@ def get_search_history(client: SupabaseClient, agent_id: str = None) -> list:
         if agent_id:
             params['agent_id'] = f'eq.{agent_id}'
         url = f"{client.url}/rest/v1/search_history"
-        response = requests.get(url, headers=client.headers, params=params, timeout=30)
+        # A GET -- retried unconditionally, same as select()/count(). As with
+        # get_usage_logs above, the `except` below would otherwise turn a
+        # transient blip into "no search history".
+        response = _request_with_retry('GET', url, what='/search_history',
+                                       headers=client.headers, params=params, timeout=30)
         response.raise_for_status()
         return response.json() if response.text else []
     except Exception as e:
@@ -3151,8 +3411,21 @@ def find_similar_profiles_rpc(
     "RPC succeeded, zero matches" case.
     """
     try:
-        response = requests.post(
-            f"{client.url}/rest/v1/rpc/match_profiles_by_embedding",
+        # Retried despite being a POST: match_profiles_by_embedding is
+        # READ-ONLY -- migrations/021_similar_profiles_location_filter.sql
+        # defines it as a bare `SELECT ... FROM profiles p`, so a replay
+        # cannot change server state. Codex round 2 named two such RPCs "for
+        # example"; this is the same case and is routed with them rather than
+        # left as the one inconsistent read.
+        #
+        # The error contract below is unchanged. The helper re-raises the same
+        # requests exception once its budget is spent, so the
+        # `except requests.RequestException` still fires; and a >= 400 status
+        # is handed straight back, so the SimilarityRPCError branch still sees
+        # it (429/5xx simply get retried first).
+        response = _request_with_retry(
+            'POST', f"{client.url}/rest/v1/rpc/match_profiles_by_embedding",
+            what='/rpc/match_profiles_by_embedding',
             headers=client.headers,
             json={
                 "query_embedding": query_embedding,
